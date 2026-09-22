@@ -32,7 +32,8 @@ Everything runs on GitHub Actions; there is nothing to install to trigger a
 build. A caller workflow calls `_pipeline.yml` (see
 [`docs/PROFILES.md`](docs/PROFILES.md) for a complete one), which walks the
 source archive once, fans out to `worker_count` parallel workers (128 by
-default), and merges each profile's shards into its own `.pmtiles`
+default, or `auto` to size the run against its own budgets), and merges
+each profile's shards into its own `.pmtiles`
 artifact. `profile`/`output_basename` accept a comma-separated list, so one
 run can build several profiles off a single `prepare-shards` walk and a
 single fetch per worker. OpenFreeMap sees each tile's bytes fetched once
@@ -85,12 +86,18 @@ else.
 | `tilealchemist/shard_prep.py` | The run's one-time planning step: resolves the `Source`, drives the walk and the partition, writes the manifests, logs the run. Needs a `Source`, not a `Profile`. |
 | `tilealchemist/attribution.py` | What a built layer credits: reads the attribution the source archive declares for itself, and fills the caller's `{source}` template in with it. |
 | `tilealchemist/pmtiles_index.py` | The source archive's directory index: header + root, then only the leaf directories the zoom range needs, in two range requests, walked and zoom-pruned in memory into directory entries. |
-| `tilealchemist/partition.py` | Those entries (plus the gaps between them) into one balanced, contiguous block of work per worker. No network, no files. |
+| `tilealchemist/partition.py` | Those entries (plus the gaps between them) into one balanced, contiguous block of work per worker, inside the hard caps. No network, no files. |
+| `tilealchemist/budgets.py` | The caps themselves: how many manifest records a worker may hold and how big its largest range request may get. |
+| `tilealchemist/sizing.py` | Picks `worker_count` itself (`--worker-count auto`): the smallest multiple of the concurrency whose worst worker fits the time, RAM and disk budgets. |
+| `tilealchemist/calibration.py` | Fits the next run's cost coefficients from the last run's `usage:` lines, with the guards that stop a bad fit being adopted. |
+| `tilealchemist/calibrate.py` | CLI for that: prints what it would change and, with `--out`, writes a `calibration.json`. It never edits `cost.py`. |
 | `tilealchemist/build_shard.py` | One worker's entry point: parses its flags, then hands off to `shard_worker.py`. |
 | `tilealchemist/shard_worker.py` | One worker's control flow: fetches its manifest's tiles in a single range request per contiguous run of them, drives the transform and the shard writing, logs the run. |
 | `tilealchemist/fetch_batching.py` | Groups a worker's manifest entries into range-GET batches (split at wide unread gaps) and fetches one batch's bytes. |
-| `tilealchemist/transform.py` | Fetched bytes to output tiles: one decode per tile shared by every selected `Profile`, chunked across this machine's cores (`--transform-workers`). |
-| `tilealchemist/mbtiles.py` | The shard files themselves: creating one mbtiles per profile, writing real and gap tiles into it (including the XYZ-to-TMS row flip). |
+| `tilealchemist/transform.py` | Fetched bytes to output tiles: one decode per tile shared by every selected `Profile`, timed apart from the per-profile transform. |
+| `tilealchemist/transform_pool.py` | Splits a batch into cost-balanced chunks and runs them across this machine's cores (`--transform-workers`), throttling how many are in flight. |
+| `tilealchemist/usage.py` | What the run actually cost: per-chunk and per-worker `usage:` lines (seconds by phase, bytes, distinct blobs, peak RSS, free disk). |
+| `tilealchemist/mbtiles.py` | The shard files themselves: creating one mbtiles per profile in either layout (`--shard-layout`), expanding runs into rows (including the XYZ-to-TMS row flip). |
 | `tilealchemist/profile_requirements.py` | Reads a profile's inline PEP 723 dependency block without importing it, so CI can install what the profile needs before loading it. |
 | `tilealchemist/profiles/` | The `Profile` ABC and the path-based `load_profile()`. No profiles: those live in their own repositories. |
 | `tilealchemist/sources/` | The `Source` ABC (which archive URL to read, and which schema its tiles are in), plus `OpenFreeMapSource`, `ProtomapsSource` and `StaticUrlSource`. |

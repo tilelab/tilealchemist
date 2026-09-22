@@ -227,6 +227,9 @@ download progress at most once every 15s (`--download-report-interval`).
 Neither prints at all if its step finishes before the first interval
 elapses, so a fast worker's whole log is major lines only.
 
+A third kind, **`usage:` lines**, carries measurements rather than progress
+and is meant to be read by machine; see "Measuring a run" below.
+
 Download progress gets its own flag, and its own shorter default, rather
 than sharing `--report-interval`, because the phase it covers is itself
 shorter: a shard's whole-batch download is a single Range request of tens to
@@ -243,8 +246,10 @@ each job far from GitHub Actions' 6-hour per-job runtime limit, plus
 smaller, failure-isolated jobs and fewer, smaller range requests. GitHub
 also queues anything past ~20 concurrently *running* jobs on a public repo,
 so a higher `worker_count` doesn't add parallelism at any one moment, just
-keeps each job smaller: that's why the default is 128, not higher. Each
-worker writes its own small mbtiles shard; a final job merges all shards
+keeps each job smaller: that's why the default is 128 rather than higher,
+and why `--worker-count auto` only ever considers multiples of that
+concurrency (see "Sizing a run"). Each worker writes its own small mbtiles
+shard; a final job merges all shards
 with `tile-join` into one `.pmtiles` file.
 
 A worker building multiple profiles in one run (`_pipeline.yml` called with
@@ -277,44 +282,232 @@ deliberately producing several times more chunks than there are processes
 ### What a record costs
 
 `cost.py` answers that, and `partition_by_cost()` splits on cumulative cost
-rather than on a record count. A record's cost has three axes, and no
-single one of them is the unit:
+rather than on a record count. `AXIS_SECONDS` holds five coefficients, all
+in seconds, and a record's cost is their terms added up:
 
-- **Decode work**, which dominates. It is paid once per *distinct* entry —
-  a record repeating the previous one's `(offset, length)` is decoded zero
-  times, matching what `transform_batch_blob_multi()` actually does — and
-  it grows *faster* than that entry's byte length, because a bigger tile is
-  also a denser one: more features to decode, more geometry for a profile
-  to clip and union. `DENSITY_EXPONENT` is 1.5, fitted against a planet
-  run's 128 worker durations, where it lifts the model's R² from 0.67
-  (linear in bytes) to 0.77.
-- **Entry count**, which bounds decode calls and, with them, peak memory.
-- **`run_length`**, one sqlite insert per output tile per profile.
+- **Per decode call** and **per byte decoded**, the pair that dominates.
+  Both are paid once per *distinct* entry — a record repeating the previous
+  one's `(offset, length)` pays neither, matching what
+  `transform_batch_blob_multi()` actually does. The byte term grows *faster*
+  than byte length, a bigger tile also being a denser one: more features to
+  decode, more geometry for a profile to clip and union.
+- **Per byte fetched**, also once per distinct entry: the range GET is real
+  time, and bytes are what bound a worker's peak blob memory.
+- **Per record**, at its measured cost; the memory bound it used to stand in
+  for is an explicit cap now (see "Budgets are caps, not prices").
+- **Per output tile**, one sqlite insert per tile per profile.
 
-Each axis is normalized to its own total across the run, then mixed by
-`AXIS_SHARES` (0.25 / 0.60 / 0.15). Normalizing first is what makes the mix
-safe: a worker can exceed its fair share of any one axis only by that
-axis's reciprocal share, so none can run away. That matters because
-weighting by a single axis was tried in production and failed badly in
-opposite directions. Balancing on bytes alone let one real run hand a
-worker 3.5M real entries against its peers' 500K-900K, a near-identical
-download size at ~5x the decode work, which ran that worker out of memory.
-Balancing on `run_length` alone was worse: a handful of entries with a huge
-`run_length` "fills" a tile-sized target almost immediately while costing
-almost no decode work, so regions dense in those pushed every real,
-unique-content entry (`run_length` 1, one decode each, and just as many
-bytes to fetch) onto whatever workers were left, producing a
-4.3M-entry/16GB worker next to a 76K-entry/7MB one.
+`cost_weights()` therefore returns a predicted *duration* rather than a
+share of something: `partition_by_cost()` splits on that number, and
+`prepare_shards` prints the run's predicted core-hours and slowest worker.
 
-Counting records, the unit used before this, fails the other way: it is
-*exactly* even and says nothing about cost. In a 128-worker planet run it
+The coefficients are fixed rather than recomputed per run, which is the
+correction to an earlier version of this model. That one normalized each
+axis to its own total across the run and mixed the results by fixed shares
+(0.25 / 0.60 / 0.15). Algebraically that is a linear combination of the
+same kind, but with a decode coefficient of 0.60/W against the run's total
+decode work W -- so the more decode-bound a run was, the less
+each byte of decode counted, which is backwards. What the shares really
+encoded was "every run has the composition of the planet run they were
+fitted against". That holds for planet builds and breaks either way for
+anything else: a z0..z11 ocean-heavy range is almost all sqlite inserts
+against one decode per deduped run, a high-zoom extract is almost all
+decode, and the normalized model insisted both were 60% decode.
+
+Balancing by a *single* axis was tried in production before either version
+and failed badly in opposite directions. Balancing on bytes alone let one
+real run hand a worker 3.5M real entries against its peers' 500K-900K, a
+near-identical download size at ~5x the decode work, which ran that worker
+out of memory. Balancing on `run_length` alone was worse: a handful of
+entries with a huge `run_length` "fills" a tile-sized target almost
+immediately while costing almost no decode work, so regions dense in those
+pushed every real, unique-content entry (`run_length` 1, one decode each,
+and just as many bytes to fetch) onto whatever workers were left, producing
+a 4.3M-entry/16GB worker next to a 76K-entry/7MB one.
+
+Both are degenerate cases of this model, with all but one coefficient at
+zero, and that is also what bounds it: with every coefficient strictly
+positive, a worker can exceed its fair share of any one axis only by that
+axis's reciprocal share of the run's total cost, so none can run away.
+Normalizing made that bound a fixed constant; absolute coefficients let it
+track what the run is actually made of, which is the point.
+
+### Where the coefficients come from
+
+`AXIS_SECONDS` is fitted against the shard manifests and the 128 measured
+worker durations of the 2026-09-19 `land` + `cropped_waterways` planet run
+(standardprofiles run 35447809178): 58,679,705 records, 43,272,366 distinct
+decode calls, 357,913,942 output tiles, no gap ranges at all, 15.7
+core-hours, workers between 39s and 34m12s. The coefficients are scaled so
+the model's total matches that run's measured work, which is what makes the
+printed core-hours figure mean anything; only the ratios between them
+affect partitioning.
+
+Two single-worker observations from that run set the small coefficients
+directly, without a regression:
+
+- One worker held 1,449,554 records whose `(offset, length)` deduped down
+  to **one** distinct entry. It finished in 39s -- the floor across all 128,
+  i.e. job setup and nothing else. A record that decodes nothing therefore
+  costs single-digit microseconds, not the 25% of a worker's budget the
+  normalized model gave it.
+- Another wrote 16,569,677 output tiles in 49s total. That bounds one
+  sqlite insert at well under a microsecond, against the 15% share the
+  normalized model spent on it. `run_length` inserts write the same deduped
+  blob over and over, and sqlite does that almost for free.
+
+Both are why `real_tiles` correlates *negatively* (-0.43) with duration
+across the 128 workers: a tile-heavy worker is an ocean-heavy worker, which
+is a cheap one.
+
+Judged on how well each weighting ranks the workers this run actually had,
+the normalized model scores a Pearson correlation of **0.049** against
+measured duration (Spearman 0.059) -- it is, for practical purposes,
+uncorrelated with what the workers went on to do. The fitted coefficients
+score 0.538 (Spearman 0.644).
+
+### What the model still cannot see
+
+Its R² against those durations caps out at **0.29**, and it under-predicts
+the slow tail by 2-4x: the worst worker was predicted at 8m and ran 34m12s.
+What is missing is content complexity. A dense coastline tile costs far
+more to clip and union than an open-ocean tile of the same byte length, and
+nothing in a manifest record exposes that -- the same effect the
+over-chunking below exists to absorb. Treat the printed prediction as a
+ranking signal, not an estimate.
+
+Two further cautions on the fit. The run it is fitted against was itself
+partitioned by the normalized model, so the predictors are correlated by
+construction (bytes against output tiles at -0.80), which is why the
+regression alone cannot pin the small coefficients and the direct
+observations above carry them instead. And `DENSITY_EXPONENT` barely earns
+its keep: sweeping it from 1.0 to 2.0 moves the correlation between 0.499
+and 0.521, peaking around 1.4-1.5. It stays at 1.5 because that is the
+flat top of the curve, not because the data insists on it.
+
+### Measuring a run
+
+Every coefficient above is a guess until something measures it, so a worker
+reports what it actually did. `usage.py` prints one `usage:` line per scope,
+in `name=value` form: a whole run's budget is one `grep '^usage:'` over the
+job logs, and that grep is what the next run's coefficients are fitted from.
+
+Three scopes:
+
+- **`scope=chunk`**, one per transform chunk, printed by the process that ran
+  it. `TRANSFORM_CHUNKS_PER_WORKER = 8` on 4 vCPU makes that ~32 lines per
+  worker rather than one, so a 128-worker run yields ~4,096 measurements
+  instead of 128. Chunks also vary far more in composition than the
+  deliberately equal-cost worker blocks do, which is what breaks the
+  collinearity a worker-level regression cannot get past (bytes against
+  output tiles at -0.80, by construction, because the run was partitioned by
+  the model being fitted). A chunk measurement contains no runner boot and no
+  `pip install` either.
+- **`scope=profile`**, one per profile per worker: `written`, `skipped`,
+  `blobs`, and the finished shard's size on disk. `blobs` counts *distinct*
+  blob objects rather than rows, so `written / blobs` is the storage
+  amplification -- the number that decides whether the deduplicated shard
+  layout pays for itself (see "Shard layout").
+- **`scope=worker`**, one per worker: wall-clock seconds split by phase
+  (`fetch`, `transform`, `write`, `close`), bytes fetched, entry counts, and
+  peak RSS. `PhaseSeconds` nests exclusively, so the `write` time spent
+  inside the transform loop is not also counted as `transform`.
+
+`decode_seconds` and `transform_seconds` are reported separately because they
+are different work on different inputs. `Tile.decode()` is gunzip plus
+protobuf, close to linear in byte length, paid once per *distinct* entry;
+`profile.transform_tile()` is shapely clip and union, paid once per profile
+and driven by content complexity rather than byte length. Fused into one
+number they are indistinguishable, and an R² of 0.29 cannot be read as either
+"the model is bad" or "decode is clean and all the variance sits in
+transform". The split also makes profile count a real factor: a run costs
+`1 x decode + N x transform`, which one fused measurement cannot express.
+
+`length_hist` accumulates the same two times into log2 buckets of entry
+length (bucket `i` holds lengths whose bit length is `i`, i.e.
+`[2**(i-1), 2**i)`), as `bits:count:bytes:decode_seconds:transform_seconds`.
+Buckets rather than 43M individual samples: the curve is what says whether
+`DENSITY_EXPONENT` is right, and it fits in a log line.
+
+The instrumentation is two `perf_counter()` calls per distinct entry. At 26ns
+a call that is 2.3s across the reference run's 43,272,366 distinct entries --
+0.004% of its 15.7 core-hours.
+
+Peak RSS is read twice, because `RUSAGE_CHILDREN.ru_maxrss` is the *maximum*
+over finished children, not their sum: taken alone it under-reports a pooled
+worker's real peak by up to `--transform-workers`x. Each `_transform_chunk`
+therefore prints its own `RUSAGE_SELF` peak on the way back, which is what
+makes the *simultaneous* per-process peak visible. `getrusage` reports
+`ru_maxrss` in bytes on macOS and in kibibytes on Linux, so `usage.py` scales
+by platform; every `usage:` byte figure is bytes.
+
+`WORKER_SETUP_SECONDS` sits next to `AXIS_SECONDS` and is a property of the
+runner rather than of the run: runner boot, artifact download, and the
+`pip install` of the dependencies. It does not change partitioning -- a
+constant every worker pays alike cancels out of every ratio -- but it changes
+two things that matter. The printed core-hours stop hiding it inside the byte
+terms (128 x 39s is 1.4 of the reference run's 15.7 core-hours, about 9%),
+and the `worker_count` search has to weigh it, every extra worker bringing
+its own setup with it.
+
+### Budgets are caps, not prices
+
+The per-record coefficient used to carry a memory bound. At its measured time
+cost (~1e-6) nothing holds deduped repeats together, and replaying the
+reference run put 8.5M records on one worker -- `read_manifest()` materializes
+those as namedtuples, about 1 GB before a single tile is fetched. Raising the
+coefficient to 9e-5 pulled that to 3.8M:
+
+| per record | max entries in a block | manifest RAM | correlation |
+| --- | --- | --- | --- |
+| 1e-6 (measured) | 8.5M | 0.95 GB | 0.538 |
+| 9e-5 | 3.8M | 0.43 GB | 0.537 |
+| 2.5e-4 | 2.0M | 0.22 GB | 0.512 |
+
+That worked, but it could never *guarantee* anything, and it is worth being
+precise about why. The table is a measured curve with no closed form: 9e-5
+produced 3.8M on **that** run, and on a run with a different record
+distribution the same coefficient produces something else. A price cannot
+enforce a limit; it can only make crossing it expensive.
+
+So the limits are limits now. `partition_by_cost()` takes `Caps` and closes a
+block the moment another group would break one, whatever the cost balance
+says -- one condition in the loop beside the existing `_share_end` comparison.
+Exact instead of statistical, and `manifest_record` goes back to its measured
+~1e-6, which leaves the cost model with no coefficient in it that is not a
+measurement.
+
+Two caps, both from `budgets.py`:
+
+- **Records per block**, from `--manifest-ram-budget` at a measured ~120 B per
+  `Entry`: 0.25 GB is 2.2M records, 0.5 GB (the default) 4.5M, 1.0 GB 8.9M.
+- **Peak batch bytes**, from `--peak-batch-budget`. The peak, deliberately,
+  not the block's byte sum: `_process_real_entries()` does `del blob` between
+  batches, so what a worker must afford at once is its largest *batch*. That
+  is not a model but an arithmetic fact, and `budgets.py` tracks it by the
+  same rule `plan_fetch_batches()` splits on, incrementally as groups are
+  added rather than by re-planning the block each time.
+
+A record cap can also split an *atomic* group, and has to. `atomic_key`
+groups a run of records sharing an `(offset)`, and such a run can be larger
+than the whole cap on its own -- one real worker held 1,449,554 records that
+deduped to a single distinct entry. `_atomic_groups()` already splits such a
+run once it outgrows a share; the cap is a second reason to split, and the
+cost of splitting is one extra decode, because the dedup check only ever
+compares against the previous entry anyway.
+
+What a cap cannot do is invent workers. The last block takes whatever is
+left, however big, so `prepare-shards` says out loud when a block overran and
+names raising `--worker-count` as the fix -- which is the job the
+`worker_count` search does automatically.
+
+Counting records, the unit used before any of this, fails the other way: it
+is *exactly* even and says nothing about cost. In a 128-worker planet run it
 gave every worker 458K entries and between 32MB and 3,494MB of tile data,
 and those workers ran between 26s and 57m42s. Across all 128, job duration
-correlated with entry count at 0.04 and with byte volume at 0.82. Replaying
-that run's manifests through the cost weight puts the longest worker at a
-predicted 10m24s against 49m06s, holds the largest shard's entry count to
-1.46M -- well under the 3.5M that died -- and *lowers* peak blob memory
-from 3.49GB to 0.98GB.
+correlated with entry count at 0.04 and with byte volume at 0.82 -- which is
+the finding the whole model rests on, and the one number here that has held
+up across every run since.
 
 Since only ~20 jobs run concurrently anyway, balancing does not move the
 floor: 16 core-hours over 20 lanes is ~48 minutes either way. What it
@@ -370,6 +563,298 @@ until the pool shuts down. Keeping the whole map pinned every chunk's
 output for the whole phase, putting the bound straight back where it was
 before chunking — a planet run's two largest shards died to exactly that,
 on runners that report it as `The runner has received a shutdown signal`.
+
+Submitting is throttled for the mirror image of the same reason.
+`_blob_slice_for_chunk()` *copies*, and `ProcessPoolExecutor`'s work queue
+holds every argument until that chunk is dispatched, so submitting all of
+them up front left the parent holding ~28 slices that roughly tile the
+batch — the batch a second time, on top of the blob it already has.
+`_pooled_chunk_results()` therefore keeps only `max_workers + SUBMIT_LEAD`
+chunks in flight and submits the next one as it takes a result back. The
+lead is what stops a process idling while the parent writes, and measured on
+a 32-chunk batch across 4 processes the parent holds 7 slices where it used
+to hold 32. The same throttle bounds the other direction too: completed
+results can no longer pile up when the serial sqlite writer falls behind
+four parallel transformers, which is exactly the combination an ocean-heavy
+worker produces.
+
+Where several chunks are already done, the lowest-numbered one is taken
+first. That is a tie-break among *ready* futures, never a wait for a
+particular chunk, so no chunk blocks the head of the line.
+
+A chunk is also committed as it is written, rather than the whole shard
+running from `init_mbtiles()` to `close_shards()` inside one open
+transaction. With `synchronous = OFF` a commit costs nothing, and it caps
+the journal instead of letting it grow to the size of the shard.
+
+That makes a half-written shard *more* plausible rather than less, so the
+shard says when it is whole: `close_shards()` writes
+`tilealchemist_complete` into `metadata` in the same commit as the last
+tiles. A worker killed mid-write leaves a database without it, which is what
+lets a merge tell a truncated shard from a small one -- `upload-artifact`
+runs with `if: always()` and `if-no-files-found: ignore`, so today such a
+shard is handed on silently and merges into a quietly short layer. (The
+merge-side check itself is not in this repository yet.) `tile-join` ignores
+the unknown metadata key; verified locally, output byte-identical with and
+without it.
+
+Free disk space is checked before every batch (`usage.free_disk_bytes()`)
+and reported on the worker's `usage:` line. Falling below the threshold is a
+loud warning, not an abort: the approach shows up in the log instead of
+arriving as an `ENOSPC` in the middle of an `INSERT`.
+
+### Runs stay runs until the writer
+
+`transform_batch_blob_multi()` used to expand every `run_length` into one
+tuple per output tile, and `write_output_tiles()` turned each of those into
+its own `INSERT`. Measured, the cost of that expansion splits three ways and
+only one of them is memory:
+
+| level | per output tile | why |
+| --- | --- | --- |
+| live objects in RAM | 156 B | the 4-tuple plus its three ints |
+| pickle across the process boundary | 13 B | pickle memoizes the shared `bytes` |
+| **disk** | **the whole blob** | a flat `tiles` table, deduplicated only at merge |
+
+The blob is therefore not multiplied in RAM; it is multiplied on disk, which
+is what "Shard layout" is about. What the expansion does cost in RAM is the
+tuples: the reference run's 357,913,942 output tiles per profile against its
+58,679,705 records is 6.1x, and its tile-heaviest worker held ~2.41 GB of
+them per profile where runs hold ~0.4 GB. Across the process boundary the
+saving is larger still, pickle having already memoized the shared blob: one
+pure run of 50,000 tiles goes from 550,397 bytes to 236.
+
+Keeping a run a run until the writer also makes an all-ocean entry O(1)
+rather than O(run_length): a run whose output is `None` no longer builds the
+millions of tuples it would throw away on the next line. And it lets
+`write_output_tiles()` use `executemany` over a generator -- the shape
+`write_gap_tiles()` already had, which is why that function is now one call
+into the common path plus its log line, and why a gap entry needs no special
+writer at all: a gap *is* a run, one shared blob over `run_length` tiles.
+
+Folding *adjacent* entries that share an `(offset, length)` into one run as
+well would take the same ratio to 8.3x. That is a second and independent
+change, deliberately not made here.
+
+### Shard layout
+
+`--shard-layout` picks how a worker's mbtiles stores its tiles. `flat` is one
+`tiles` row per tile, the layout every shard has had until now. `dedup` is
+the layout `tile-join` writes itself:
+
+    map    (zoom_level, tile_column, tile_row, tile_id)   UNIQUE (z, x, y)
+    images (tile_id INTEGER PRIMARY KEY, tile_data)
+    tiles  a view joining the two
+
+The default is `flat`, and the switch is staged on purpose: `dedup` pays only
+where a shard really repeats blobs, which is what `usage:`'s
+`written / blobs` measures, per profile, `land` and `cropped_waterways` being
+free to disagree. Per written tile, with `B` the blob size and
+`A = written / blobs`:
+
+| layout | per written tile |
+| --- | --- |
+| flat | `B + ~26`, the row inline plus its index entry |
+| dedup | `~35 + B/A` |
+
+| B | A | flat | dedup | factor |
+| --- | --- | --- | --- | --- |
+| 200 | 6.1 | 226 | 68 | 3.3x |
+| 200 | 2 | 226 | 135 | 1.7x |
+| 1000 | 6.1 | 1026 | 199 | 5.2x |
+| 200 | **1** | 226 | 235 | **0.96x, a loss** |
+
+Break-even is `B * (1 - 1/A) > 9`: from `A >= 2` the layout wins at any
+realistic blob size, and at `A = 1` it loses about 4%. The risk is therefore
+"needless complexity", not "catastrophe" -- but `A` has to be measured on a
+real run before the default moves, and `flat` stays a release as the way back.
+
+**The key is a synthetic counter, not a content hash.** A 32-character hex
+digest costs ~33 B in *every* `map` row and again in every `map_index` entry;
+across the reference run's 357.9M output tiles that is ~23 GB of pure key
+material, which would eat the whole saving. A small integer costs 1-4 B.
+`INTEGER PRIMARY KEY` is a rowid alias besides, so `images` writes become a
+purely sequential append with no B-tree of their own and the merge's join a
+direct rowid seek, where a TEXT hash would need its own index and a random
+B-tree insert per distinct blob.
+
+Blobs are matched by identity against the *previous* one -- `is`, against a
+variable holding a strong reference for the whole loop, so a freed address
+cannot be reused under it -- rather than by hashing. `id()` would not do:
+a freed address gets reused, and an `id()`-keyed dict can confuse two
+different blobs. That adjacency window covers exactly the two cases that are
+adjacent by construction: a run (one object over N tiles), and two
+consecutive entries sharing an `(offset, length)`, which already share one
+`outputs` list. Duplicates further apart get a second `images` row, which is
+fine: PMTiles' content hash catches them in the merge exactly as it does
+today. `write_gap_tiles()` collapses to a single `images` row per shard for
+free, every gap entry carrying the same `gap_data` object -- measured on a
+real run with hand-made gaps, 111 gap tiles became one `images` row and one
+`map` row per tile.
+
+The `UNIQUE` index stays, moving from `tiles` onto `map`, for two independent
+reasons. An `IntegrityError` on a repeated `(z, x, y)` is a wanted invariant
+-- it means a partitioning bug, and crashing is the right answer, which is
+also why neither `INSERT OR REPLACE` nor `OR IGNORE` belongs on `map`. And it
+carries the *merge*: `tile-join` reads
+`... from tiles order by zoom_level, tile_column, tile_row`, and without the
+index sqlite would have to sort those rows -- blobs included -- externally.
+
+`tile-join` supports this layout by construction rather than by accident: it
+writes this schema itself and reads only through `tiles`, so it can read its
+own output back. Both halves verified locally: a flat and a deduplicated
+shard of the same tiles produce byte-identical PMTiles content and identical
+headers, a mixed invocation (one of each, which a half-migrated
+`build-shards` can hand it) works, and `EXPLAIN QUERY PLAN` on tile-join's
+own query gives `SCAN map USING INDEX map_index` plus a rowid seek into
+`images`, with **no** `USE TEMP B-TREE FOR ORDER BY` -- at 490K map rows and
+after `ANALYZE` too.
+
+### Learning the coefficients from the last run
+
+`AXIS_SECONDS` in `cost.py` is the reviewed fallback, and the first run of
+anything uses it. After that, `tilealchemist-calibrate` reads the `usage:`
+lines a finished run printed and proposes what the next one should use.
+
+Each coefficient comes from the measurement that isolates it:
+
+| coefficient | fitted from |
+| --- | --- |
+| `fetched_byte` | `sum(fetch_seconds) / sum(fetched_bytes)` over workers |
+| `output_tile` | `sum(write_seconds) / sum(output_tiles)` |
+| `decode_call`, `decoded_byte` | two-parameter least squares over the `length_hist` buckets, against `(count, count * mean_length ** DENSITY_EXPONENT)` |
+| `manifest_record` | the slope of `setup_seconds` against a worker's record count |
+
+Every aggregate is `sum(seconds) / sum(units)`, never the mean of per-unit
+rates. That is the same choice tiledistillery's `fit_seconds_per_byte()`
+documents: small units carry a fixed overhead, so averaging their rates lets
+the smallest ones dominate. Here that would let the worker holding one
+distinct entry weigh as much as the one holding 2M.
+
+The entry-cost fit targets `decode_seconds + transform_seconds` together,
+because the model charges both to the same per-distinct-entry axes. Keeping
+them apart in the *measurement* is what makes the fit reviewable: the
+proposal prints the split, so "the model is bad" and "decode is clean, the
+variance is all in transform" stop looking alike. The same buckets sweep
+`DENSITY_EXPONENT` and print which exponent the length curve actually
+prefers -- the documented 1.5 sits on the flat top of that curve, not on a
+value the data insists on.
+
+This does not port tiledistillery's approach, and it is worth saying why.
+`leaves.py` looks each Geofabrik region up in `timings.json`, where a
+measurement *beats* the model; the fitted `seconds_per_byte` exists only to
+place regions that were never built. tilealchemist's unit of work is a
+worker block recomputed every run, so `worker-042.bin` means something
+different next time and there is no key to hang a measurement on. Only the
+*coefficients* carry over.
+
+Four guards, because a bad calibration does its damage quietly, inside
+`partition_by_cost()` on every later run:
+
+- **Every worker must have reported.** A partial run is a biased sample --
+  the workers that failed are exactly the expensive ones.
+- **Each coefficient is clamped** to within `CLAMP_FACTOR` of the reviewed
+  one, and every clamp is printed as a warning naming the raw measurement.
+- **With `--manifest-dir`**, the proposal is scored against the run's own
+  measured worker durations alongside the reviewed coefficients. Ranking
+  worse than what it would replace is a warning that says not to commit it.
+  Below `MIN_SCORED_WORKERS` the score is withheld rather than printed: over
+  two points a correlation is always exactly +/-1, which would read as a
+  verdict while meaning nothing.
+- **Nothing is written automatically.** `--out` writes a `calibration.json`
+  for a caller to keep; committing it, or passing it to
+  `prepare-shards --axis-seconds`, is a human decision. The model shapes the
+  distribution it is then fitted on, which is why two of the current five
+  coefficients had to be set by hand from single observations in the first
+  place.
+
+`worker_setup_seconds` is deliberately not learned from logs alone. A
+worker's own `setup_seconds` is the *in-process* residual (wall clock minus
+the phases); runner boot, artifact download and `pip install` happen before
+the process exists and no line in its log can see them. The proposal
+therefore leaves it alone unless `--runner-overhead-seconds` supplies that
+half, and says so.
+
+The coefficients are profile-dependent -- `_entry_outputs()` runs
+`transform_tile()` once per profile, so the seconds per byte belong to
+`land` + `cropped_waterways` rather than to tilealchemist. A single constant
+in the library cannot be right for every caller at once, which is why the
+calibration is a file, keyed by the caller on
+`(output_basename, schema, source.build)` the way tiledistillery keys
+`timings.json` by region, and kept in the caller's state rather than here.
+
+What makes the fit identifiable in the long run is runs of *different shape*
+-- planet, a regional extract, a high-zoom range. That mixture is exactly
+what the earlier normalized model could not survive ("a z0..z11 ocean-heavy
+range is almost all sqlite inserts, a high-zoom extract is almost all
+decode"), which makes it the training set that separates the coefficients
+rather than the one that confounds them.
+
+### Sizing a run
+
+`--worker-count auto` lets `prepare-shards` pick the count instead of taking
+it as an input. The pipeline was already built for it by accident:
+`_pipeline.yml` generates the worker matrix in `gen-workers` *after* the
+archive walk, in the same job, so the manifests exist by then. `gen-workers`
+counts `manifests/worker-*.bin` rather than reading the input back, which
+makes the manifests the only truth about how many workers there are.
+
+Partitioning is one pass over the records, so the search needs no closed
+form:
+
+    for N = C, 2C, 3C, ...:                 # C = --concurrency, in practice 20
+        blocks = partition_into_worker_blocks(entries, gaps, N)
+        if every budget holds for the worst block: take N
+
+Three budgets, three sources. **Time** from `cost_weights()` against the 6h
+job cap. **RAM** from the block's peak *batch* bytes through a measured
+affine fit. **Disk** from its output tiles times measured bytes per tile.
+All three fall as N rises -- more workers, smaller blocks, smaller spans,
+smaller batches -- and only setup overhead and wave count rise, so the first
+N that fits is the best one and the search is a loop rather than an
+optimization. Verified: against a 1.5M-entry, 77 GiB synthetic manifest the
+chosen N falls 120 -> 60 -> 40 -> 20 as the RAM budget rises 4 -> 8 -> 14 ->
+28 GiB, and tightening the job budget from 6h to 2h at 14 GiB raises it back
+to 60, with the log naming which budget bound it at each step.
+
+**Only multiples of the concurrency are considered.** At 20 lanes and
+roughly equal-cost blocks a run goes in waves:
+
+| workers | waves | last wave |
+| --- | --- | --- |
+| 120 | 6 | 20/20 |
+| **128 (the old default)** | **7** | **8/20** |
+| 140 | 7 | 20/20 |
+
+128 buys the same seven waves as 140 and leaves 12 lanes idle in the last
+one; 120 is the same work in six. It is an idealization -- GitHub starts
+greedily as a lane frees rather than in strict waves -- but it is measurable
+and it is the cheapest saving available.
+
+`worker_count` also has a hard ceiling that nothing used to check:
+`_pipeline.yml` expands it straight into the `build-shards` matrix, and
+GitHub refuses more than **256** cells. Both `prepare-shards` and
+`gen-workers` reject it now, the latter before the matrix is built rather
+than after the archive walk has already run.
+
+The time budget is charged at `TAIL_SAFETY_FACTOR` (4x), not at face value,
+and that is the honest way to use a model that under-predicts its slow tail
+by 2-4x -- the reference run's worst worker was predicted at 8m and ran
+34m12s. Sizing against a *hard* 6h limit with such a model would otherwise
+mean either a blind guess or a silent overrun. Which is also why this comes
+last: it needs measured coefficients to mean anything. For scale, that run's
+slowest worker sat a factor of **10.5** under the cap and the whole run used
+15.7 of 120 available lane-hours. Time is not the binding limit today; RAM
+and disk are.
+
+The RAM and disk conversions are measured rather than assumed.
+`usage:`'s `peak_rss` and `peak_batch_bytes` give an affine fit of peak
+memory against the largest batch a worker fetched, and the `profile` lines'
+`shard_bytes` over `output_tiles` gives bytes per tile. `calibrate` emits
+both as the `runner` block of `calibration.json`, and `--axis-seconds` reads
+them back. Until a run has measured them, `DEFAULT_RUNNER` carries the one
+observation there was: 3.49 GB of tile bytes dying on a 16 GB runner, so at
+least 4.6x.
 
 ### Worker independence
 
@@ -590,7 +1075,8 @@ section together.
       fetch_declared_attribution()    attribution.py: what the archive credits
       compose_attribution()           attribution.py: what this layer credits
       compute_gaps()                  partition.py: tile_ids no entry covers
-      partition_into_worker_blocks()  partition.py: each worker's share
+      caps_from_budgets()             budgets.py: this run's hard per-worker limits
+      _size_run()                     sizing.py: how many workers, and their blocks
       write_worker_manifests()        manifest.py: worker-NNN.bin
       write_source_metadata()         manifest.py: source.json, shared
 
@@ -600,16 +1086,17 @@ section together.
       read_source_metadata()     manifest.py: source.json from prepare-shards
       read_manifest()            manifest.py: this worker's entries
       split_manifest_entries()   -> real entries / gap entries
-      init_mbtiles()             mbtiles.py: one connection per profile
+      init_mbtiles()             mbtiles.py: one ShardWriter per profile
       real entries (_process_real_entries), one batch at a time:
         plan_fetch_batches()       fetch_batching.py: one range GET per batch
         fetch_batch_blob()         fetch_batching.py: that batch's bytes
         run_transform()            transform.py: a chunk of tiles at a time
-        write_output_tiles()       mbtiles.py: that chunk, then drop it
+        ShardWriter.write()        mbtiles.py: that chunk, then drop it
       gap entries (_process_gap_entries):
         Profile.transform_gap()    one blob for every gap tile in the run
         write_gap_tiles()          mbtiles.py: nothing to fetch
-      close_connections()
+      close_shards()
+      _report_worker_usage()     usage.py: one `usage:` line per scope
 
 ### Zoom levels (`zoom.py`)
 
@@ -660,9 +1147,23 @@ PMTiles' content-hash dedup in the final merge.
 
 mbtiles numbers rows TMS-style while a PMTiles tile ID decodes to XYZ, so
 every write flips the row (`(2 ** zoom - 1) - tile_row`).
-`write_gap_tiles()`'s `tms_rows()` must stay a generator: a worker holding a
-million-tile gap (an ocean, an ice sheet interior) would otherwise
-materialize them all as one list before handing them to sqlite3.
+
+The transform hands the writer *runs*, `(tile_id, run_length, output_data)`,
+rather than one tuple per tile, so `mbtiles.py` is where a run becomes rows.
+`_tile_rows()` must stay a generator: a worker holding a million-tile run (an
+ocean, an ice sheet interior) would otherwise materialize them all as one
+list before sqlite3 sees them. `_run_counts()` walks the runs rather than the
+rows, which is what lets the counting and that generator coexist.
+
+A run is clipped to the zoom range in `transform_batch_blob_multi()`, and
+*before* the `None` test, because the per-tile filter it replaces ran there
+too: a tile outside the range appears in **neither** `written` nor `skipped`.
+Clipping there is exact rather than approximate, because PMTiles tile IDs are
+ordered by zoom -- `min_zoom <= zoom <= max_zoom` across a run selects the
+same tiles as intersecting that run with `tile_id_bounds(min_zoom, max_zoom)`.
+That makes the writer the third consumer of one derivation instead of a
+fourth reimplementation of it, and turns an O(run_length) filter into O(1)
+arithmetic.
 
 ### The directory walk (`pmtiles_index.py`)
 
@@ -702,7 +1203,7 @@ progress line instead of counting the re-sent bytes twice.
 `_warn_retry()` emits a `::warning` workflow command as the retry happens, so
 a stampede surfaces in the Actions UI and not only in the job log.
 
-### Batching and chunking (`fetch_batching.py`, `transform.py`)
+### Batching and chunking (`fetch_batching.py`, `transform_pool.py`)
 
 Entries arrive sorted by offset, but sorted is not adjacent: dedup points an
 entry at whatever tile first held its bytes, so two neighbours can sit
@@ -732,7 +1233,16 @@ In `_pooled_chunk_results()`, `pending.pop(future)` must pop rather than
 index. A `Future` keeps the result it was handed for as long as the `Future`
 itself is alive, so holding every entry until the pool shuts down would pin
 every chunk's output for the whole transform phase — exactly the memory
-`run_transform()` yields per chunk to avoid.
+`run_transform()` yields per chunk to avoid. For the same reason it must
+keep submitting lazily: `executor.submit()` hands the work queue a *copy* of
+that chunk's bytes, so submitting every chunk up front holds the batch
+twice.
+
+`transform.py` is the transform itself and nothing else; `transform_pool.py`
+is the chunking and the process wiring around it. The dependency runs one
+way — the pool imports the transform — which is also why `run_transform()`
+lives on the pool side despite having an inline branch: it chooses between
+the two strategies.
 
 ### Profiles and gaps
 

@@ -1,14 +1,10 @@
 """The CPU-bound half of a worker; see docs/ARCHITECTURE.md "Parallelism"."""
-import collections
-import concurrent.futures
-import operator
 import sys
+import time
 
 from pmtiles.tile import tileid_to_zxy
 
-from tilealchemist.partition import partition_by_cost
-from tilealchemist.profiles import load_profile
-from tilealchemist.schemas import SCHEMAS
+from tilealchemist.pmtiles_index import tile_id_bounds
 from tilealchemist.tile import Tile
 from tilealchemist.throttle import UpdateLineThrottle
 
@@ -42,8 +38,10 @@ def _describe_entry(entry):
     return f"tile {zoom}/{column}/{row} (run of {entry.run_length} tiles)"
 
 
-def _entry_outputs(tile_data, entry, profiles, schema):
+def _entry_outputs(tile_data, entry, profiles, schema, usage):
+    decode_start = time.perf_counter()
     tile = Tile.decode(tile_data, schema)
+    transform_start = time.perf_counter()
     outputs = []
     for profile in profiles:
         try:
@@ -51,12 +49,15 @@ def _entry_outputs(tile_data, entry, profiles, schema):
         except Exception as error:
             raise RuntimeError(
                 f"profile {profile.name!r} failed on {_describe_entry(entry)}") from error
+    usage.add_decode(len(tile_data), transform_start - decode_start,
+                     time.perf_counter() - transform_start)
     return outputs
 
 
 def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress, profiles,
-                                schema):
+                                schema, usage):
     batch_offset, _batch_length, batch_entries = batch
+    tile_id_start, tile_id_limit = tile_id_bounds(min_zoom, max_zoom)
     results = [[] for _ in profiles]
     previous_key = None
     outputs = None
@@ -65,84 +66,16 @@ def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progre
         key = (entry.offset, entry.length)
         if key != previous_key:
             start = entry.offset - batch_offset
-            outputs = _entry_outputs(blob[start:start + entry.length], entry, profiles, schema)
+            outputs = _entry_outputs(blob[start:start + entry.length], entry, profiles, schema,
+                                      usage)
             previous_key = key
+        usage.entries += 1
         transform_progress.tick(tileid_to_zxy(entry.tile_id))
-        for run_offset in range(entry.run_length):
-            zoom, tile_column, tile_row = tileid_to_zxy(entry.tile_id + run_offset)
-            if min_zoom <= zoom <= max_zoom:
-                for profile_results, output_data in zip(results, outputs):
-                    profile_results.append((zoom, tile_column, tile_row, output_data))
+        run_start = max(entry.tile_id, tile_id_start)
+        run_length = min(entry.tile_id + entry.run_length, tile_id_limit) - run_start
+        if run_length <= 0:
+            continue
+        usage.output_tiles += run_length
+        for profile_results, output_data in zip(results, outputs):
+            profile_results.append((run_start, run_length, output_data))
     return results
-
-
-# Spare chunks per process, so one finishing early pulls the next instead of idling.
-TRANSFORM_CHUNKS_PER_WORKER = 8
-
-
-def _chunk_entries(real_entries, transform_workers):
-    if transform_workers <= 1 or len(real_entries) <= 1:
-        return [real_entries]
-    chunk_count = min(len(real_entries), transform_workers * TRANSFORM_CHUNKS_PER_WORKER)
-    chunks = partition_by_cost(real_entries, chunk_count,
-                               atomic_key=operator.attrgetter("offset"))
-    return [chunk for chunk in chunks if chunk]
-
-
-def _blob_slice_for_chunk(blob, batch_offset, chunk_entries):
-    chunk_offset = chunk_entries[0].offset
-    chunk_length = max(entry.offset + entry.length for entry in chunk_entries) - chunk_offset
-    start = chunk_offset - batch_offset
-    return blob[start:start + chunk_length], chunk_offset
-
-
-# One picklable value; `args` cannot serve, carrying profile classes a worker cannot unpickle.
-ChunkJob = collections.namedtuple(
-    "ChunkJob", "profile_paths schema_name min_zoom max_zoom report_interval")
-
-
-def _transform_chunk(job, blob_slice, blob_slice_offset, chunk_entries, chunk_index):
-    profiles = [load_profile(path)() for path in job.profile_paths]
-    batch = (blob_slice_offset, len(blob_slice), chunk_entries)
-    progress = TransformProgress(len(chunk_entries), job.report_interval,
-                                  label=f"transforming chunk {chunk_index + 1}")
-    return transform_batch_blob_multi(blob_slice, batch, job.min_zoom, job.max_zoom, progress,
-                                       profiles, SCHEMAS[job.schema_name])
-
-
-def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-        pending = {}
-        for index, chunk in enumerate(chunks):
-            blob_slice, blob_slice_offset = _blob_slice_for_chunk(blob, batch_offset, chunk)
-            future = executor.submit(_transform_chunk, job, blob_slice, blob_slice_offset,
-                                      chunk, index)
-            pending[future] = (index, len(chunk), len(blob_slice))
-        for future in concurrent.futures.as_completed(pending):
-            # pop, not index: a live Future pins its chunk's output for the whole phase.
-            index, entry_count, byte_count = pending.pop(future)
-            yield index, entry_count, byte_count, future.result()
-
-
-def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args):
-    batch_offset, _batch_length, real_entries = batch
-    chunks = _chunk_entries(real_entries, args.transform_workers)
-
-    fanout = (f", {len(chunks)} chunks across up to {args.transform_workers} processes"
-              if len(chunks) > 1 else "")
-    print(f"starting transform for profiles "
-          f"{', '.join(repr(profile.name) for profile in profiles)} "
-          f"({len(real_entries)} entries{fanout})", file=sys.stderr)
-
-    if len(chunks) <= 1:
-        transform_progress = TransformProgress(len(real_entries), args.report_interval)
-        yield transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress,
-                                         profiles, schema)
-        return
-
-    job = ChunkJob(args.profile, schema.name, min_zoom, max_zoom, args.report_interval)
-    completed = _pooled_chunk_results(blob, batch_offset, chunks, job, args.transform_workers)
-    for done, (index, entry_count, byte_count, chunk_results) in enumerate(completed, start=1):
-        yield chunk_results
-        print(f"chunk {index + 1} done ({done}/{len(chunks)} chunks, "
-              f"{entry_count} entries, {byte_count} bytes)", file=sys.stderr)

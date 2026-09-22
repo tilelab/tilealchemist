@@ -4,6 +4,7 @@ import argparse
 import os
 
 from tilealchemist.fetch_batching import DEFAULT_MAX_FETCH_GAP
+from tilealchemist.mbtiles import SHARD_LAYOUTS
 from tilealchemist.profiles import load_profile
 from tilealchemist.shard_worker import run_worker
 from tilealchemist.transform import DEFAULT_REPORT_INTERVAL
@@ -57,6 +58,11 @@ def parse_args():
                               "between two of its entries before the batch is split into another "
                               f"range request (default {DEFAULT_MAX_FETCH_GAP}); such gaps come "
                               "from PMTiles dedup, and get wide at a high --min-zoom")
+    parser.add_argument("--shard-layout", choices=SHARD_LAYOUTS, default="flat",
+                         help="how this shard stores its tiles: \"flat\" writes one row per "
+                              "tile, \"dedup\" stores each distinct blob once in an images "
+                              "table with a map table pointing at it (default flat; see "
+                              "docs/ARCHITECTURE.md \"Shard layout\" for when dedup pays)")
     parser.add_argument("--transform-workers", type=int, default=os.cpu_count() or 1,
                          help="parallel processes for the CPU-bound transform phase "
                               "(default: all available cores; 1 disables pooling and runs "

@@ -123,7 +123,13 @@ jobs:
 
           path = os.environ["OUTPUT_BASENAME"] + ".pmtiles"
           with open(path, "rb") as f:
-              count = Reader(MmapSource(f)).header()["addressed_tiles_count"]
-          print(f"{path}: {count} tiles")
-          assert count > 0, f"no tiles written to {path}"
+              header = Reader(MmapSource(f)).header()
+          addressed = header["addressed_tiles_count"]
+          contents = header["tile_contents_count"]
+          print(f"{path}: {addressed} tiles, {contents} distinct contents")
+          assert addressed > 0, f"no tiles written to {path}"
+          # addressed is what a shard layout must never change; contents is what
+          # deduplication moves, and can only ever be a subset of it.
+          assert 0 < contents <= addressed, (
+              f"{path}: {contents} distinct contents against {addressed} tiles")
           PY

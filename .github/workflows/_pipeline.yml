@@ -61,7 +61,7 @@ on:
         type: string
         default: "14"
       worker_count:
-        description: "How many parallel shard-building jobs to fan out into. Higher isn't necessarily faster: GitHub queues more than ~20 concurrently running jobs on a public repo, so it mainly trades job count for job size (see docs/ARCHITECTURE.md \"Parallelism\")."
+        description: "How many parallel shard-building jobs to fan out into (1-256, GitHub's matrix limit), or \"auto\" to let prepare-shards pick the smallest multiple of the concurrency whose worst worker stays inside every budget. Higher isn't necessarily faster: GitHub queues more than ~20 concurrently running jobs on a public repo, so it mainly trades job count for job size (see docs/ARCHITECTURE.md \"Parallelism\" and \"Sizing a run\")."
         required: false
         type: string
         default: "128"
@@ -182,11 +182,22 @@ jobs:
           name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shard-manifests
           path: manifests
 
+      # Counted from the manifests, not from the input: `worker_count: auto`
+      # lets prepare-shards choose, and the manifests it wrote are then the
+      # only truth about how many there are. The 256 check is GitHub's own
+      # matrix limit, which it would otherwise report as an unhelpful error
+      # after the whole archive walk has already run.
       - id: gen-workers
         name: Generate worker index matrix
-        env:
-          WORKER_COUNT: ${{ inputs.worker_count }}
-        run: echo "workers=$(python3 -c 'import json, os; print(json.dumps(list(range(int(os.environ["WORKER_COUNT"])))))')" >> "$GITHUB_OUTPUT"
+        run: |
+          python3 - >> "$GITHUB_OUTPUT" <<'PY'
+          import glob, json, sys
+          count = len(glob.glob("manifests/worker-*.bin"))
+          if not 1 <= count <= 256:
+              sys.exit(f"::error::prepare-shards wrote {count} manifests; a GitHub Actions "
+                       f"matrix expands to at most 256 cells")
+          print(f"workers={json.dumps(list(range(count)))}")
+          PY
 
       - id: gen-pairs
         name: Generate profile/output-basename pairs
