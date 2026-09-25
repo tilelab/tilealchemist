@@ -9,9 +9,20 @@ BASE_URL = "https://build.protomaps.com/"
 
 
 class ProtomapsSource(Source):
+    """The newest planet basemap in the Protomaps daily build index."""
+
     schema = PROTOMAPS
 
     def resolve(self):
+        """Pick the newest .pmtiles build listed in the daily index.
+
+        Returns:
+            The chosen build as a ResolvedSource, labelled with its key and
+            basemap version.
+
+        Raises:
+            RuntimeError: If the index lists no .pmtiles build at all.
+        """
         response = requests.get(BUILDS_URL, timeout=30)
         response.raise_for_status()
 

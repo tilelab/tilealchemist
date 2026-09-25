@@ -8,21 +8,56 @@ from tilealchemist.features import Feature
 
 
 class Tile:
+    """One source tile, as a profile sees it.
+
+    Decoded features and every derived value are computed on first use and
+    kept, so that several profiles walking the same tile pay for them once
+    between them.
+
+    Attributes:
+        layers: The decoded layers, in decode_tile()'s shape.
+        schema: The schema those layers are encoded in.
+    """
+
     def __init__(self, layers, schema):
+        """Wrap decoded layers as a tile.
+
+        Args:
+            layers: The decoded layers, in decode_tile()'s shape.
+            schema: The schema those layers are encoded in.
+        """
         self.layers = layers  # decode_tile()'s {layer_name: {...}} dict.
         self.schema = schema
         self._derived = {}
 
     @classmethod
     def decode(cls, data, schema):
+        """Decode a tile from its stored bytes.
+
+        Args:
+            data: The tile's gzipped MVT bytes.
+            schema: The schema it is encoded in.
+
+        Returns:
+            The decoded Tile.
+        """
         return cls(mvt.decode_tile(data), schema)
 
     @classmethod
     def empty(cls, schema):
+        """A tile with no layers, for a gap the archive holds nothing for.
+
+        Args:
+            schema: The schema the output is written against.
+
+        Returns:
+            An empty Tile.
+        """
         return cls({}, schema)
 
     @cached_property
     def extent(self):
+        """The coordinate extent this tile's geometry is relative to."""
         if not self.layers:
             return self.schema.default_extent
         # MVT allows an extent per layer; a real tile encodes every layer at one.
@@ -30,6 +65,7 @@ class Tile:
 
     @cached_property
     def buffered_square(self):
+        """The tile's square, grown by the schema's buffer."""
         buffer = self.extent * self.schema.default_buffer_pixels / self.schema.tile_size_pixels
         return box(-buffer, -buffer, self.extent + buffer, self.extent + buffer)
 

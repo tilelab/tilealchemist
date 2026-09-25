@@ -34,6 +34,17 @@ Prints the layer's attribution on stdout; every log line goes to stderr.
 
 
 def zoom_level_type(value):
+    """Parse a zoom level from the command line.
+
+    Args:
+        value: The flag's raw text.
+
+    Returns:
+        That value as a ZoomLevel.
+
+    Raises:
+        argparse.ArgumentTypeError: If it falls outside the supported range.
+    """
     zoom = int(value)  # A non-numeric value is argparse's own error to report.
     try:
         return ZoomLevel(zoom)
@@ -43,6 +54,17 @@ def zoom_level_type(value):
 
 
 def schema_type(value):
+    """Parse a schema name from the command line.
+
+    Args:
+        value: The flag's raw text.
+
+    Returns:
+        That value as a SchemaName.
+
+    Raises:
+        argparse.ArgumentTypeError: If no such schema is known.
+    """
     try:
         return SchemaName(value)
     except ValueError:
@@ -51,6 +73,18 @@ def schema_type(value):
 
 
 def worker_count_type(value):
+    """Parse a worker count from the command line.
+
+    Args:
+        value: The flag's raw text, either a number or "auto".
+
+    Returns:
+        The count as an int, or "auto" to have the run size itself.
+
+    Raises:
+        argparse.ArgumentTypeError: If the count falls outside what a GitHub
+            Actions matrix will expand to.
+    """
     if value == "auto":
         return value
     count = int(value)  # A non-numeric value is argparse's own error to report.
@@ -62,6 +96,15 @@ def worker_count_type(value):
 
 
 def parse_args():
+    """Parse and check this command's arguments.
+
+    Every check a flag combination can fail is made here, so that a bad call
+    fails as a usage error rather than part-way into the run.
+
+    Returns:
+        The parsed arguments, with the calibration loaded and the run's
+        limits assembled onto them.
+    """
     parser = argparse.ArgumentParser(
         description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--worker-count", type=worker_count_type, default=128,
@@ -140,6 +183,7 @@ def parse_args():
 
 
 def main():
+    """Run the planning step."""
     run_prepare(parse_args())
 
 

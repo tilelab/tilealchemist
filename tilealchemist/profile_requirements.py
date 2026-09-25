@@ -32,6 +32,18 @@ EMPTY_BLOCK_PATTERN = rf"(?m)^# /// {BLOCK_TYPE}$\s^# ///$"
 
 
 def read_metadata(source):
+    """Read a profile's PEP 723 script-metadata block.
+
+    Args:
+        source: The profile's full source text.
+
+    Returns:
+        The block's parsed TOML, or an empty mapping if it has no block.
+
+    Raises:
+        ValueError: If the file carries more than one block, or opens one it
+            never closes.
+    """
     openers = len(re.findall(OPENER_PATTERN, source))
     if openers > 1:
         raise ValueError(f"{openers} `# /// {BLOCK_TYPE}` blocks found; PEP 723 allows one")
@@ -48,6 +60,19 @@ def read_metadata(source):
 
 
 def profile_requirements(path):
+    """List what a profile needs beyond tilealchemist's own dependencies.
+
+    Args:
+        path: Path to the profile's .py file.
+
+    Returns:
+        The PEP 508 requirement strings it declares, empty if it declares none.
+
+    Raises:
+        OSError: If the file cannot be read.
+        ValueError: If its metadata block is malformed, or its `dependencies`
+            is not an array of requirement strings.
+    """
     with open(path, encoding="utf-8") as profile_file:
         metadata = read_metadata(profile_file.read())
     requirements = metadata.get("dependencies", [])
@@ -58,6 +83,7 @@ def profile_requirements(path):
 
 
 def main():
+    """Print one requirement per line for the profile named on the command line."""
     parser = argparse.ArgumentParser(
         description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("profile", help="path to the profile's .py file")

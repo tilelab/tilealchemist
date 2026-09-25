@@ -16,8 +16,24 @@ RETRY_LABEL = "prepare-shards"
 
 
 class WalkProgress:
+    """Prints how far the directory walk has got, at most once per interval.
+
+    Attributes:
+        total_bytes: The size of the leaf window being decoded.
+        entries: The list the walk appends to, read for its current length.
+        directories_decoded: Directories deserialized so far, root included.
+        directories_popped: Directories walked to the end so far.
+        decoded_bytes: Bytes of leaf directory deserialized so far.
+        throttle: The rate limiter the lines go through.
+    """
 
     def __init__(self, total_bytes, entries):
+        """Set up progress reporting for one directory walk.
+
+        Args:
+            total_bytes: The size of the leaf window being decoded.
+            entries: The list the walk appends its entries to.
+        """
         self.total_bytes = total_bytes
         self.entries = entries
         self.directories_decoded = 1
@@ -26,15 +42,22 @@ class WalkProgress:
         self.throttle = UpdateLineThrottle(LOG_INTERVAL)
 
     def decoded(self, node_bytes):
+        """Record one more directory deserialized.
+
+        Args:
+            node_bytes: That directory's raw bytes, counted towards the total.
+        """
         self.directories_decoded += 1
         self.decoded_bytes += len(node_bytes)
         self.report()
 
     def popped(self):
+        """Record one more directory walked to the end."""
         self.directories_popped += 1
         self.report()
 
     def report(self):
+        """Print how far the walk has got, if a line is due."""
         if not self.throttle.due():
             return
         percent = (f" (~{100 * self.decoded_bytes / self.total_bytes:.1f}%)"
@@ -45,12 +68,37 @@ class WalkProgress:
 
 
 class LeafWindow:
+    """The one slice of the leaf section a walk needs, held in memory.
+
+    Attributes:
+        blob: The fetched bytes.
+        start: The offset within the leaf section that `blob` begins at.
+    """
 
     def __init__(self, blob, start):
+        """Hold a fetched slice of the leaf section.
+
+        Args:
+            blob: The fetched bytes.
+            start: The offset within the leaf section that `blob` begins at.
+        """
         self.blob = blob
         self.start = start
 
     def node_bytes(self, entry):
+        """Cut one directory out of the window.
+
+        Args:
+            entry: The root entry pointing at that directory.
+
+        Returns:
+            The directory's bytes.
+
+        Raises:
+            RuntimeError: If the directory lies outside the window, which means
+                the archive orders its leaves in a way this reader cannot follow
+                without fetching the whole leaf section.
+        """
         offset = entry.offset - self.start
         if offset < 0 or offset + entry.length > len(self.blob):
             raise RuntimeError(
@@ -64,7 +112,20 @@ class LeafWindow:
 
 
 def leaf_window_for(root_directory, tile_id_start, tile_id_limit):
-    # Prunes by exactly the rule walk_directory_tree() descends by; keep the two in step.
+    """Find the span of the leaf section a zoom range needs.
+
+    Prunes by exactly the rule walk_directory_tree() descends by; keep the two
+    in step.
+
+    Args:
+        root_directory: The archive's deserialized root directory.
+        tile_id_start: First tile id in range.
+        tile_id_limit: One past the last tile id in range.
+
+    Returns:
+        `(start, length)` within the leaf section, or `(0, 0)` where the range
+        needs no leaf directory at all.
+    """
     start = end = None
     for index, entry in enumerate(root_directory):
         if entry.tile_id >= tile_id_limit:
@@ -82,12 +143,32 @@ def leaf_window_for(root_directory, tile_id_start, tile_id_limit):
 
 
 def tile_id_bounds(min_zoom, max_zoom):
-    # Derived here alone: the walk prunes against these and compute_gaps() fills between them.
+    """The half-open tile id range a zoom range covers.
+
+    Args:
+        min_zoom: Lowest zoom level the run walks.
+        max_zoom: Highest zoom level the run walks.
+
+    Returns:
+        `(start, limit)`, which the walk prunes against and compute_gaps()
+        fills between.
+    """
     return zxy_to_tileid(min_zoom, 0, 0), zxy_to_tileid(max_zoom + 1, 0, 0)
 
 
 def walk_directory_tree(root_directory, leaf_window, tile_id_start, tile_id_limit):
-    """Entries in range, walked from memory; the bounds prune the walk, not its result."""
+    """Collect every entry in range, walking the tree from memory.
+
+    Args:
+        root_directory: The archive's deserialized root directory.
+        leaf_window: The slice of the leaf section to descend into.
+        tile_id_start: First tile id in range.
+        tile_id_limit: One past the last tile id in range.
+
+    Returns:
+        The entries covering the range. The bounds prune the walk rather than
+        its result, so an entry straddling a bound comes back whole.
+    """
     entries = []
     progress = WalkProgress(len(leaf_window.blob), entries)
     frontier = [root_directory]
@@ -112,6 +193,20 @@ def walk_directory_tree(root_directory, leaf_window, tile_id_start, tile_id_limi
 
 
 def collect_entries(session, url, min_zoom, max_zoom):
+    """Read an archive's directory index down to the entries a run needs.
+
+    Two requests: the header and root directory in one, and the slice of the
+    leaf section they point into in the other.
+
+    Args:
+        session: The requests session the fetches share.
+        url: Absolute URL of the archive.
+        min_zoom: Lowest zoom level the run walks.
+        max_zoom: Highest zoom level the run walks.
+
+    Returns:
+        The archive's header, and its entries for the range in offset order.
+    """
     header, root_directory = _fetch_header_and_root(session, url)
     tile_id_start, tile_id_limit = tile_id_bounds(min_zoom, max_zoom)
     leaf_window = _fetch_leaf_window(
@@ -124,6 +219,19 @@ def collect_entries(session, url, min_zoom, max_zoom):
 
 
 def _fetch_header_and_root(session, url):
+    """Fetch the archive's header and root directory in one request.
+
+    Args:
+        session: The requests session the fetches share.
+        url: Absolute URL of the archive.
+
+    Returns:
+        The parsed header, and the deserialized root directory.
+
+    Raises:
+        RuntimeError: If the root runs past the prefix PMTiles v3 section 4
+            requires header and root to fit inside.
+    """
     prefix = fetch_range(session, url, 0, HEADER_AND_ROOT_PREFIX_LENGTH,
                          retry_label=RETRY_LABEL)
     header = deserialize_header(prefix[:PMTILES_HEADER_LENGTH])
@@ -138,6 +246,18 @@ def _fetch_header_and_root(session, url):
 
 
 def _fetch_leaf_window(session, url, header, window_start, window_length):
+    """Fetch the slice of the leaf section the walk will descend into.
+
+    Args:
+        session: The requests session the fetches share.
+        url: Absolute URL of the archive.
+        header: The archive's parsed header.
+        window_start: Offset within the leaf section to start at.
+        window_length: How many bytes to fetch, or 0 for none.
+
+    Returns:
+        That slice as a LeafWindow, empty where nothing was needed.
+    """
     if window_length == 0:
         return LeafWindow(b"", 0)
 

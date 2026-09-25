@@ -29,6 +29,15 @@ DEFAULT_DOWNLOAD_REPORT_INTERVAL = 15.0
 
 
 def parse_args():
+    """Parse and check this worker's arguments.
+
+    The profiles are loaded here, so that a bad --profile fails as a usage
+    error rather than once the download is already paid for.
+
+    Returns:
+        The parsed arguments, with --profile and --out split into matching
+        lists and the profile classes loaded onto them.
+    """
     parser = argparse.ArgumentParser(
         description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--worker-index", type=int, required=True)
@@ -90,6 +99,7 @@ def parse_args():
 
 
 def main():
+    """Run one worker."""
     run_worker(parse_args())
 
 

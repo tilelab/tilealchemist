@@ -21,6 +21,18 @@ AXIS_SECONDS = AxisSeconds(
 
 
 def _record_costs(records, axis):
+    """Price each record, charging a shared fetch only to the first to use it.
+
+    Consecutive records naming the same (offset, length) are one fetch and one
+    decode between them, so only the first of such a run carries that cost.
+
+    Args:
+        records: Manifest records, in the order a worker will walk them.
+        axis: The per-axis seconds to charge.
+
+    Yields:
+        The predicted seconds for each record, in the same order.
+    """
     previous_key = None
     for record in records:
         key = (record.offset, record.length)
@@ -33,5 +45,15 @@ def _record_costs(records, axis):
 
 
 def cost_weights(records, axis=AXIS_SECONDS):
-    """Every record's predicted seconds, and the seconds the whole run is predicted to take."""
+    """Price every record, and the run as a whole.
+
+    Args:
+        records: Manifest records, in the order a worker will walk them.
+            Iterated twice, so a one-shot iterator will not do.
+        axis: The per-axis seconds to charge.
+
+    Returns:
+        A pair of the per-record seconds, lazily, and the total seconds the
+        run is predicted to take.
+    """
     return _record_costs(records, axis), sum(_record_costs(records, axis))

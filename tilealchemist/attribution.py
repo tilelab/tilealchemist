@@ -9,7 +9,17 @@ PLACEHOLDER = "{source}"
 
 
 def fetch_declared_attribution(session, url, header):
-    """The attribution the archive states for itself, None if it states none."""
+    """Read the attribution the archive states for itself.
+
+    Args:
+        session: The requests session the ranged fetches share.
+        url: Absolute URL of the source archive.
+        header: The archive's parsed PMTiles header.
+
+    Returns:
+        The declared attribution, stripped, or None where the archive carries
+        no metadata, no `attribution` key, or a blank one.
+    """
     length = header["metadata_length"]
     if length == 0:
         return None
@@ -24,7 +34,22 @@ def fetch_declared_attribution(session, url, header):
 
 
 def compose_attribution(declared, template):
-    """The layer's attribution: `template` with `{source}` filled in."""
+    """Decide what the built layer credits.
+
+    Args:
+        declared: What the source archive states for itself, or None.
+        template: The pipeline's `attribution` input, whose `{source}` is
+            filled in with `declared`. Empty carries `declared` through
+            unchanged.
+
+    Returns:
+        The attribution the layer will carry.
+
+    Raises:
+        ValueError: If there is nothing to carry, if the template has a
+            `{source}` the archive gives nothing to fill it with, or if the
+            template composes to nothing at all.
+    """
     if not template:
         if not declared:
             raise ValueError(

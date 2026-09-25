@@ -4,7 +4,18 @@ from pathlib import Path
 
 
 def load_profile(path):
-    """Imports `path` as a standalone module and returns its `PROFILE` class."""
+    """Load a profile from the path to its .py file.
+
+    Args:
+        path: Path to the profile file.
+
+    Returns:
+        The module's `PROFILE` class.
+
+    Raises:
+        ValueError: If the file does not exist, or declares no module-level
+            `PROFILE`.
+    """
     path = Path(path)
     if not path.is_file():
         raise ValueError(f"profile file not found: {path}")

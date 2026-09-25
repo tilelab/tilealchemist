@@ -14,6 +14,20 @@ from tilealchemist.sources import resolve_source
 
 
 def run_prepare(args):
+    """Plan the whole run, once, before any worker starts.
+
+    Walks the archive's directory tree, settles the attribution, sizes the
+    run and writes one manifest per worker. The layer's attribution goes to
+    stdout for the pipeline to hand on, and every log line to stderr.
+
+    Args:
+        args: The parsed command line from prepare_shards.py.
+
+    Raises:
+        ValueError: If the run would produce a layer crediting nobody, which
+            is checked before the manifests are written rather than at merge
+            time.
+    """
     os.makedirs(args.out_dir, exist_ok=True)
 
     resolved_source = resolve_source(args.source, args.source_url, args.schema).resolve()

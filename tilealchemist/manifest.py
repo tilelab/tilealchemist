@@ -14,25 +14,59 @@ Entry = namedtuple("Entry", ["tile_id", "offset", "length", "run_length"])
 
 
 def write_manifest(path, entries):
+    """Write entries out as fixed-width records.
+
+    Args:
+        path: File to write.
+        entries: The entries to pack, in the order a worker will walk them.
+    """
     with open(path, "wb") as file:
         for entry in entries:
             file.write(RECORD.pack(entry.tile_id, entry.offset, entry.length, entry.run_length))
 
 
 def read_manifest(path):
+    """Read a manifest back.
+
+    Args:
+        path: File to read.
+
+    Returns:
+        The entries it holds, in file order.
+    """
     with open(path, "rb") as file:
         data = file.read()
     return [Entry(*fields) for fields in RECORD.iter_unpack(data)]
 
 
 def write_worker_manifests(out_dir, blocks):
-    # An empty block still gets its file, so worker N always has one to read.
+    """Write one manifest per worker.
+
+    Args:
+        out_dir: Directory the `worker-NNN.bin` files go in.
+        blocks: One entry block per worker, in worker order. An empty block
+            still gets its file, so worker N always has one to read.
+    """
     for worker_index, block in enumerate(blocks):
         write_manifest(os.path.join(out_dir, f"worker-{worker_index:03d}.bin"), block)
 
 
 @dataclass(frozen=True)
 class SourceMetadata:
+    """What every worker needs to know about the archive it reads.
+
+    Travels as `source.json`, beside the per-worker manifests.
+
+    Attributes:
+        url: Absolute URL of the source archive.
+        build: Human-readable build label, for logs.
+        schema: Which schema its tiles are encoded in.
+        min_zoom: Lowest zoom level the run walks.
+        max_zoom: Highest zoom level the run walks.
+        tile_data_offset: Start of the archive's tile data, which the offsets
+            in a manifest record are relative to.
+    """
+
     url: str
     build: str
     schema: SchemaName
@@ -65,6 +99,15 @@ class SourceMetadata:
 
 
 def write_source_metadata(out_dir, resolved_source, min_zoom, max_zoom, tile_data_offset):
+    """Write the `source.json` the workers read.
+
+    Args:
+        out_dir: Directory the file goes in.
+        resolved_source: The archive this run settled on.
+        min_zoom: Lowest zoom level the run walks.
+        max_zoom: Highest zoom level the run walks.
+        tile_data_offset: Start of the archive's tile data.
+    """
     metadata = SourceMetadata(
         url=resolved_source.url,
         build=resolved_source.build,
@@ -78,5 +121,18 @@ def write_source_metadata(out_dir, resolved_source, min_zoom, max_zoom, tile_dat
 
 
 def read_source_metadata(path):
+    """Read a worker's `source.json` back.
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        Its contents as a SourceMetadata.
+
+    Raises:
+        KeyError: If the document is missing a key.
+        ValueError: If its schema name or a zoom level is not one this build
+            knows.
+    """
     with open(path) as source_file:
         return SourceMetadata.from_json(json.load(source_file))

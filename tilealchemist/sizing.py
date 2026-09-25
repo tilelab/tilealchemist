@@ -26,6 +26,19 @@ DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS, ram_bytes=DEFAULT_WORKE
 
 
 def block_load(block, runner, axis, max_fetch_gap):
+    """Predict what one worker's block will cost it.
+
+    Args:
+        block: The entries assigned to that worker.
+        runner: The calibrated runner profile the RAM and disk rates come from.
+        axis: The per-axis seconds to charge.
+        max_fetch_gap: The largest gap between two entries that still shares
+            one ranged fetch.
+
+    Returns:
+        The block's predicted seconds, peak RSS, output bytes, record count
+        and peak batch size, as a BlockLoad.
+    """
     batch_bytes = peak_batch_bytes(block, max_fetch_gap)
     return BlockLoad(
         seconds=WORKER_SETUP_SECONDS + cost_weights(block, axis)[1],
@@ -36,6 +49,20 @@ def block_load(block, runner, axis, max_fetch_gap):
 
 
 def worst_load(blocks, runner, axis, max_fetch_gap):
+    """Take the worst value of each axis across every block.
+
+    No single worker need be the worst on every axis, so the result is the
+    envelope a limit has to hold against rather than any one worker's load.
+
+    Args:
+        blocks: One entry block per worker.
+        runner: The calibrated runner profile.
+        axis: The per-axis seconds to charge.
+        max_fetch_gap: The largest gap that still shares one ranged fetch.
+
+    Returns:
+        A BlockLoad whose every field is the maximum across the blocks.
+    """
     loads = [block_load(block, runner, axis, max_fetch_gap) for block in blocks]
     return BlockLoad(*(max(getattr(load, field) for load in loads)
                        for field in BlockLoad._fields))
@@ -54,6 +81,18 @@ def breaches(load, limits):
 
 
 def candidate_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
+    """The worker counts worth trying, smallest first.
+
+    Stepped by the concurrency limit, because a run goes in waves of that many
+    and a count part-way into a wave costs what the whole wave costs.
+
+    Args:
+        limits: The run's hard limits, read here for its concurrency.
+        cell_limit: The most matrix cells a run may have.
+
+    Returns:
+        The worker counts to try, in increasing order.
+    """
     step = max(limits.concurrency, 1)
     counts = list(range(step, cell_limit + 1, step))
     return counts or [cell_limit]
@@ -61,6 +100,24 @@ def candidate_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
 
 def choose_worker_count(entries, gaps, runner, axis, caps, limits=DEFAULT_LIMITS,
                         max_fetch_gap=None, cell_limit=MATRIX_CELL_LIMIT):
+    """Pick the smallest worker count whose worst worker stays inside the limits.
+
+    Args:
+        entries: The archive entries this run will walk.
+        gaps: The gap records covering tiles the archive does not hold.
+        runner: The calibrated runner profile.
+        axis: The per-axis seconds to charge.
+        caps: The per-block caps a partition has to respect.
+        limits: The run's hard limits.
+        max_fetch_gap: The largest gap that still shares one ranged fetch, or
+            None to take it from `caps`.
+        cell_limit: The most matrix cells a run may have.
+
+    Returns:
+        The chosen count, its blocks, its worst load, and every
+        `(worker_count, load, breaches)` attempt made along the way. Where no
+        count fits, the largest is returned with the budgets it still breaks.
+    """
     gap = caps.max_fetch_gap if max_fetch_gap is None else max_fetch_gap
     attempts = []
     for worker_count in candidate_counts(limits, cell_limit):

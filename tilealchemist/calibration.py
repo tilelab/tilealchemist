@@ -29,6 +29,15 @@ DEFAULT_RUNNER = RunnerProfile(rss_base=400 * 1024 * 1024, rss_per_batch_byte=4.
 
 
 def parse_usage_lines(lines):
+    """Pull the `usage:` lines out of a run's logs.
+
+    Args:
+        lines: The log lines to read; everything else is ignored.
+
+    Returns:
+        One mapping of field name to raw string value per usage line, in the
+        order they appeared.
+    """
     rows = []
     for line in lines:
         stripped = line.strip()
@@ -44,19 +53,57 @@ def parse_usage_lines(lines):
 
 
 def _scoped(rows, scope):
+    """The rows belonging to one scope.
+
+    Args:
+        rows: Parsed usage rows.
+        scope: The scope to keep, such as "worker" or "chunk".
+
+    Returns:
+        The matching rows, in order.
+    """
     return [row for row in rows if row.get("scope") == scope]
 
 
 def _total(rows, field):
+    """Sum one field across the rows that carry it.
+
+    Args:
+        rows: Parsed usage rows.
+        field: The field to sum.
+
+    Returns:
+        The total, 0.0 where no row carries that field.
+    """
     return sum(float(row[field]) for row in rows if field in row)
 
 
 def _ratio(seconds, units):
-    """Aggregated ratio, never the mean of per-unit rates: small units carry fixed overhead."""
+    """Seconds per unit, aggregated.
+
+    An aggregate ratio, never the mean of per-unit rates: a small unit
+    carries the same fixed overhead as a large one, so averaging the rates
+    would let the smallest units set the figure.
+
+    Args:
+        seconds: The total seconds spent.
+        units: The total units they went on.
+
+    Returns:
+        The seconds per unit, or None where there were no units.
+    """
     return seconds / units if units else None
 
 
 def length_buckets(chunk_rows):
+    """Total the per-length histograms across every chunk.
+
+    Args:
+        chunk_rows: Parsed usage rows for scope "chunk".
+
+    Returns:
+        A mapping of bit length to `[calls, bytes, decode, transform]`.
+    """
     totals = {}
     for row in chunk_rows:
         histogram = row.get("length_hist", "-")
@@ -73,6 +120,15 @@ def length_buckets(chunk_rows):
 
 
 def _fit_two(samples):
+    """Least-squares fit of a two-term model with no intercept.
+
+    Args:
+        samples: The `(x1, x2, target)` triples to fit.
+
+    Returns:
+        The two coefficients, or None where the samples do not determine
+        them.
+    """
     left = right = cross = first = second = 0.0
     for x_one, x_two, target in samples:
         left += x_one * x_one
@@ -88,6 +144,15 @@ def _fit_two(samples):
 
 
 def _entry_samples(buckets, density_exponent):
+    """Turn the length buckets into samples for the per-entry fit.
+
+    Args:
+        buckets: The totalled histograms, by bit length.
+        density_exponent: The power the decode cost is charged on length at.
+
+    Returns:
+        `(calls, weighted bytes, seconds)` per non-empty bucket.
+    """
     samples = []
     for count, byte_count, decode, transform in buckets.values():
         if not count:
@@ -98,6 +163,15 @@ def _entry_samples(buckets, density_exponent):
 
 
 def _residual(samples, fit):
+    """The squared error a fit leaves on its samples.
+
+    Args:
+        samples: The `(x1, x2, target)` triples that were fitted.
+        fit: The two coefficients, or None where there was no fit.
+
+    Returns:
+        The sum of squared residuals, or infinity where there was no fit.
+    """
     if fit is None:
         return math.inf
     call_cost, byte_cost = fit
@@ -106,6 +180,15 @@ def _residual(samples, fit):
 
 
 def best_density_exponent(buckets, candidates=DENSITY_CANDIDATES):
+    """The exponent whose fit leaves the least error.
+
+    Args:
+        buckets: The totalled histograms, by bit length.
+        candidates: The exponents to try.
+
+    Returns:
+        The best candidate, or None where there were none to try.
+    """
     scored = []
     for candidate in candidates:
         samples = _entry_samples(buckets, candidate)
@@ -114,6 +197,16 @@ def best_density_exponent(buckets, candidates=DENSITY_CANDIDATES):
 
 
 def correlation(left, right):
+    """Pearson correlation between two equal-length series.
+
+    Args:
+        left: One series.
+        right: The other, in the same order.
+
+    Returns:
+        The coefficient, or None where there are too few workers to score it
+        or either series does not vary at all.
+    """
     count = len(left)
     if count < MIN_SCORED_WORKERS:
         return None
@@ -125,6 +218,21 @@ def correlation(left, right):
 
 
 def _clamped(name, measured, reviewed, notes):
+    """Keep a measured coefficient within reach of the reviewed one.
+
+    One odd run should move a coefficient, not replace it, so a measurement
+    further than CLAMP_FACTOR from the reviewed value is pulled back to that
+    bound and the reason recorded.
+
+    Args:
+        name: The coefficient's name, for the note.
+        measured: What this run measured, or None.
+        reviewed: The value the reviewed cost model carries.
+        notes: The list any explanation is appended to.
+
+    Returns:
+        The value to use.
+    """
     if measured is None or not math.isfinite(measured) or measured <= 0:
         notes.append(f"{name}: nothing usable measured, keeping the reviewed {reviewed:g}")
         return reviewed
@@ -138,6 +246,15 @@ def _clamped(name, measured, reviewed, notes):
 
 
 def fit_runner_profile(rows, fallback=DEFAULT_RUNNER):
+    """Fit a runner's memory and disk rates from a run's logs.
+
+    Args:
+        rows: Parsed usage rows for the whole run.
+        fallback: The rates to keep where nothing usable was measured.
+
+    Returns:
+        The fitted RunnerProfile.
+    """
     workers, chunks, profiles = _scoped(rows, "worker"), _scoped(rows, "chunk"), _scoped(
         rows, "profile")
     rss_fit = _fit_two([(1.0, float(row["peak_batch_bytes"]), float(row["peak_rss"]))
@@ -152,6 +269,14 @@ def fit_runner_profile(rows, fallback=DEFAULT_RUNNER):
 
 
 def runner_profile_from_json(data):
+    """Read a runner profile out of a calibration document.
+
+    Args:
+        data: The parsed calibration JSON.
+
+    Returns:
+        The RunnerProfile it carries, each field defaulted where absent.
+    """
     runner = data.get("runner", {}) if isinstance(data, dict) else {}
     return RunnerProfile(**{name: float(runner[name]) if name in runner
                             else getattr(DEFAULT_RUNNER, name)
@@ -160,6 +285,24 @@ def runner_profile_from_json(data):
 
 def calibrate(rows, reviewed=AXIS_SECONDS, reviewed_setup=WORKER_SETUP_SECONDS,
               density_exponent=DENSITY_EXPONENT, runner_overhead_seconds=None):
+    """Fit the next run's cost coefficients from the last run's logs.
+
+    Every coefficient is measured and then clamped towards the reviewed one,
+    so that a single unusual run moves the model without taking it over.
+    What was clamped, and why, comes back in the notes.
+
+    Args:
+        rows: Parsed usage rows for the whole run.
+        reviewed: The reviewed per-axis seconds to measure against.
+        reviewed_setup: The reviewed per-worker setup seconds.
+        density_exponent: The power the decode cost is charged on length at.
+        runner_overhead_seconds: What a runner costs before the worker's own
+            code starts, which no log of that worker can see. None leaves the
+            reviewed setup figure alone, and says so in the notes.
+
+    Returns:
+        The fitted Calibration, with its diagnostics and its notes.
+    """
     workers, chunks = _scoped(rows, "worker"), _scoped(rows, "chunk")
     notes, diagnostics = [], {}
 
@@ -209,6 +352,18 @@ def calibrate(rows, reviewed=AXIS_SECONDS, reviewed_setup=WORKER_SETUP_SECONDS,
 
 
 def axis_seconds_from_json(data):
+    """Read the per-axis seconds out of a calibration document.
+
+    Args:
+        data: The parsed calibration JSON, either whole or just its
+            `axis_seconds`.
+
+    Returns:
+        The coefficients as an AxisSeconds.
+
+    Raises:
+        ValueError: If the document is missing any of them.
+    """
     axis = data["axis_seconds"] if "axis_seconds" in data else data
     missing = [name for name in AxisSeconds._fields if name not in axis]
     if missing:
@@ -218,6 +373,18 @@ def axis_seconds_from_json(data):
 
 
 def load_calibration_file(path):
+    """Read a calibration file.
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        Its per-axis seconds, and its runner profile.
+
+    Raises:
+        OSError: If the file cannot be read.
+        ValueError: If it is not valid JSON, or is missing a coefficient.
+    """
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
     return axis_seconds_from_json(data), runner_profile_from_json(data)

@@ -479,8 +479,12 @@ measurement.
 
 Two caps, both from `budgets.py`:
 
-- **Records per block**, from `--manifest-ram-budget` at a measured ~120 B per
-  `Entry`: 0.25 GB is 2.2M records, 0.5 GB (the default) 4.5M, 1.0 GB 8.9M.
+- **Records per block**, from `--manifest-ram-budget` at a measured ~184 B per
+  `Entry`: 0.25 GB is 1.4M records, 0.5 GB (the default) 2.9M, 1.0 GB 5.8M.
+  The figure is the list slot, the namedtuple and the ints `struct.unpack`
+  allocates per record; an earlier ~120 B assumed repeated `offset`s shared int
+  objects, which the `iter_unpack` path never does, and so let a block through at
+  1.5x its budget.
 - **Peak batch bytes**, from `--peak-batch-budget`. The peak, deliberately,
   not the block's byte sum: `_process_real_entries()` does `del blob` between
   batches, so what a worker must afford at once is its largest *batch*. That
@@ -1059,10 +1063,9 @@ listing required.
 
 ## Module invariants
 
-Facts the code depends on that the code itself cannot state. They lived in
-comments before [`COMMENT_STYLE.md`](COMMENT_STYLE.md) moved them here; each
-is a constraint an edit could break silently, so change the code and this
-section together.
+Facts that reach across modules, which no single docstring is the right
+home for (see [`DOC_STYLE.md`](DOC_STYLE.md)). Each is a constraint an edit
+could break silently, so change the code and this section together.
 
 ### Phase maps
 

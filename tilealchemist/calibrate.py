@@ -31,6 +31,11 @@ what gets committed.
 
 
 def parse_args():
+    """Parse this command's arguments.
+
+    Returns:
+        The parsed arguments.
+    """
     parser = argparse.ArgumentParser(
         description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--log", action="append", default=[],
@@ -57,6 +62,14 @@ def parse_args():
 
 
 def _read_lines(patterns):
+    """Read the log lines named on the command line.
+
+    Args:
+        patterns: Files or globs to read, empty to read standard input.
+
+    Returns:
+        Every line read, in file-name order.
+    """
     if not patterns:
         return sys.stdin.read().splitlines()
     lines = []
@@ -69,6 +82,17 @@ def _read_lines(patterns):
 
 
 def _score(manifest_dir, workers, axis):
+    """Score predicted worker durations against the measured ones.
+
+    Args:
+        manifest_dir: The run's manifests, to price each worker's block from.
+        workers: Parsed usage rows for scope "worker".
+        axis: The per-axis seconds to price with.
+
+    Returns:
+        The correlation between predicted and measured durations, or None
+        where a manifest is missing or too few workers reported to score.
+    """
     predicted, measured = [], []
     for row in workers:
         path = os.path.join(manifest_dir, f"worker-{int(row['worker']):03d}.bin")
@@ -80,6 +104,12 @@ def _score(manifest_dir, workers, axis):
 
 
 def main():
+    """Propose the next run's cost coefficients from a finished run's logs.
+
+    Returns:
+        0 on success, or 1 where no usage lines were found or only part of
+        the run reported.
+    """
     args = parse_args()
     rows = parse_usage_lines(_read_lines(args.log))
     result = calibrate(rows, runner_overhead_seconds=args.runner_overhead_seconds)

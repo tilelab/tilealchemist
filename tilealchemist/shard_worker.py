@@ -24,13 +24,31 @@ from tilealchemist.usage import (
 
 
 def split_manifest_entries(entries):
-    # compute_gaps() tags a gap length=0, there being nothing to fetch for it.
+    """Split a manifest into the entries to fetch and the gaps to fill.
+
+    Args:
+        entries: This worker's manifest records.
+
+    Returns:
+        The real entries and the gap entries, told apart by the `length=0`
+        that compute_gaps() marks a gap with, there being nothing to fetch
+        for one.
+    """
     real_entries = [entry for entry in entries if entry.length > 0]
     gap_entries = [entry for entry in entries if entry.length == 0]
     return real_entries, gap_entries
 
 
 def run_worker(args):
+    """Build one worker's shard of every profile's output layer.
+
+    One fetch per batch, shared between the profiles, then a transform and a
+    write per chunk. The shards are marked complete on the way out, so that a
+    worker cut short leaves shards a later step can tell are unfinished.
+
+    Args:
+        args: The parsed command line from build_shard.py.
+    """
     wall_start = time.perf_counter()
     phases = PhaseSeconds()
     source = read_source_metadata(args.source)
@@ -75,6 +93,16 @@ def run_worker(args):
 
 
 def _report_worker_usage(args, profiles, counts, phases, wall_start, totals):
+    """Print this worker's usage lines: one per profile, and one for itself.
+
+    Args:
+        args: The parsed command line.
+        profiles: The profiles that ran, in output order.
+        counts: Each profile's tile counts, in the same order.
+        phases: The per-phase seconds.
+        wall_start: When the worker started, by `time.perf_counter()`.
+        totals: The worker-scoped measurements to report alongside.
+    """
     for profile, out, profile_counts in zip(profiles, args.out, counts):
         report("profile", worker=args.worker_index, profile=profile.name,
                written=profile_counts.written, skipped=profile_counts.skipped,
@@ -90,6 +118,24 @@ def _report_worker_usage(args, profiles, counts, phases, wall_start, totals):
 
 def _process_real_entries(real_entries, args, source, schema, profiles, writers, counts,
                           phases):
+    """Fetch, transform and write every real entry, batch by batch.
+
+    Each batch's bytes are dropped before the next is fetched: a worker's
+    memory budget covers one batch, not the whole block's byte sum.
+
+    Args:
+        real_entries: The entries to fetch, in offset order.
+        args: The parsed command line.
+        source: The archive's metadata.
+        schema: The schema its tiles are in.
+        profiles: The profiles to run, in output order.
+        writers: Each profile's shard, in the same order.
+        counts: Each profile's tile counts, in the same order.
+        phases: The per-phase seconds to charge the work to.
+
+    Returns:
+        The bytes fetched in total, and the largest single batch.
+    """
     batches = plan_fetch_batches(real_entries, args.max_fetch_gap)
     if len(batches) > 1:
         print(f"{len(real_entries)} real entries fetched in {len(batches)} range requests "
@@ -120,7 +166,18 @@ def _process_real_entries(real_entries, args, source, schema, profiles, writers,
 
 
 def _process_gap_entries(gap_entries, schema, profiles, writers, counts):
-    """No fetch: one transform_gap() per profile covers every gap tile in the run."""
+    """Fill every gap tile, without fetching anything.
+
+    A gap carries no source data, so one `transform_gap()` per profile covers
+    every gap tile in the run between them.
+
+    Args:
+        gap_entries: The gap records this worker carries.
+        schema: The schema the output is written against.
+        profiles: The profiles to run, in output order.
+        writers: Each profile's shard, in the same order.
+        counts: Each profile's tile counts, in the same order.
+    """
     for profile_counts, profile, writer in zip(counts, profiles, writers):
         gap_data = profile.transform_gap(schema)
         profile_counts.add(*write_gap_tiles(gap_entries, writer, gap_data))

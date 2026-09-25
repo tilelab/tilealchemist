@@ -110,7 +110,7 @@ else.
 | `tilealchemist/manifest.py` | Both sides of everything `shard_prep.py` hands the workers: the binary per-worker manifest format, and the shared `source.json` (as the `SourceMetadata` record a worker reads it back into). |
 | `tilealchemist/ranged_fetch.py` | HTTP Range fetching against the source archive (session, retry/backoff, 206 enforcement, download progress), shared by `pmtiles_index.py`/`fetch_batching.py`. |
 | `tilealchemist/backoff.py`, `tilealchemist/throttle.py`, `tilealchemist/throttle_progress.sh` | HTTP retry backoff, throttled progress logging. |
-| `lint/comment_style.py` | The comment-style linter CI runs; see [`docs/COMMENT_STYLE.md`](docs/COMMENT_STYLE.md). |
+| `lint/doc_style.py` | The documentation-style linter CI runs; see [`docs/DOC_STYLE.md`](docs/DOC_STYLE.md). |
 
 ## Related projects
 
@@ -132,14 +132,16 @@ else.
 
 Bug reports and pull requests are welcome.
 
-Code here is self-documenting, and comments are held to a strict, linted
-style: one line each, attached to the code they comment on, at most five per
-file counting docstrings, with the reasoning behind a design living in
-`docs/` instead. See [`docs/COMMENT_STYLE.md`](docs/COMMENT_STYLE.md) for the
-rules and the rationale. CI enforces them; run the check yourself with:
+Documentation here is held to a strict, linted style. Every module, class
+and function carries a Google-style docstring covering what it is for, what
+it takes and how it fails. Comments are one line each, attached to the code
+they comment on, and carry only a local fact the code cannot state for
+itself; the reasoning behind a design lives in `docs/` instead. See
+[`docs/DOC_STYLE.md`](docs/DOC_STYLE.md) for the rules and the rationale. CI
+enforces them; run the check yourself with:
 
 ```sh
-python3 lint/comment_style.py tilealchemist lint
+python3 lint/doc_style.py tilealchemist lint
 ```
 
 ## License / attribution

@@ -15,6 +15,18 @@ def surface_water_union(tile):
 
 
 def _compute_union(tile):
+    """Union a tile's surface water into one closed polygon.
+
+    Each polygon is repaired before the union, and the result is buffered by
+    half an output cell, so that sub-unit gaps do not survive snapping as
+    slivers of land.
+
+    Args:
+        tile: The tile whose SURFACE_WATER features to merge.
+
+    Returns:
+        The merged water polygon, or None if the tile carries no water.
+    """
     polygons = [feature.geometry.buffer(0)
                 for feature in tile.features(SURFACE_WATER)]
     if not polygons:

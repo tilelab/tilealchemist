@@ -12,9 +12,20 @@ PLANET_RE = re.compile(r"^areas/planet/(\d{8}_\d{6})_pt/(.+)$")
 
 
 class OpenFreeMapSource(Source):
+    """The newest fully-published OpenFreeMap planet build."""
+
     schema = OPENMAPTILES
 
     def resolve(self):
+        """Pick the newest planet build that has finished converting.
+
+        Returns:
+            The chosen build as a ResolvedSource, labelled with its timestamp.
+
+        Raises:
+            RuntimeError: If no listed build carries both its `done` marker and
+                its tiles.pmtiles.
+        """
         response = requests.get(FILES_URL, timeout=30)
         response.raise_for_status()
 
