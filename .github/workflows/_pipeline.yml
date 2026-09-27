@@ -115,16 +115,19 @@ jobs:
           fi
           echo "tilealchemist: ${TILEALCHEMIST_REPOSITORY}@${TILEALCHEMIST_SHA}"
 
-      # This job runs no profile. It downloads them only so a path missing
-      # from the artifact fails here, in seconds, instead of identically in
-      # every one of `worker_count` build-shards cells after the archive walk
-      # has already run.
+      # prepare-shards imports every profile to read its `seconds_per_tile`,
+      # so this job needs them on disk for real, not just to check the paths.
+      # Unpacked at the workspace root, exactly as build-shards does it, so
+      # the paths in `profile` resolve the same in both jobs.
       - name: Download the caller's profiles
         uses: actions/download-artifact@v4
         with:
           name: ${{ inputs.profile_artifact }}
-          path: profiles
 
+      # A path missing from the artifact fails here, in seconds, instead of
+      # identically in every one of `worker_count` build-shards cells after
+      # the archive walk has already run. Must stay ahead of the checkout
+      # below, which is what keeps the `find` listing the artifact alone.
       - name: Validate every profile path is in the artifact
         env:
           PROFILE: ${{ inputs.profile }}
@@ -132,8 +135,8 @@ jobs:
         run: |
           IFS=',' read -ra PROFILE_ENTRIES <<< "$PROFILE"
           for PROFILE_PATH in "${PROFILE_ENTRIES[@]}"; do
-            if [ ! -f "profiles/$PROFILE_PATH" ]; then
-              echo "::error::profile '$PROFILE_PATH' is not in the '$PROFILE_ARTIFACT' artifact; it holds: $(cd profiles && find . -name '*.py' | sort | tr '\n' ' ')"
+            if [ ! -f "$PROFILE_PATH" ]; then
+              echo "::error::profile '$PROFILE_PATH' is not in the '$PROFILE_ARTIFACT' artifact; it holds: $(find . -name '*.py' | sort | tr '\n' ' ')"
               exit 1
             fi
           done
@@ -149,8 +152,23 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install tilealchemist
-        run: pip install ./.tilealchemist
+      # prepare-shards imports each profile, so this job needs the profiles'
+      # own PEP 723 dependencies as much as build-shards does; see
+      # docs/PROFILES.md ("Writing and distributing your own profile").
+      - name: Install tilealchemist and every profile's own dependencies
+        env:
+          PROFILE: ${{ inputs.profile }}
+        run: |
+          pip install ./.tilealchemist
+
+          REQUIREMENTS="$RUNNER_TEMP/profile-requirements.txt"
+          IFS=',' read -ra PROFILE_ENTRIES <<< "$PROFILE"
+          for PROFILE_PATH in "${PROFILE_ENTRIES[@]}"; do
+            tilealchemist-profile-requirements "$PROFILE_PATH" > "$REQUIREMENTS"
+            if [ -s "$REQUIREMENTS" ]; then
+              pip install -r "$REQUIREMENTS"
+            fi
+          done
 
       - id: walk
         name: Walk archive directory and partition into per-worker manifests

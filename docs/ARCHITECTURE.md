@@ -1021,12 +1021,15 @@ would collide by that name instead.
 
 `_pipeline.yml` never checks the calling repository out. Profiles reach it
 as **an artifact the caller uploads before calling it**, named by the
-required `profile_artifact` input, which `build-shards` unpacks at the
-workspace root so the paths in `profile` read exactly like repo-relative ones
-(`./my_profile.py`). `prepare-shards` downloads it too, but only to fail a
-`profile` path that isn't in the artifact once, in seconds, rather than
-identically in all `worker_count` build cells after the archive walk has
-already run.
+required `profile_artifact` input, which both `prepare-shards` and
+`build-shards` unpack at the workspace root so the paths in `profile` read
+exactly like repo-relative ones (`./my_profile.py`). `build-shards` runs
+them; `prepare-shards` imports them to read each one's `seconds_per_tile`,
+which is what makes its prediction profile-specific, so it installs their
+PEP 723 dependencies too. It also checks every `profile` path against the
+artifact before the walk starts, so a path that isn't there fails once, in
+seconds, rather than identically in all `worker_count` build cells after the
+archive walk has already run.
 
 The alternative, a bare `actions/checkout` (which inside a called reusable
 workflow resolves to the *caller's* repository), would work for a profile
