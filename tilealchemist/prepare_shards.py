@@ -20,14 +20,17 @@ from tilealchemist.zoom import MAX_SUPPORTED_ZOOM, ZoomLevel
 HELP = """The whole run's one-time planning step, before any shard worker starts.
 
 Walks a source PMTiles archive's directory tree once and partitions the
-resulting entries, plus computed gaps, into --worker-count contiguous
-manifests, one per worker. docs/ARCHITECTURE.md ("Fetching") says why it is
-structured this way.
+resulting entries, plus computed gaps, into contiguous manifests, one per
+worker. docs/ARCHITECTURE.md ("Fetching") says why it is structured this
+way.
+
+The worker count is never an input: the run partitions at --concurrency and
+doubles until its worst worker fits every limit (see "Sizing a run"). The
+manifests it writes are the only truth about how many workers there are.
 
 Prints the layer's attribution on stdout; every log line goes to stderr.
 
-    tilealchemist-prepare-shards --worker-count 128 --min-zoom 0 --max-zoom 14 \\
-        --out-dir manifests/
+    tilealchemist-prepare-shards --min-zoom 0 --max-zoom 14 --out-dir manifests/
 """
 
 
@@ -70,29 +73,6 @@ def schema_type(value):
             f"must be one of {', '.join(SchemaName)}") from None
 
 
-def worker_count_type(value):
-    """Parse a worker count from the command line.
-
-    Args:
-        value: The flag's raw text, either a number or "auto".
-
-    Returns:
-        The count as an int, or "auto" to have the run size itself.
-
-    Raises:
-        argparse.ArgumentTypeError: If the count falls outside what a GitHub
-            Actions matrix will expand to.
-    """
-    if value == "auto":
-        return value
-    count = int(value)  # A non-numeric value is argparse's own error to report.
-    if not 1 <= count <= MATRIX_CELL_LIMIT:
-        raise argparse.ArgumentTypeError(
-            f"must be between 1 and {MATRIX_CELL_LIMIT}, the most cells GitHub Actions will "
-            f"expand a matrix to, or \"auto\"")
-    return count
-
-
 def parse_args():
     """Parse and check this command's arguments.
 
@@ -105,30 +85,18 @@ def parse_args():
     """
     parser = argparse.ArgumentParser(
         description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--worker-count", type=worker_count_type, default=128,
-                         help=f"how many workers to split the run across (1-{MATRIX_CELL_LIMIT}, "
-                              "default 128), or \"auto\" to pick the smallest multiple of "
-                              "--concurrency whose worst worker stays inside every limit")
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                          help="how many workers actually run at once (default "
-                              f"{DEFAULT_CONCURRENCY}); \"auto\" only considers multiples of "
-                              "it, so the last wave is not mostly empty")
+                              f"{DEFAULT_CONCURRENCY}), and so the worker count the run tries "
+                              "first: it doubles from here until its worst worker fits every "
+                              f"limit, stopping at {MATRIX_CELL_LIMIT}, the most cells GitHub "
+                              "Actions will expand a matrix to. Every count tried is a multiple "
+                              "of this, so the last wave is not mostly empty")
     parser.add_argument("--job-seconds", type=float, default=DEFAULT_JOB_SECONDS,
                          help=f"a worker job's runtime limit (default {DEFAULT_JOB_SECONDS}); "
                               f"predicted seconds are charged against it at "
                               f"{TAIL_SAFETY_FACTOR:g}x, the factor by which the model "
                               "under-predicts the slow tail")
-    parser.add_argument("--max-tiles", type=int, default=None,
-                         help="the most output tiles one worker may write, unset by default. "
-                              "A block is closed as soon as another group would take it past "
-                              "the cap, which is how a run is kept under a runner's disk "
-                              "limit without anyone having to model that disk. Every tile id "
-                              "counts, a deduped run's repeats and every tile a gap covers "
-                              "alike, because a flat shard writes each of them its own row; "
-                              "it counts once per worker rather than once per profile, so a "
-                              "run building two profiles writes two shards of that many rows. "
-                              "At the ~250 B a tile measures (tilealchemist-calibrate's "
-                              "runner block), 10 GiB of runner disk is roughly 40000000")
     parser.add_argument("--profile", default=None,
                          help="comma-separated path(s) to the profile .py files this run will "
                               "build, the same value build-shard is given. Their per-tile "
@@ -162,12 +130,10 @@ def parse_args():
                              if args.axis_seconds else AXIS_SECONDS)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.error(f"--axis-seconds: {error}")
-    args.limits = Limits(job_seconds=args.job_seconds, max_tiles=args.max_tiles or 0,
-                          concurrency=args.concurrency, tail_factor=TAIL_SAFETY_FACTOR)
+    args.limits = Limits(job_seconds=args.job_seconds, concurrency=args.concurrency,
+                          tail_factor=TAIL_SAFETY_FACTOR)
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
-    if args.max_tiles is not None and args.max_tiles < 1:
-        parser.error("--max-tiles must be at least 1")
     try:
         args.profiles = ([load_profile(path)() for path in args.profile.split(",")]
                          if args.profile else None)

@@ -143,9 +143,8 @@ def main():
 
     share = result.diagnostics["decode_share"]
     if share is not None:
-        print(f"decode is {share:.1%} of per-entry CPU, transform {1 - share:.1%}; the length "
-              f"curve prefers DENSITY_EXPONENT "
-              f"{result.diagnostics['best_density_exponent']}", file=sys.stderr)
+        print(f"decode is {share:.1%} of per-entry CPU, transform {1 - share:.1%}",
+              file=sys.stderr)
     for note in result.notes:
         print(f"::warning title=calibration::{note}", file=sys.stderr)
 
@@ -166,7 +165,6 @@ def main():
     if args.out:
         payload = {"axis_seconds": result.axis_seconds._asdict(),
                    "worker_setup_seconds": result.worker_setup_seconds,
-                   "density_exponent": result.density_exponent,
                    "runner": result.runner._asdict(),
                    "diagnostics": result.diagnostics, "notes": result.notes}
         if args.source:

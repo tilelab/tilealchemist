@@ -14,12 +14,12 @@ DEFAULT_JOB_SECONDS = 6 * 3600
 # The model under-predicts the slow tail by 2-4x, so a time budget is spent at this rate.
 TAIL_SAFETY_FACTOR = 4.0
 
-Limits = namedtuple("Limits", "job_seconds max_tiles concurrency tail_factor")
+Limits = namedtuple("Limits", "job_seconds concurrency tail_factor")
 
 BlockLoad = namedtuple("BlockLoad", "seconds tiles records batch_bytes")
 
-DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS, max_tiles=0,
-                        concurrency=DEFAULT_CONCURRENCY, tail_factor=TAIL_SAFETY_FACTOR)
+DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS, concurrency=DEFAULT_CONCURRENCY,
+                        tail_factor=TAIL_SAFETY_FACTOR)
 
 
 def block_load(block, axis, profiles=None):
@@ -66,16 +66,18 @@ def breaches(load, limits):
     broken = []
     if load.seconds * limits.tail_factor > limits.job_seconds:
         broken.append("time")
-    if limits.max_tiles and load.tiles > limits.max_tiles:
-        broken.append("tiles")
     return broken
 
 
 def candidate_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
     """The worker counts worth trying, smallest first.
 
-    Stepped by the concurrency limit, because a run goes in waves of that many
-    and a count part-way into a wave costs what the whole wave costs.
+    Starts at the concurrency limit, because a run goes in waves of that many
+    and a count part-way into a wave costs what the whole wave costs, and
+    doubles from there: every candidate stays a multiple of the concurrency,
+    and a run that needs many workers reaches them in a handful of partitions
+    rather than one per wave. The cell limit is the last candidate whether or
+    not the doubling lands on it.
 
     Args:
         limits: The run's hard limits, read here for its concurrency.
@@ -84,21 +86,27 @@ def candidate_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
     Returns:
         The worker counts to try, in increasing order.
     """
-    step = max(limits.concurrency, 1)
-    counts = list(range(step, cell_limit + 1, step))
-    return counts or [cell_limit]
+    counts, count = [], max(limits.concurrency, 1)
+    while count < cell_limit:
+        counts.append(count)
+        count *= 2
+    return counts + [cell_limit]
 
 
 def choose_worker_count(entries, gaps, axis, limits=DEFAULT_LIMITS,
                         cell_limit=MATRIX_CELL_LIMIT, profiles=None):
-    """Pick the smallest worker count whose worst worker stays inside the limits.
+    """Pick the first worker count whose worst worker stays inside the limits.
+
+    Partitions at the concurrency limit and doubles until every limit holds,
+    so a run that fits the first try pays one partition pass and the worst
+    case pays a handful. Every limit falls as the count rises, so the first
+    count that fits is also the cheapest one that does.
 
     Args:
         entries: The archive entries this run will walk.
         gaps: The gap records covering tiles the archive does not hold.
         axis: The per-axis seconds to charge.
-        limits: The run's hard limits, whose tile cap the partition also
-            holds each block to.
+        limits: The run's hard limits.
         cell_limit: The most matrix cells a run may have.
         profiles: The profiles the run builds, priced into the time.
 
@@ -109,13 +117,11 @@ def choose_worker_count(entries, gaps, axis, limits=DEFAULT_LIMITS,
     """
     attempts = []
     for worker_count in candidate_counts(limits, cell_limit):
-        blocks = partition_into_worker_blocks(entries, gaps, worker_count,
-                                               limits.max_tiles, axis)
+        blocks = partition_into_worker_blocks(entries, gaps, worker_count, axis)
         load = worst_load(blocks, axis, profiles)
         broken = breaches(load, limits)
         attempts.append((worker_count, load, broken))
         if not broken:
-            return worker_count, blocks, load, attempts
-    worker_count, load, _broken = attempts[-1]
-    return worker_count, partition_into_worker_blocks(
-        entries, gaps, worker_count, limits.max_tiles, axis), load, attempts
+            break
+    # Whether the loop broke out or ran dry, the last partition is the one to keep.
+    return worker_count, blocks, load, attempts

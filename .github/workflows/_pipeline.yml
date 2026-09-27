@@ -60,16 +60,11 @@ on:
         required: false
         type: string
         default: "14"
-      worker_count:
-        description: "How many parallel shard-building jobs to fan out into (1-256, GitHub's matrix limit), or \"auto\" to let prepare-shards pick the smallest multiple of the concurrency whose worst worker stays inside every limit. Higher isn't necessarily faster: GitHub queues more than ~20 concurrently running jobs on a public repo, so it mainly trades job count for job size (see docs/ARCHITECTURE.md \"Parallelism\" and \"Sizing a run\")."
+      concurrency:
+        description: "How many shard-building jobs GitHub will actually run at once, which is also the worker count prepare-shards tries first: it doubles from here until its worst worker fits every limit, stopping at 256, GitHub's matrix limit. The worker count itself is never an input -- the manifests prepare-shards writes are the only truth about how many there are. GitHub queues more than ~20 concurrently running jobs on a public repo, so the default matches that; lower it to keep a small run from fanning out into mostly-empty cells (see docs/ARCHITECTURE.md \"Parallelism\" and \"Sizing a run\")."
         required: false
         type: string
-        default: "128"
-      max_tiles:
-        description: "The most output tiles one worker may write, e.g. \"40000000\". Left empty (the default) nothing caps a worker, and a block is sized by cost alone; set it to keep a worker inside a runner's disk. Every tile id counts, a deduped run's repeats and the tiles a gap covers alike, because a flat shard writes each of them its own row (see docs/ARCHITECTURE.md \"Budgets are caps, not prices\")."
-        required: false
-        type: string
-        default: ""
+        default: "20"
       output_basename:
         description: "Base name for each profile's output .pmtiles file and artifact: one value, or a comma-separated list matched 1:1 with profile, e.g. \"land\" or \"land,cropped-waterways\"."
         required: true
@@ -85,6 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       workers: ${{ steps.gen-workers.outputs.workers }}
+      worker_count: ${{ steps.gen-workers.outputs.worker_count }}
       profile_pairs: ${{ steps.gen-pairs.outputs.profile_pairs }}
       attribution: ${{ steps.walk.outputs.attribution }}
     steps:
@@ -178,12 +174,11 @@ jobs:
           SOURCE: ${{ inputs.source }}
           SOURCE_URL: ${{ inputs.source_url }}
           SCHEMA: ${{ inputs.schema }}
-          WORKER_COUNT: ${{ inputs.worker_count }}
+          CONCURRENCY: ${{ inputs.concurrency }}
           ATTRIBUTION: ${{ inputs.attribution }}
           PROFILE: ${{ inputs.profile }}
-          MAX_TILES: ${{ inputs.max_tiles }}
         run: |
-          ARGS=(--worker-count "$WORKER_COUNT" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests --profile "$PROFILE")
+          ARGS=(--concurrency "$CONCURRENCY" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests --profile "$PROFILE")
           if [ -n "$SOURCE_URL" ]; then
             ARGS+=(--source-url "$SOURCE_URL")
           fi
@@ -192,9 +187,6 @@ jobs:
           fi
           if [ -n "$ATTRIBUTION" ]; then
             ARGS+=(--attribution "$ATTRIBUTION")
-          fi
-          if [ -n "$MAX_TILES" ]; then
-            ARGS+=(--max-tiles "$MAX_TILES")
           fi
           # stdout is the layer attribution the merge job stamps in; the run's
           # log lines go to stderr and pass straight through. The template is
@@ -210,11 +202,11 @@ jobs:
           name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shard-manifests
           path: manifests
 
-      # Counted from the manifests, not from the input: `worker_count: auto`
-      # lets prepare-shards choose, and the manifests it wrote are then the
-      # only truth about how many there are. The 256 check is GitHub's own
-      # matrix limit, which it would otherwise report as an unhelpful error
-      # after the whole archive walk has already run.
+      # Counted from the manifests, never from an input: prepare-shards sizes
+      # the run itself, so the manifests it wrote are the only truth about how
+      # many workers there are. The 256 check is GitHub's own matrix limit,
+      # which it would otherwise report as an unhelpful error after the whole
+      # archive walk has already run.
       - id: gen-workers
         name: Generate worker index matrix
         run: |
@@ -225,6 +217,7 @@ jobs:
               sys.exit(f"::error::prepare-shards wrote {count} manifests; a GitHub Actions "
                        f"matrix expands to at most 256 cells")
           print(f"workers={json.dumps(list(range(count)))}")
+          print(f"worker_count={count}")
           PY
 
       - id: gen-pairs
@@ -378,7 +371,7 @@ jobs:
           PROFILE: ${{ matrix.pair.profile }}
           MIN_ZOOM: ${{ inputs.min_zoom }}
           MAX_ZOOM: ${{ inputs.max_zoom }}
-          WORKER_COUNT: ${{ inputs.worker_count }}
+          WORKER_COUNT: ${{ needs.prepare-shards.outputs.worker_count }}
         run: |
           SHARD_COUNT=$(find shards -name "${OUTPUT_BASENAME}-shard-*.mbtiles" | wc -l | tr -d ' ')
           SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)

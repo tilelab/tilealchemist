@@ -5,14 +5,9 @@ import sys
 from tilealchemist.attribution import compose_attribution, fetch_declared_attribution
 from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_weights
 from tilealchemist.manifest import write_source_metadata, write_worker_manifests
-from tilealchemist.partition import (
-    block_gap_tiles,
-    block_tiles,
-    compute_gaps,
-    partition_into_worker_blocks,
-)
+from tilealchemist.partition import block_gap_tiles, block_tiles
 from tilealchemist.sizing import breaches, choose_worker_count, worst_load
-from tilealchemist.pmtiles_index import collect_entries
+from tilealchemist.pmtiles_index import collect_entries, compute_gaps
 from tilealchemist.ranged_fetch import make_session
 from tilealchemist.sources import resolve_source
 
@@ -64,14 +59,7 @@ def run_prepare(args):
     print(f"wrote {len(blocks)} manifests to {args.out_dir} "
           f"({non_empty_count} non-empty)", file=sys.stderr)
     print(f"largest block holds {max(len(block) for block in blocks)} records", file=sys.stderr)
-    print(_tiles_line(blocks, args.limits.max_tiles), file=sys.stderr)
-    overruns = _cap_overruns(blocks, args.limits.max_tiles)
-    if overruns:
-        print(f"::warning title=worker budget::{len(overruns)} of {len(blocks)} blocks write "
-              f"more tiles than --max-tiles, worst "
-              f"{max(overruns, key=lambda run: run[2])[2]}; there is nowhere else to put the "
-              f"work at {worker_count} workers, so raise --worker-count or raise --max-tiles",
-              file=sys.stderr)
+    print(_tiles_line(blocks), file=sys.stderr)
     load = worst_load(blocks, args.axis_seconds, args.profiles)
     broken = breaches(load, args.limits)
     print(f"worst worker: {load.seconds / 60:.0f}m predicted, {load.tiles} output tiles, "
@@ -91,45 +79,33 @@ def run_prepare(args):
     print(attribution)
 
 
-def _cap_overruns(blocks, max_tiles):
-    """Blocks the cap could not hold; the last block takes the remainder however big it is.
+def _tiles_line(blocks):
+    """Say what the worst block writes.
 
     Args:
         blocks: One entry block per worker.
-        max_tiles: The output tiles one worker may write, or 0 for no cap.
-
-    Returns:
-        `(index, records, tiles)` for every block over the cap.
-    """
-    if not max_tiles:
-        return []
-    return [(index, len(block), block_tiles(block)) for index, block in enumerate(blocks)
-            if block_tiles(block) > max_tiles]
-
-
-def _tiles_line(blocks, max_tiles):
-    """Say what the worst block writes, and how much of the tile cap that takes.
-
-    Args:
-        blocks: One entry block per worker.
-        max_tiles: The output tiles one worker may write, or 0 for no cap.
 
     Returns:
         That line, ready for stderr.
     """
     worst = max(blocks, key=block_tiles)
     tiles, gap_tiles = block_tiles(worst), block_gap_tiles(worst)
-    against = (f"{100 * tiles / max_tiles:.0f}% of the {max_tiles} --max-tiles cap"
-               if max_tiles else "against no --max-tiles cap")
     return (f"worst block: {len(worst)} records writing {tiles} output tiles "
-            f"({gap_tiles} of them gap tiles), {against}")
+            f"({gap_tiles} of them gap tiles)")
 
 
 def _size_run(args, entries, gaps):
-    """The worker count this run uses and its blocks: as asked for, or the smallest that fits."""
-    if args.worker_count != "auto":
-        return args.worker_count, partition_into_worker_blocks(
-            entries, gaps, args.worker_count, args.limits.max_tiles, args.axis_seconds)
+    """The worker count this run sized itself to, and its blocks.
+
+    Args:
+        args: The parsed command line, for the limits, axis and profiles.
+        entries: The archive's directory entries for this run.
+        gaps: The gap records covering what the archive does not hold.
+
+    Returns:
+        The chosen worker count and its blocks. Every count tried is logged,
+        so the log says which limit pushed the run to the count it landed on.
+    """
     worker_count, blocks, _load, attempts = choose_worker_count(
         entries, gaps, args.axis_seconds, args.limits, profiles=args.profiles)
     for tried, load, broken in attempts:

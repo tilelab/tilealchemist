@@ -1,8 +1,14 @@
-"""A URL in, every directory entry covering the zoom range out, in offset order."""
+"""A URL in, every directory entry covering the zoom range out, in offset order.
+
+Also covers what the archive does *not* hold: compute_gaps() reads the same
+entries back and names the tile id ranges nothing in the index covers.
+"""
+import operator
 import sys
 
 from pmtiles.tile import deserialize_directory, deserialize_header, zxy_to_tileid
 
+from tilealchemist.manifest import Entry
 from tilealchemist.ranged_fetch import DownloadProgress, fetch_range
 from tilealchemist.throttle import UpdateLineThrottle
 
@@ -10,6 +16,9 @@ PMTILES_HEADER_LENGTH = 127
 
 # PMTiles v3 section 4 requires header plus root inside the first 16,384 bytes.
 HEADER_AND_ROOT_PREFIX_LENGTH = 16 * 1024
+
+# Caps one gap record, so a single unbroken gap cannot land wholly on one worker.
+GAP_CHUNK_SIZE = 200_000
 
 LOG_INTERVAL = 1.0
 RETRY_LABEL = "prepare-shards"
@@ -154,6 +163,47 @@ def tile_id_bounds(min_zoom, max_zoom):
         fills between.
     """
     return zxy_to_tileid(min_zoom, 0, 0), zxy_to_tileid(max_zoom + 1, 0, 0)
+
+
+def compute_gaps(entries, min_zoom, max_zoom):
+    """Find the tile ranges the archive holds nothing for.
+
+    Args:
+        entries: The archive's directory entries for this run.
+        min_zoom: Lowest zoom level the run walks.
+        max_zoom: Highest zoom level the run walks.
+
+    Returns:
+        Gap records covering every tile id in range that no entry covers,
+        chunked so that no one record is larger than GAP_CHUNK_SIZE.
+    """
+    tile_id_start, tile_id_limit = tile_id_bounds(min_zoom, max_zoom)
+    gaps = []
+    expected = tile_id_start
+    # Entries never overlap, so sorted by tile_id their ends are non-decreasing too.
+    for entry in sorted(entries, key=operator.attrgetter("tile_id")):
+        if entry.tile_id > expected:
+            gaps.extend(_chunk_gap(expected, entry.tile_id))
+        expected = entry.tile_id + entry.run_length
+    if expected < tile_id_limit:
+        gaps.extend(_chunk_gap(expected, tile_id_limit))
+    return gaps
+
+
+def _chunk_gap(start, end):
+    """Cut one gap into records small enough to spread across workers.
+
+    Args:
+        start: First uncovered tile id.
+        end: One past the last uncovered tile id.
+
+    Returns:
+        Gap records spanning the range, each marked by the `length=0` sentinel
+        that split_manifest_entries() tells a gap by.
+    """
+    return [Entry(tile_id=chunk_start, offset=0, length=0,
+                  run_length=min(GAP_CHUNK_SIZE, end - chunk_start))
+            for chunk_start in range(start, end, GAP_CHUNK_SIZE)]
 
 
 def walk_directory_tree(root_directory, leaf_window, tile_id_start, tile_id_limit):

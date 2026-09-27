@@ -3,52 +3,6 @@ import itertools
 import operator
 
 from tilealchemist.cost import AXIS_SECONDS, cost_weights
-from tilealchemist.manifest import Entry
-from tilealchemist.pmtiles_index import tile_id_bounds
-
-# Caps one gap record, so a single unbroken gap cannot land wholly on one worker.
-GAP_CHUNK_SIZE = 200_000
-
-
-def compute_gaps(entries, min_zoom, max_zoom):
-    """Find the tile ranges the archive holds nothing for.
-
-    Args:
-        entries: The archive's directory entries for this run.
-        min_zoom: Lowest zoom level the run walks.
-        max_zoom: Highest zoom level the run walks.
-
-    Returns:
-        Gap records covering every tile id in range that no entry covers,
-        chunked so that no one record is larger than GAP_CHUNK_SIZE.
-    """
-    tile_id_start, tile_id_limit = tile_id_bounds(min_zoom, max_zoom)
-    gaps = []
-    expected = tile_id_start
-    # Entries never overlap, so sorted by tile_id their ends are non-decreasing too.
-    for entry in sorted(entries, key=operator.attrgetter("tile_id")):
-        if entry.tile_id > expected:
-            gaps.extend(_chunk_gap(expected, entry.tile_id))
-        expected = entry.tile_id + entry.run_length
-    if expected < tile_id_limit:
-        gaps.extend(_chunk_gap(expected, tile_id_limit))
-    return gaps
-
-
-def _chunk_gap(start, end):
-    """Cut one gap into records small enough to spread across workers.
-
-    Args:
-        start: First uncovered tile id.
-        end: One past the last uncovered tile id.
-
-    Returns:
-        Gap records spanning the range, each marked by the `length=0` sentinel
-        that split_manifest_entries() tells a gap by.
-    """
-    return [Entry(tile_id=chunk_start, offset=0, length=0,
-                  run_length=min(GAP_CHUNK_SIZE, end - chunk_start))
-            for chunk_start in range(start, end, GAP_CHUNK_SIZE)]
 
 
 def block_tiles(entries):
@@ -117,30 +71,18 @@ def _atomic_groups(weighted_records, atomic_key, share_limit):
         yield run, run_weight
 
 
-def _reserved_at(reserved, worker_index):
-    """The tiles already spoken for in this worker's block, or 0 where none are."""
-    return reserved[worker_index] if worker_index < len(reserved) else 0
-
-
-def partition_by_cost(records, worker_count, atomic_key=None, max_tiles=0, axis=AXIS_SECONDS,
-                      reserved=()):
+def partition_by_cost(records, worker_count, atomic_key=None, axis=AXIS_SECONDS):
     """Spread records across workers so each carries a similar predicted cost.
 
     Args:
         records: The records to spread, in walk order.
         worker_count: How many blocks to produce.
         atomic_key: What makes two records inseparable, or None.
-        max_tiles: The output tiles one block may write, or 0 for no cap.
         axis: The per-axis seconds to charge.
-        reserved: Tiles each worker's block owes before it takes any of these
-            records, in worker order; a short sequence reserves nothing for
-            the workers past its end.
 
     Returns:
-        One list of records per worker, in worker order. A block is closed as
-        soon as another group would take it past `max_tiles`, its reservation
-        included; the last block takes whatever is left, however far past its
-        share and its cap that puts it.
+        One list of records per worker, in worker order. The last block takes
+        whatever is left, however far past its share that puts it.
     """
     weights, total_weight = cost_weights(records, axis)
     groups = _atomic_groups(zip(records, weights), atomic_key,
@@ -148,26 +90,17 @@ def partition_by_cost(records, worker_count, atomic_key=None, max_tiles=0, axis=
     blocks = [[] for _ in range(worker_count)]
     worker_index = 0
     assigned_weight = 0.0
-    tiles = _reserved_at(reserved, 0)
     for group, group_weight in groups:
-        group_tiles = block_tiles(group)
-        # An empty block takes a group however large it is, since something has to.
-        if (worker_index < worker_count - 1 and blocks[worker_index] and max_tiles
-                and tiles + group_tiles > max_tiles):
-            worker_index += 1
-            tiles = _reserved_at(reserved, worker_index)
         blocks[worker_index].extend(group)
-        tiles += group_tiles
         assigned_weight += group_weight
         # A group can span several shares, and every one it covered must be skipped.
         while (worker_index < worker_count - 1
                and assigned_weight >= _share_end(total_weight, worker_index, worker_count)):
             worker_index += 1
-            tiles = _reserved_at(reserved, worker_index)
     return blocks
 
 
-def partition_into_worker_blocks(entries, gaps, worker_count, max_tiles=0, axis=AXIS_SECONDS):
+def partition_into_worker_blocks(entries, gaps, worker_count, axis=AXIS_SECONDS):
     """Build each worker's block from both the real entries and the gaps.
 
     The two are spread separately, so that gap work, which needs no fetch at
@@ -177,7 +110,6 @@ def partition_into_worker_blocks(entries, gaps, worker_count, max_tiles=0, axis=
         entries: The archive's directory entries for this run.
         gaps: The gap records covering what the archive does not hold.
         worker_count: How many blocks to produce.
-        max_tiles: The output tiles one worker may write, or 0 for no cap.
         axis: The per-axis seconds to charge.
 
     Returns:
@@ -185,30 +117,7 @@ def partition_into_worker_blocks(entries, gaps, worker_count, max_tiles=0, axis=
     """
     gap_blocks = partition_by_cost(gaps, worker_count, axis=axis)
     real_blocks = partition_by_cost(entries, worker_count,
-                                    atomic_key=operator.attrgetter("offset"),
-                                    max_tiles=max_tiles, axis=axis,
-                                    reserved=_gap_reservations(gap_blocks, max_tiles))
+                                    atomic_key=operator.attrgetter("offset"), axis=axis)
     return [real_block + gap_block
             for real_block, gap_block in zip(real_blocks, gap_blocks)]
-
-
-def _gap_reservations(gap_blocks, max_tiles):
-    """The tiles each worker's gaps take before its real entries get any.
-
-    A gap is fetched from nowhere, so it costs no download. The output tiles
-    it stands for are written to the same shard as everything else, though,
-    so the real entries are partitioned into what the gaps leave rather than
-    beside them.
-
-    Args:
-        gap_blocks: The gap records already assigned to each worker.
-        max_tiles: The output tiles one worker may write, or 0 for no cap.
-
-    Returns:
-        One reservation per worker, or nothing to reserve where no cap holds
-        the blocks to anything.
-    """
-    if not max_tiles:
-        return ()
-    return [block_tiles(gap_block) for gap_block in gap_blocks]
 

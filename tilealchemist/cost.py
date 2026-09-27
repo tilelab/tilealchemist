@@ -1,21 +1,18 @@
 """What one manifest record costs a worker, in seconds; see docs/ARCHITECTURE.md "Parallelism"."""
 from collections import namedtuple
 
-# Fitted against a planet run's 128 worker durations: decode outgrows byte length.
-DENSITY_EXPONENT = 1.5
-
 # The 39s floor across a planet run's 128 workers: runner boot, artifact download, pip install.
 WORKER_SETUP_SECONDS = 39.0
 
 AxisSeconds = namedtuple(
     "AxisSeconds", "manifest_record decode_call fetched_byte decoded_byte output_tile")
 
-# decoded_byte is charged on length**DENSITY_EXPONENT, the other per-byte axis on length itself.
+# Both per-byte axes charge length itself; docs/ARCHITECTURE.md has the retired decode exponent.
 AXIS_SECONDS = AxisSeconds(
     manifest_record=1e-6,
     decode_call=2.5e-4,
     fetched_byte=3.3e-7,
-    decoded_byte=2e-9,
+    decoded_byte=1.1e-7,
     output_tile=4.9e-7,
 )
 
@@ -42,7 +39,7 @@ def _record_costs(records, axis, per_tile_seconds=0.0):
         entry = 0.0
         if key != previous_key:
             entry = (axis.decode_call + axis.fetched_byte * record.length
-                     + axis.decoded_byte * record.length ** DENSITY_EXPONENT
+                     + axis.decoded_byte * record.length
                      + per_tile_seconds)
             previous_key = key
         yield axis.manifest_record + entry + axis.output_tile * record.run_length

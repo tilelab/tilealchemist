@@ -102,10 +102,10 @@ The defaults a profile can override, but usually doesn't:
   profile's own measurement — the work is its shapely, not tilealchemist's —
   and the default is deliberately pessimistic, so an undeclared profile
   plans a bigger run rather than one that runs out of time. There is no
-  storage figure to declare beside it: how much a worker writes is capped by
-  `--max-tiles` in rows, not predicted from the profile in bytes. See
-  [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#budgets-are-caps-not-prices)
-  "Budgets are caps, not prices".
+  storage figure to declare beside it: nothing bounds what a worker writes,
+  and a run is sized on time alone. See
+  [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#why-no-budget-caps-a-worker)
+  "Why no budget caps a worker" for the caps that were tried and dropped.
 - **`_encode_tile(features, extent)`** wraps `mvt.encode_tile()` with this
   profile's own `output_layer_name` filled in, and is the one place a profile
   touches the MVT codec directly, for a `transform_gap` or
