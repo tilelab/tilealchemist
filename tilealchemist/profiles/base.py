@@ -17,9 +17,15 @@ class Profile(ABC):
     Attributes:
         name: The profile's name, which its output layer and its .mbtiles are
             named after unless overridden.
+        seconds_per_tile: What `transform_tile()` costs on one deduped source
+            tile. A profile's own measurement, since the work is its shapely,
+            not tilealchemist's; see docs/ARCHITECTURE.md "What a record costs".
     """
 
     name: str
+
+    # Pessimistic default: an undeclared profile is costed as passing tiles through.
+    seconds_per_tile: float = 1e-3
 
     @property
     def output_layer_name(self):

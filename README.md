@@ -32,7 +32,7 @@ Everything runs on GitHub Actions; there is nothing to install to trigger a
 build. A caller workflow calls `_pipeline.yml` (see
 [`docs/PROFILES.md`](docs/PROFILES.md) for a complete one), which walks the
 source archive once, fans out to `worker_count` parallel workers (128 by
-default, or `auto` to size the run against its own budgets), and merges
+default, or `auto` to size the run against its own limits), and merges
 each profile's shards into its own `.pmtiles`
 artifact. `profile`/`output_basename` accept a comma-separated list, so one
 run can build several profiles off a single `prepare-shards` walk and a
@@ -86,9 +86,8 @@ else.
 | `tilealchemist/shard_prep.py` | The run's one-time planning step: resolves the `Source`, drives the walk and the partition, writes the manifests, logs the run. Needs a `Source`, not a `Profile`. |
 | `tilealchemist/attribution.py` | What a built layer credits: reads the attribution the source archive declares for itself, and fills the caller's `{source}` template in with it. |
 | `tilealchemist/pmtiles_index.py` | The source archive's directory index: header + root, then only the leaf directories the zoom range needs, in two range requests, walked and zoom-pruned in memory into directory entries. |
-| `tilealchemist/partition.py` | Those entries (plus the gaps between them) into one balanced, contiguous block of work per worker, inside the hard caps. No network, no files. |
-| `tilealchemist/budgets.py` | The caps themselves: how many manifest records a worker may hold and how big its largest range request may get. |
-| `tilealchemist/sizing.py` | Picks `worker_count` itself (`--worker-count auto`): the smallest multiple of the concurrency whose worst worker fits the time, RAM and disk budgets. |
+| `tilealchemist/partition.py` | Those entries (plus the gaps between them) into one balanced, contiguous block of work per worker, inside `--max-tiles` where a run sets one. No network, no files. |
+| `tilealchemist/sizing.py` | Picks `worker_count` itself (`--worker-count auto`): the smallest multiple of the concurrency whose worst worker fits the job's time limit and, where one is set, `--max-tiles`. |
 | `tilealchemist/calibration.py` | Fits the next run's cost coefficients from the last run's `usage:` lines, with the guards that stop a bad fit being adopted. |
 | `tilealchemist/calibrate.py` | CLI for that: prints what it would change and, with `--out`, writes a `calibration.json`. It never edits `cost.py`. |
 | `tilealchemist/build_shard.py` | One worker's entry point: parses its flags, then hands off to `shard_worker.py`. |

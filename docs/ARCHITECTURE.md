@@ -294,7 +294,7 @@ in seconds, and a record's cost is their terms added up:
 - **Per byte fetched**, also once per distinct entry: the range GET is real
   time, and bytes are what bound a worker's peak blob memory.
 - **Per record**, at its measured cost; the memory bound it used to stand in
-  for is an explicit cap now (see "Budgets are caps, not prices").
+  for is `--max-tiles` now (see "Budgets are caps, not prices").
 - **Per output tile**, one sqlite insert per tile per profile.
 
 `cost_weights()` therefore returns a predicted *duration* rather than a
@@ -470,40 +470,71 @@ produced 3.8M on **that** run, and on a run with a different record
 distribution the same coefficient produces something else. A price cannot
 enforce a limit; it can only make crossing it expensive.
 
-So the limits are limits now. `partition_by_cost()` takes `Caps` and closes a
-block the moment another group would break one, whatever the cost balance
-says -- one condition in the loop beside the existing `_share_end` comparison.
-Exact instead of statistical, and `manifest_record` goes back to its measured
+So the limits are limits now. `partition_by_cost()` closes a block the
+moment another group would break one, whatever the cost balance says -- one
+condition in the loop beside the existing `_share_end` comparison. Exact
+instead of statistical, and `manifest_record` goes back to its measured
 ~1e-6, which leaves the cost model with no coefficient in it that is not a
 measurement.
 
-Two caps, both from `budgets.py`:
+There is exactly one such limit, and a run sets it or does without:
+**`--max-tiles`**, the output tiles one worker may write. Unset by default,
+because nothing about a correct run needs it -- it exists to keep a worker
+inside whatever disk the runner it lands on happens to have.
 
-- **Records per block**, from `--manifest-ram-budget` at a measured ~184 B per
-  `Entry`: 0.25 GB is 1.4M records, 0.5 GB (the default) 2.9M, 1.0 GB 5.8M.
-  The figure is the list slot, the namedtuple and the ints `struct.unpack`
-  allocates per record; an earlier ~120 B assumed repeated `offset`s shared int
-  objects, which the `iter_unpack` path never does, and so let a block through at
-  1.5x its budget.
-- **Peak batch bytes**, from `--peak-batch-budget`. The peak, deliberately,
-  not the block's byte sum: `_process_real_entries()` does `del blob` between
-  batches, so what a worker must afford at once is its largest *batch*. That
-  is not a model but an arithmetic fact, and `budgets.py` tracks it by the
-  same rule `plan_fetch_batches()` splits on, incrementally as groups are
-  added rather than by re-planning the block each time.
+It replaced a run of steadily more elaborate byte budgets: **records per
+block** at a measured ~184 B per `Entry`, **peak batch bytes**, and then a
+single `--worker-disk-budget` that the manifest, the one spooled batch and
+the shards were all charged against. Each was more faithful than the last,
+and each needed the same thing to work: a model of what a source byte turns
+into on the runner's disk. That model in turn needed numbers only a profile
+could give -- a declared `storage_reduction`, a weighed `gap_tile_bytes()`,
+a measured per-row overhead -- so the accuracy of a cap meant to stop a
+worker filling a disk rested on a chain of ratios, one of them declared by
+hand in somebody else's repository.
 
-A record cap can also split an *atomic* group, and has to. `atomic_key`
-groups a run of records sharing an `(offset)`, and such a run can be larger
-than the whole cap on its own -- one real worker held 1,449,554 records that
-deduped to a single distinct entry. `_atomic_groups()` already splits such a
-run once it outgrows a share; the cap is a second reason to split, and the
-cost of splitting is one extra decode, because the dedup check only ever
-compares against the previous entry anyway.
+A tile count needs none of it. It is the unit the pipeline is already
+denominated in, `prepare-shards` knows exactly how many each block writes
+before it writes a manifest, and the operator's conversion is one
+multiplication they can check: `tilealchemist-calibrate` fits **shard bytes
+per output tile** from the last run's `usage:` lines (~250 B), so ~10 GiB of
+runner disk is ~40M tiles. Being out by a factor of two there is visible in
+a way that a chain of ratios is not.
+
+**What counts is a row, not a record.** `block_tiles()` sums `run_length`
+over the block, so:
+
+- a **deduped run** contributes every tile id it covers. The archive stores
+  one blob for 40 identical ocean tiles and the worker writes 40 rows, because
+  a shard is flat and only the merge deduplicates (see "Shard layout").
+- a **gap** contributes every tile id it covers, for exactly the same reason.
+- a **record** contributes nothing by itself. Its ~184 B of namedtuple
+  against a row's ~250 B of shard is not worth a second axis.
+
+It counts **per worker, not per profile**: a run building two profiles
+writes two shards of that many rows. That multiplication stays with the
+operator, who knows how many profiles they asked for.
+
+The gaps are spread across workers before the real entries are, so each
+worker's gap block is known by the time the real partition runs.
+`_gap_reservations()` hands `partition_by_cost()` the tiles those gaps
+already cost that worker, and its running count starts the block owing
+them, so the real entries are partitioned into what the gaps *leave* rather
+than beside them. Measured on a 6K-entry synthetic manifest whose 120 gaps
+come to 600K of its 653K output tiles, at 16 workers under a 40K cap:
+reserved, blocks 0-14 land between 39,976 and 40,040 tiles and the remainder
+goes to block 15; unreserved, eight of them sit at 43,300, 8% over. The 40
+tiles of overshoot are one atomic group landing on a block whose reservation
+left no room for even one, which is the same rule that has an empty block
+take a group however large it is: something has to.
 
 What a cap cannot do is invent workers. The last block takes whatever is
-left, however big, so `prepare-shards` says out loud when a block overran and
-names raising `--worker-count` as the fix -- which is the job the
-`worker_count` search does automatically.
+left, however big, so `prepare-shards` prints the worst block against the
+cap and says out loud when one overran, naming `--worker-count` as the fix
+-- which is the job the `worker_count` search does automatically:
+
+    worst block: 458123 records writing 7798155 output tiles (7340032 of
+    them gap tiles), 19% of the 40000000 --max-tiles cap
 
 Counting records, the unit used before any of this, fails the other way: it
 is *exactly* even and says nothing about cost. In a 128-worker planet run it
@@ -517,6 +548,23 @@ Since only ~20 jobs run concurrently anyway, balancing does not move the
 floor: 16 core-hours over 20 lanes is ~48 minutes either way. What it
 removes is the tail. That run spent its last 19 minutes at a concurrency of
 **one**, waiting on a single worker.
+
+### A gap is a tile like any other
+
+A gap record is a `tile_id` range the archive holds nothing for, and it is
+cheap in exactly one way: there is nothing to fetch. It costs no download
+and, carrying `length=0`, it can never widen a batch -- both
+`_split_on_wide_holes()` and `peak_batch_bytes()` skip it. Everything else
+about it is an ordinary tile. It occupies a manifest record like any other,
+and the worker writes one output tile per tile id it covers, which for one
+unbroken ice sheet interior is hundreds of thousands of rows.
+
+That is why a gap counts against `--max-tiles` at its full `run_length`, and
+why it is chunked at all: `GAP_CHUNK_SIZE` cuts every gap into 200K-tile
+records so that one unbroken gap cannot land whole on a single worker.
+`Profile.transform_gap()` is called once per run and its bytes reused for
+every tile in it, so the profile work is free -- but the rows are not, and
+rows are what fills a disk.
 
 ### Why more chunks than processes
 
@@ -810,16 +858,30 @@ form:
         blocks = partition_into_worker_blocks(entries, gaps, N)
         if every budget holds for the worst block: take N
 
-Three budgets, three sources. **Time** from `cost_weights()` against the 6h
-job cap. **RAM** from the block's peak *batch* bytes through a measured
-affine fit. **Disk** from its output tiles times measured bytes per tile.
-All three fall as N rises -- more workers, smaller blocks, smaller spans,
-smaller batches -- and only setup overhead and wave count rise, so the first
-N that fits is the best one and the search is a loop rather than an
-optimization. Verified: against a 1.5M-entry, 77 GiB synthetic manifest the
-chosen N falls 120 -> 60 -> 40 -> 20 as the RAM budget rises 4 -> 8 -> 14 ->
-28 GiB, and tightening the job budget from 6h to 2h at 14 GiB raises it back
-to 60, with the log naming which budget bound it at each step.
+Two limits at most. **Time** from `cost_weights()` against the 6h job cap,
+always. **Tiles** from `block_tiles()` against `--max-tiles`, and only when
+a run sets one -- the same cap the partition already held each block to,
+checked here on the finished block (see "Budgets are caps, not prices"). RAM
+was a third until the batch body moved to disk; it was fitted from the peak
+batch a worker fetched, and there is nothing left for it to bound. A run
+with no `--max-tiles` is sized on time alone, which is what the default has
+always effectively been: time is the limit `worker_count` was chosen against
+before any of the storage budgets existed.
+
+Both fall as N rises -- more workers, smaller blocks, smaller spans, smaller
+batches -- and only setup overhead and wave count rise, so the first N that
+fits is the best one and the search is a loop rather than an optimization.
+Verified on the tile axis: against a 6K-entry synthetic manifest of 653K
+output tiles at `--concurrency 4`, the chosen N rises 4 -> 8 -> 16 as the
+cap falls 200K -> 100K -> 50K, and at each step every block stays inside
+it, the remainder one included -- the search only takes an N whose *worst*
+block fits, so a remainder that overran is what makes it try the next N. It
+held the same way when a byte budget was the binding axis: against a
+1.5M-entry, 77 GiB synthetic manifest the chosen N fell 120 -> 60 -> 40 ->
+20 as that
+budget rose 4 -> 8 -> 14 -> 28 GiB, and tightening the job budget from 6h to
+2h at 14 GiB raised it back to 60, with the log naming which limit bound it
+at each step.
 
 **Only multiples of the concurrency are considered.** At 20 lanes and
 roughly equal-cost blocks a run goes in waves:
@@ -848,17 +910,18 @@ by 2-4x -- the reference run's worst worker was predicted at 8m and ran
 mean either a blind guess or a silent overrun. Which is also why this comes
 last: it needs measured coefficients to mean anything. For scale, that run's
 slowest worker sat a factor of **10.5** under the cap and the whole run used
-15.7 of 120 available lane-hours. Time is not the binding limit today; RAM
-and disk are.
+15.7 of 120 available lane-hours. Time is not the binding limit today; the
+runner's disk is, which is why the one cap a run can set is about rows on
+that disk rather than about seconds.
 
-The RAM and disk conversions are measured rather than assumed.
-`usage:`'s `peak_rss` and `peak_batch_bytes` give an affine fit of peak
-memory against the largest batch a worker fetched, and the `profile` lines'
-`shard_bytes` over `output_tiles` gives bytes per tile. `calibrate` emits
-both as the `runner` block of `calibration.json`, and `--axis-seconds` reads
-them back. Until a run has measured them, `DEFAULT_RUNNER` carries the one
-observation there was: 3.49 GB of tile bytes dying on a 16 GB runner, so at
-least 4.6x.
+A tile count needs no fitted conversion at all, which is the point of it:
+`prepare-shards` counts the rows each block will write, and turning a disk
+size into a row count is the operator's one multiplication (see "Budgets are
+caps, not prices"). `calibrate` still fits a `runner` block from `usage:`'s
+`peak_rss`, `peak_batch_bytes` and shard bytes per output tile, and writes it
+to `calibration.json`; sizing reads none of it, but that last figure is
+exactly the number to pick a `--max-tiles` with. What `--axis-seconds` still
+feeds is the *time* model.
 
 ### Worker independence
 
@@ -1078,7 +1141,6 @@ could break silently, so change the code and this section together.
       fetch_declared_attribution()    attribution.py: what the archive credits
       compose_attribution()           attribution.py: what this layer credits
       compute_gaps()                  partition.py: tile_ids no entry covers
-      caps_from_budgets()             budgets.py: this run's hard per-worker limits
       _size_run()                     sizing.py: how many workers, and their blocks
       write_worker_manifests()        manifest.py: worker-NNN.bin
       write_source_metadata()         manifest.py: source.json, shared
@@ -1216,6 +1278,11 @@ wider than `--max-fetch-gap`. Two entries at the same offset are zero apart
 and must not be split. The 8 MB default is where one request still beats two:
 a few MB of unread bytes on an open, streaming connection cost less than
 another round trip against a cold CDN.
+
+`peak_batch_bytes()` lives here rather than with the planner that calls it,
+because it is the same rule read the other way: it walks a block and reports
+the widest span `plan_fetch_batches()` would produce, without building the
+batches. Split the two across modules and one of them drifts.
 
 `_chunk_entries()` must keep chunks contiguous and in order.
 `_blob_slice_for_chunk()` slices one byte range per chunk, and

@@ -61,10 +61,15 @@ on:
         type: string
         default: "14"
       worker_count:
-        description: "How many parallel shard-building jobs to fan out into (1-256, GitHub's matrix limit), or \"auto\" to let prepare-shards pick the smallest multiple of the concurrency whose worst worker stays inside every budget. Higher isn't necessarily faster: GitHub queues more than ~20 concurrently running jobs on a public repo, so it mainly trades job count for job size (see docs/ARCHITECTURE.md \"Parallelism\" and \"Sizing a run\")."
+        description: "How many parallel shard-building jobs to fan out into (1-256, GitHub's matrix limit), or \"auto\" to let prepare-shards pick the smallest multiple of the concurrency whose worst worker stays inside every limit. Higher isn't necessarily faster: GitHub queues more than ~20 concurrently running jobs on a public repo, so it mainly trades job count for job size (see docs/ARCHITECTURE.md \"Parallelism\" and \"Sizing a run\")."
         required: false
         type: string
         default: "128"
+      max_tiles:
+        description: "The most output tiles one worker may write, e.g. \"40000000\". Left empty (the default) nothing caps a worker, and a block is sized by cost alone; set it to keep a worker inside a runner's disk. Every tile id counts, a deduped run's repeats and the tiles a gap covers alike, because a flat shard writes each of them its own row (see docs/ARCHITECTURE.md \"Budgets are caps, not prices\")."
+        required: false
+        type: string
+        default: ""
       output_basename:
         description: "Base name for each profile's output .pmtiles file and artifact: one value, or a comma-separated list matched 1:1 with profile, e.g. \"land\" or \"land,cropped-waterways\"."
         required: true
@@ -157,8 +162,10 @@ jobs:
           SCHEMA: ${{ inputs.schema }}
           WORKER_COUNT: ${{ inputs.worker_count }}
           ATTRIBUTION: ${{ inputs.attribution }}
+          PROFILE: ${{ inputs.profile }}
+          MAX_TILES: ${{ inputs.max_tiles }}
         run: |
-          ARGS=(--worker-count "$WORKER_COUNT" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests)
+          ARGS=(--worker-count "$WORKER_COUNT" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests --profile "$PROFILE")
           if [ -n "$SOURCE_URL" ]; then
             ARGS+=(--source-url "$SOURCE_URL")
           fi
@@ -167,6 +174,9 @@ jobs:
           fi
           if [ -n "$ATTRIBUTION" ]; then
             ARGS+=(--attribution "$ATTRIBUTION")
+          fi
+          if [ -n "$MAX_TILES" ]; then
+            ARGS+=(--max-tiles "$MAX_TILES")
           fi
           # stdout is the layer attribution the merge job stamps in; the run's
           # log lines go to stderr and pass straight through. The template is

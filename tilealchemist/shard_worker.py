@@ -147,21 +147,19 @@ def _process_real_entries(real_entries, args, source, schema, profiles, writers,
     for batch_index, batch in enumerate(batches, start=1):
         batch_label = f" {batch_index}/{len(batches)}" if len(batches) > 1 else ""
         free_disk_bytes(out_dir)
-        with phases.phase("fetch"):
-            blob = fetch_batch_blob(session, batch, batch_label, args.worker_index, source,
-                                     args.download_report_interval)
-        fetched_bytes += len(blob)
-        peak_batch = max(peak_batch, len(blob))
-        with phases.phase("transform"):
-            for chunk_results in run_transform(blob, batch, source.min_zoom,
-                                                source.max_zoom, profiles, schema, args):
-                with phases.phase("write"):
-                    for profile_counts, profile_runs, writer in zip(
-                            counts, chunk_results, writers):
-                        profile_counts.add(*writer.write(profile_runs))
-                        writer.connection.commit()
-        # A worker cannot afford two batches' bytes at once; drop before the next fetch.
-        del blob
+        # Unmapped and deleted on the way out, so two batches never overlap.
+        with fetch_batch_blob(session, batch, batch_label, args.worker_index, source,
+                               args.download_report_interval, out_dir, phases) as blob:
+            fetched_bytes += len(blob)
+            peak_batch = max(peak_batch, len(blob))
+            with phases.phase("transform"):
+                for chunk_results in run_transform(blob, batch, source.min_zoom,
+                                                    source.max_zoom, profiles, schema, args):
+                    with phases.phase("write"):
+                        for profile_counts, profile_runs, writer in zip(
+                                counts, chunk_results, writers):
+                            profile_counts.add(*writer.write(profile_runs))
+                            writer.connection.commit()
     return fetched_bytes, peak_batch
 
 

@@ -96,6 +96,16 @@ The defaults a profile can override, but usually doesn't:
   there's nothing left for a `(z, x, y)` to vary. The worker calls it
   once per profile and reuses the result across the whole gap, which can be
   hundreds of thousands of tiles (e.g. an ice sheet interior).
+- **`seconds_per_tile`** is what `prepare-shards` sizes the run's *time*
+  with, and the one number about a profile tilealchemist cannot work out for
+  itself: what `transform_tile()` costs on one deduped source tile. It is a
+  profile's own measurement — the work is its shapely, not tilealchemist's —
+  and the default is deliberately pessimistic, so an undeclared profile
+  plans a bigger run rather than one that runs out of time. There is no
+  storage figure to declare beside it: how much a worker writes is capped by
+  `--max-tiles` in rows, not predicted from the profile in bytes. See
+  [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#budgets-are-caps-not-prices)
+  "Budgets are caps, not prices".
 - **`_encode_tile(features, extent)`** wraps `mvt.encode_tile()` with this
   profile's own `output_layer_name` filled in, and is the one place a profile
   touches the MVT codec directly, for a `transform_gap` or

@@ -3,10 +3,14 @@ import os
 import sys
 
 from tilealchemist.attribution import compose_attribution, fetch_declared_attribution
-from tilealchemist.budgets import cap_overruns, caps_from_budgets, peak_batch_bytes
 from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_weights
 from tilealchemist.manifest import write_source_metadata, write_worker_manifests
-from tilealchemist.partition import compute_gaps, partition_into_worker_blocks
+from tilealchemist.partition import (
+    block_gap_tiles,
+    block_tiles,
+    compute_gaps,
+    partition_into_worker_blocks,
+)
 from tilealchemist.sizing import breaches, choose_worker_count, worst_load
 from tilealchemist.pmtiles_index import collect_entries
 from tilealchemist.ranged_fetch import make_session
@@ -51,8 +55,7 @@ def run_prepare(args):
     print(f"{len(gaps)} gap ranges covering {gap_tile_count} tiles with no archive "
           f"entry at all", file=sys.stderr)
 
-    caps = caps_from_budgets(args.manifest_ram_budget, args.peak_batch_budget)
-    worker_count, blocks = _size_run(args, entries, gaps, caps)
+    worker_count, blocks = _size_run(args, entries, gaps)
     write_worker_manifests(args.out_dir, blocks)
     write_source_metadata(args.out_dir, resolved_source, args.min_zoom, args.max_zoom,
                           header["tile_data_offset"])
@@ -60,26 +63,24 @@ def run_prepare(args):
     non_empty_count = sum(1 for block in blocks if block)
     print(f"wrote {len(blocks)} manifests to {args.out_dir} "
           f"({non_empty_count} non-empty)", file=sys.stderr)
-    print(f"largest block holds {max(len(block) for block in blocks)} records against a cap "
-          f"of {caps.records or 'none'}, and peaks at "
-          f"{max(peak_batch_bytes(block) for block in blocks)} batch bytes against a cap of "
-          f"{caps.batch_bytes or 'none'}", file=sys.stderr)
-    overruns = cap_overruns(blocks, caps)
+    print(f"largest block holds {max(len(block) for block in blocks)} records", file=sys.stderr)
+    print(_tiles_line(blocks, args.limits.max_tiles), file=sys.stderr)
+    overruns = _cap_overruns(blocks, args.limits.max_tiles)
     if overruns:
-        print(f"::warning title=worker budget::{len(overruns)} of {len(blocks)} blocks exceed a "
-              f"cap, worst {max(overruns, key=lambda run: run[1])[1]} records / "
-              f"{max(overruns, key=lambda run: run[2])[2]} batch bytes; there is nowhere else "
-              f"to put the work at {worker_count} workers, so raise it or raise "
-              f"the budgets", file=sys.stderr)
-    load = worst_load(blocks, args.runner, args.axis_seconds, caps.max_fetch_gap)
+        print(f"::warning title=worker budget::{len(overruns)} of {len(blocks)} blocks write "
+              f"more tiles than --max-tiles, worst "
+              f"{max(overruns, key=lambda run: run[2])[2]}; there is nowhere else to put the "
+              f"work at {worker_count} workers, so raise --worker-count or raise --max-tiles",
+              file=sys.stderr)
+    load = worst_load(blocks, args.axis_seconds, args.profiles)
     broken = breaches(load, args.limits)
-    print(f"worst worker: {load.seconds / 60:.0f}m predicted, "
-          f"{load.rss_bytes / 2 ** 30:.2f} GiB peak RSS, "
-          f"{load.disk_bytes / 2 ** 30:.2f} GiB of shards", file=sys.stderr)
+    print(f"worst worker: {load.seconds / 60:.0f}m predicted, {load.tiles} output tiles, "
+          f"largest batch {load.batch_bytes / 2 ** 30:.2f} GiB", file=sys.stderr)
     if broken:
         print(f"::warning title=worker budget::the worst worker is over budget on "
               f"{', '.join(broken)} at {worker_count} workers", file=sys.stderr)
-    worker_seconds = [WORKER_SETUP_SECONDS + cost_weights(block, args.axis_seconds)[1]
+    worker_seconds = [WORKER_SETUP_SECONDS + cost_weights(block, args.axis_seconds,
+                                                           args.profiles)[1]
                        for block in blocks]
     even_minutes = sum(worker_seconds) / len(blocks) / 60
     print(f"cost model predicts {sum(worker_seconds) / 3600:.1f} core-hours including "
@@ -90,16 +91,49 @@ def run_prepare(args):
     print(attribution)
 
 
-def _size_run(args, entries, gaps, caps):
+def _cap_overruns(blocks, max_tiles):
+    """Blocks the cap could not hold; the last block takes the remainder however big it is.
+
+    Args:
+        blocks: One entry block per worker.
+        max_tiles: The output tiles one worker may write, or 0 for no cap.
+
+    Returns:
+        `(index, records, tiles)` for every block over the cap.
+    """
+    if not max_tiles:
+        return []
+    return [(index, len(block), block_tiles(block)) for index, block in enumerate(blocks)
+            if block_tiles(block) > max_tiles]
+
+
+def _tiles_line(blocks, max_tiles):
+    """Say what the worst block writes, and how much of the tile cap that takes.
+
+    Args:
+        blocks: One entry block per worker.
+        max_tiles: The output tiles one worker may write, or 0 for no cap.
+
+    Returns:
+        That line, ready for stderr.
+    """
+    worst = max(blocks, key=block_tiles)
+    tiles, gap_tiles = block_tiles(worst), block_gap_tiles(worst)
+    against = (f"{100 * tiles / max_tiles:.0f}% of the {max_tiles} --max-tiles cap"
+               if max_tiles else "against no --max-tiles cap")
+    return (f"worst block: {len(worst)} records writing {tiles} output tiles "
+            f"({gap_tiles} of them gap tiles), {against}")
+
+
+def _size_run(args, entries, gaps):
     """The worker count this run uses and its blocks: as asked for, or the smallest that fits."""
     if args.worker_count != "auto":
         return args.worker_count, partition_into_worker_blocks(
-            entries, gaps, args.worker_count, caps, args.axis_seconds)
+            entries, gaps, args.worker_count, args.limits.max_tiles, args.axis_seconds)
     worker_count, blocks, _load, attempts = choose_worker_count(
-        entries, gaps, args.runner, args.axis_seconds, caps, args.limits)
+        entries, gaps, args.axis_seconds, args.limits, profiles=args.profiles)
     for tried, load, broken in attempts:
         verdict = f"{', '.join(broken)} over budget" if broken else "fits"
         print(f"sizing: {tried} workers, worst worker {load.seconds / 60:.0f}m predicted, "
-              f"{load.rss_bytes / 2 ** 30:.2f} GiB RSS, "
-              f"{load.disk_bytes / 2 ** 30:.2f} GiB disk -- {verdict}", file=sys.stderr)
+              f"{load.tiles} output tiles -- {verdict}", file=sys.stderr)
     return worker_count, blocks

@@ -2,14 +2,12 @@
 """CLI entry point for the planning step; the run itself is in shard_prep.py."""
 import argparse
 
-from tilealchemist.budgets import DEFAULT_MANIFEST_RAM_BYTES, DEFAULT_PEAK_BATCH_BYTES
-from tilealchemist.calibration import DEFAULT_RUNNER, load_calibration_file
+from tilealchemist.calibration import load_calibration_file
 from tilealchemist.cost import AXIS_SECONDS
+from tilealchemist.profiles import load_profile
 from tilealchemist.sizing import (
     DEFAULT_CONCURRENCY,
     DEFAULT_JOB_SECONDS,
-    DEFAULT_WORKER_DISK_BYTES,
-    DEFAULT_WORKER_RAM_BYTES,
     MATRIX_CELL_LIMIT,
     Limits,
     TAIL_SAFETY_FACTOR,
@@ -110,7 +108,7 @@ def parse_args():
     parser.add_argument("--worker-count", type=worker_count_type, default=128,
                          help=f"how many workers to split the run across (1-{MATRIX_CELL_LIMIT}, "
                               "default 128), or \"auto\" to pick the smallest multiple of "
-                              "--concurrency whose worst worker stays inside every budget")
+                              "--concurrency whose worst worker stays inside every limit")
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                          help="how many workers actually run at once (default "
                               f"{DEFAULT_CONCURRENCY}); \"auto\" only considers multiples of "
@@ -120,11 +118,22 @@ def parse_args():
                               f"predicted seconds are charged against it at "
                               f"{TAIL_SAFETY_FACTOR:g}x, the factor by which the model "
                               "under-predicts the slow tail")
-    parser.add_argument("--worker-ram-budget", type=int, default=DEFAULT_WORKER_RAM_BYTES,
-                         help=f"a worker's usable memory (default {DEFAULT_WORKER_RAM_BYTES})")
-    parser.add_argument("--worker-disk-budget", type=int, default=DEFAULT_WORKER_DISK_BYTES,
-                         help="disk a worker's shards may take together (default "
-                              f"{DEFAULT_WORKER_DISK_BYTES})")
+    parser.add_argument("--max-tiles", type=int, default=None,
+                         help="the most output tiles one worker may write, unset by default. "
+                              "A block is closed as soon as another group would take it past "
+                              "the cap, which is how a run is kept under a runner's disk "
+                              "limit without anyone having to model that disk. Every tile id "
+                              "counts, a deduped run's repeats and every tile a gap covers "
+                              "alike, because a flat shard writes each of them its own row; "
+                              "it counts once per worker rather than once per profile, so a "
+                              "run building two profiles writes two shards of that many rows. "
+                              "At the ~250 B a tile measures (tilealchemist-calibrate's "
+                              "runner block), 10 GiB of runner disk is roughly 40000000")
+    parser.add_argument("--profile", default=None,
+                         help="comma-separated path(s) to the profile .py files this run will "
+                              "build, the same value build-shard is given. Their per-tile "
+                              "seconds are what make the prediction profile-specific; without "
+                              "it a run is costed as if it passed tiles through unchanged")
     parser.add_argument("--min-zoom", type=zoom_level_type, default=ZoomLevel.Z0)
     parser.add_argument("--max-zoom", type=zoom_level_type, default=ZoomLevel.Z14)
     parser.add_argument("--out-dir", required=True)
@@ -133,16 +142,6 @@ def parse_args():
                               "replace the reviewed ones in cost.py for this run; the "
                               "coefficients are profile-dependent, so a calibration belongs to "
                               "the profile set and archive it was measured on")
-    parser.add_argument("--manifest-ram-budget", type=int, default=DEFAULT_MANIFEST_RAM_BYTES,
-                         help="bytes of a worker's memory the manifest records themselves may "
-                              f"take (default {DEFAULT_MANIFEST_RAM_BYTES}); a block is closed "
-                              "once another group would break it, whatever the cost balance "
-                              "says. 0 disables the cap")
-    parser.add_argument("--peak-batch-budget", type=int, default=DEFAULT_PEAK_BATCH_BYTES,
-                         help="bytes the largest single range request a worker makes may reach "
-                              f"(default {DEFAULT_PEAK_BATCH_BYTES}); this is the peak, not the "
-                              "block's byte sum, a worker dropping each batch before the next. "
-                              "0 disables the cap")
     parser.add_argument("--attribution", default=None,
                          help="what the built layer credits, as a template in which "
                               "`{source}` stands for the attribution the archive declares "
@@ -159,19 +158,21 @@ def parse_args():
     args = parser.parse_args()
 
     try:
-        args.axis_seconds, args.runner = (load_calibration_file(args.axis_seconds)
-                                          if args.axis_seconds
-                                          else (AXIS_SECONDS, DEFAULT_RUNNER))
+        args.axis_seconds = (load_calibration_file(args.axis_seconds)[0]
+                             if args.axis_seconds else AXIS_SECONDS)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.error(f"--axis-seconds: {error}")
-    args.limits = Limits(job_seconds=args.job_seconds, ram_bytes=args.worker_ram_budget,
-                          disk_bytes=args.worker_disk_budget, concurrency=args.concurrency,
-                          tail_factor=TAIL_SAFETY_FACTOR)
+    args.limits = Limits(job_seconds=args.job_seconds, max_tiles=args.max_tiles or 0,
+                          concurrency=args.concurrency, tail_factor=TAIL_SAFETY_FACTOR)
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
-    for name in ("manifest_ram_budget", "peak_batch_budget"):
-        if getattr(args, name) < 0:
-            parser.error(f"--{name.replace('_', '-')} must not be negative")
+    if args.max_tiles is not None and args.max_tiles < 1:
+        parser.error("--max-tiles must be at least 1")
+    try:
+        args.profiles = ([load_profile(path)() for path in args.profile.split(",")]
+                         if args.profile else None)
+    except (OSError, ValueError, ImportError, AttributeError, TypeError) as error:
+        parser.error(f"--profile: {error}")
     if args.min_zoom > args.max_zoom:
         parser.error(f"--min-zoom ({args.min_zoom}) must not exceed --max-zoom ({args.max_zoom})")
     # Discarded: built only to make a bad flag combination a usage error. Touches no network.
