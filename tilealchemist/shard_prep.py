@@ -5,7 +5,7 @@ import sys
 from tilealchemist.attribution import compose_attribution, fetch_declared_attribution
 from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_weights
 from tilealchemist.manifest import write_source_metadata, write_worker_manifests
-from tilealchemist.partition import block_gap_tiles, block_tiles
+from tilealchemist.partition import count_gap_tiles, count_output_tiles
 from tilealchemist.sizing import breaches, choose_worker_count, worst_load
 from tilealchemist.pmtiles_index import collect_entries, compute_gaps
 from tilealchemist.ranged_fetch import make_session
@@ -88,8 +88,8 @@ def _tiles_line(blocks):
     Returns:
         That line, ready for stderr.
     """
-    worst = max(blocks, key=block_tiles)
-    tiles, gap_tiles = block_tiles(worst), block_gap_tiles(worst)
+    worst = max(blocks, key=count_output_tiles)
+    tiles, gap_tiles = count_output_tiles(worst), count_gap_tiles(worst)
     return (f"worst block: {len(worst)} records writing {tiles} output tiles "
             f"({gap_tiles} of them gap tiles)")
 

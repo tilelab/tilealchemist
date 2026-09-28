@@ -504,7 +504,7 @@ distribution the same coefficient produces something else. A price cannot
 enforce a limit; it can only make crossing it expensive.
 
 What followed was a run of steadily more elaborate caps, each one a hard
-condition in `partition_by_cost()`'s loop beside the `_share_end`
+condition in `partition_by_cost()`'s loop beside the `_share_end_weight`
 comparison: **records per block** at a measured ~184 B per `Entry`, **peak
 batch bytes**, a single `--worker-disk-budget` that the manifest, the one
 spooled batch and the shards were all charged against, and finally
@@ -534,7 +534,7 @@ specific resource, measured -- rather than another general budget.
 cost model with no coefficient in it that is not a measurement.
 
 **What a block writes is still counted, in rows rather than records.**
-`block_tiles()` sums `run_length` over the block and `prepare-shards` logs
+`count_output_tiles()` sums `run_length` over the block and `prepare-shards` logs
 it, so:
 
 - a **deduped run** contributes every tile id it covers. The archive stores
@@ -949,7 +949,7 @@ strict waves, but it is measurable and it is the cheapest saving available.
 
 The **256** ceiling is GitHub's own: `_pipeline.yml` expands the worker count
 straight into the `build-shards` matrix, and GitHub refuses more than that
-many cells. `candidate_counts()` therefore ends on 256 whether or not the
+many cells. `candidate_worker_counts()` therefore ends on 256 whether or not the
 doubling lands on it, and `gen-workers` checks the manifest count against it
 before the matrix is built rather than after the archive walk has already run.
 

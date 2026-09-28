@@ -3,7 +3,7 @@ from collections import namedtuple
 
 from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_weights
 from tilealchemist.fetch_batching import peak_batch_bytes
-from tilealchemist.partition import block_tiles, partition_into_worker_blocks
+from tilealchemist.partition import count_output_tiles, partition_into_worker_blocks
 
 # GitHub queues past ~20 concurrently running jobs on a public repo, so a run goes in waves.
 DEFAULT_CONCURRENCY = 20
@@ -37,7 +37,7 @@ def block_load(block, axis, profiles=None):
     """
     return BlockLoad(
         seconds=WORKER_SETUP_SECONDS + cost_weights(block, axis, profiles)[1],
-        tiles=block_tiles(block),
+        tiles=count_output_tiles(block),
         records=len(block),
         batch_bytes=peak_batch_bytes(block))
 
@@ -69,7 +69,7 @@ def breaches(load, limits):
     return broken
 
 
-def candidate_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
+def candidate_worker_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
     """The worker counts worth trying, smallest first.
 
     Starts at the concurrency limit, because a run goes in waves of that many
@@ -116,7 +116,7 @@ def choose_worker_count(entries, gaps, axis, limits=DEFAULT_LIMITS,
         count fits, the largest is returned with the limits it still breaks.
     """
     attempts = []
-    for worker_count in candidate_counts(limits, cell_limit):
+    for worker_count in candidate_worker_counts(limits, cell_limit):
         blocks = partition_into_worker_blocks(entries, gaps, worker_count, axis)
         load = worst_load(blocks, axis, profiles)
         broken = breaches(load, limits)

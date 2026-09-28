@@ -5,8 +5,8 @@ import operator
 from tilealchemist.cost import AXIS_SECONDS, cost_weights
 
 
-def block_tiles(entries):
-    """How many output tiles these records make a worker write.
+def count_output_tiles(entries):
+    """Count the output tiles these records make a worker write.
 
     Args:
         entries: The records to count, real entries and gaps alike.
@@ -19,12 +19,12 @@ def block_tiles(entries):
     return sum(entry.run_length for entry in entries)
 
 
-def block_gap_tiles(entries):
-    """How many of these records' output tiles come from gaps rather than from the archive."""
+def count_gap_tiles(entries):
+    """Count the output tiles these records write from gaps rather than from the archive."""
     return sum(entry.run_length for entry in entries if entry.length == 0)
 
 
-def _share_end(total_weight, worker_index, worker_count):
+def _share_end_weight(total_weight, worker_index, worker_count):
     """The cumulative weight at which one worker's share of the run ends.
 
     Args:
@@ -95,7 +95,7 @@ def partition_by_cost(records, worker_count, atomic_key=None, axis=AXIS_SECONDS)
         assigned_weight += group_weight
         # A group can span several shares, and every one it covered must be skipped.
         while (worker_index < worker_count - 1
-               and assigned_weight >= _share_end(total_weight, worker_index, worker_count)):
+               and assigned_weight >= _share_end_weight(total_weight, worker_index, worker_count)):
             worker_index += 1
     return blocks
 
