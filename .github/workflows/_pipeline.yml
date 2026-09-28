@@ -364,8 +364,15 @@ jobs:
     if: always() && inputs.axis_state == 'true'
     continue-on-error: true
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+    # No `permissions:` here, deliberately. A called workflow may only narrow
+    # what its caller granted, never widen it, and that ceiling is checked
+    # before `if:` is ever evaluated -- so a `contents: write` on this job
+    # refuses the whole run at startup for every caller that did not grant it,
+    # including the ones passing `axis_state: false` precisely because they
+    # never wanted it. Inheriting instead keeps the documented bargain: grant
+    # `contents: write` on the calling job and the coefficients are recorded,
+    # withhold it and the push fails inside a `continue-on-error` job, costing
+    # the calibration and nothing else.
     steps:
       - uses: actions/checkout@v4
         with:

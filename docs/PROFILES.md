@@ -718,6 +718,12 @@ jobs:
   build:
     needs: profiles
     uses: tilelab/tilealchemist/.github/workflows/_pipeline.yml@main
+    # `axis_state` is on by default, and its writer pushes with your own
+    # token. Without this the build still succeeds; it just keeps the
+    # reviewed constants instead of what your last few runs measured. Pass
+    # `axis_state: "false"` to turn the whole thing off and drop this.
+    permissions:
+      contents: write
     with:
       profile: ./my_profile.py
       profile_artifact: my-profiles

@@ -527,6 +527,17 @@ The whole loop, in the order it runs:
    ones -- and refuses again if `--manifest-dir` scoring says the fit predicts
    this run's own workers worse than the reviewed constants already did.
 
+`merge-axes` pushes with the caller's own `GITHUB_TOKEN`, so the calling job
+has to grant `contents: write`; the default for a repository is `read`. The job
+deliberately does not declare that permission for itself, because a called
+workflow may only narrow what its caller granted and never widen it, and that
+ceiling is checked before any `if:` is evaluated -- a `permissions:` block here
+would refuse the whole run at startup for every caller that had not granted
+write, including one passing `axis_state: false` precisely because it never
+wanted the branch. Inheriting keeps the failure where it belongs: withhold the
+permission and the push fails inside a `continue-on-error` job, costing the
+calibration and nothing else.
+
 The write is a read-modify-write against the blob sha through the contents
 API, so two pipelines finishing together cannot lose each other's
 observations: the second write is refused and the whole change reapplied to the
