@@ -14,13 +14,7 @@ from tilealchemist.mbtiles import (
 from tilealchemist.ranged_fetch import make_session
 from tilealchemist.schemas import SCHEMAS
 from tilealchemist.transform_pool import run_transform
-from tilealchemist.usage import (
-    PhaseSeconds,
-    child_peak_rss_bytes,
-    free_disk_bytes,
-    peak_rss_bytes,
-    report,
-)
+from tilealchemist.usage import PhaseSeconds, report
 
 
 def split_manifest_entries(entries):
@@ -111,8 +105,6 @@ def _report_worker_usage(args, profiles, counts, phases, wall_start, totals):
     wall_seconds = time.perf_counter() - wall_start
     report("worker", worker=args.worker_index, wall_seconds=wall_seconds,
            setup_seconds=wall_seconds - phases.total(),
-           peak_rss=peak_rss_bytes(), child_peak_rss=child_peak_rss_bytes(),
-           free_disk=free_disk_bytes(os.path.dirname(os.path.abspath(args.out[0]))),
            **totals, **phases.fields())
 
 
@@ -146,7 +138,6 @@ def _process_real_entries(real_entries, args, source, schema, profiles, writers,
     out_dir = os.path.dirname(os.path.abspath(args.out[0]))
     for batch_index, batch in enumerate(batches, start=1):
         batch_label = f" {batch_index}/{len(batches)}" if len(batches) > 1 else ""
-        free_disk_bytes(out_dir)
         # Unmapped and deleted on the way out, so two batches never overlap.
         with fetch_batch_blob(session, batch, batch_label, args.worker_index, source,
                                args.download_report_interval, out_dir, phases) as blob:

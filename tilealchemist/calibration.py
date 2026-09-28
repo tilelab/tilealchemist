@@ -13,11 +13,10 @@ MIN_SCORED_WORKERS = 8
 Calibration = namedtuple(
     "Calibration", "axis_seconds worker_setup_seconds runner diagnostics notes")
 
-RunnerProfile = namedtuple("RunnerProfile", "rss_base rss_per_batch_byte bytes_per_output_tile")
+RunnerProfile = namedtuple("RunnerProfile", "bytes_per_output_tile")
 
-# What a worker's peak RSS and shard size come to, before any measurement replaces them.
-DEFAULT_RUNNER = RunnerProfile(rss_base=400 * 1024 * 1024, rss_per_batch_byte=4.6,
-                               bytes_per_output_tile=250.0)
+# What a worker's shard size comes to, before any measurement replaces it.
+DEFAULT_RUNNER = RunnerProfile(bytes_per_output_tile=250.0)
 
 
 def parse_usage_lines(lines):
@@ -201,25 +200,18 @@ def _clamped(name, measured, reviewed, notes):
 
 
 def fit_runner_profile(rows, fallback=DEFAULT_RUNNER):
-    """Fit a runner's memory and disk rates from a run's logs.
+    """Fit a runner's disk rate from a run's logs.
 
     Args:
         rows: Parsed usage rows for the whole run.
-        fallback: The rates to keep where nothing usable was measured.
+        fallback: The rate to keep where nothing usable was measured.
 
     Returns:
         The fitted RunnerProfile.
     """
-    workers, chunks, profiles = _scoped(rows, "worker"), _scoped(rows, "chunk"), _scoped(
-        rows, "profile")
-    rss_fit = _fit_two([(1.0, float(row["peak_batch_bytes"]), float(row["peak_rss"]))
-                        for row in workers
-                        if float(row.get("peak_batch_bytes", 0)) > 0 and "peak_rss" in row])
+    chunks, profiles = _scoped(rows, "chunk"), _scoped(rows, "profile")
     per_tile = _ratio(_total(profiles, "shard_bytes"), _total(chunks, "output_tiles"))
     return RunnerProfile(
-        rss_base=rss_fit[0] if rss_fit and rss_fit[0] > 0 else fallback.rss_base,
-        rss_per_batch_byte=(rss_fit[1] if rss_fit and rss_fit[1] > 0
-                            else fallback.rss_per_batch_byte),
         bytes_per_output_tile=per_tile if per_tile else fallback.bytes_per_output_tile)
 
 

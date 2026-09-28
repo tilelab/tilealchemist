@@ -136,10 +136,8 @@ def main():
         raw_text = "n/a" if raw is None else f"{raw:.4g}"
         print(f"{name:<22}{reviewed:>14.4g}{raw_text:>14}{proposed:>14.4g}", file=sys.stderr)
 
-    runner = result.runner
-    print(f"runner: peak RSS ~ {runner.rss_base / 2 ** 20:.0f} MiB + "
-          f"{runner.rss_per_batch_byte:.2f} x peak batch bytes, and "
-          f"{runner.bytes_per_output_tile:.0f} shard bytes per output tile", file=sys.stderr)
+    print(f"runner: {result.runner.bytes_per_output_tile:.0f} shard bytes per output tile",
+          file=sys.stderr)
 
     share = result.diagnostics["decode_share"]
     if share is not None:

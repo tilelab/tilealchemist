@@ -1,57 +1,10 @@
 """What a run actually cost, measured rather than predicted; see docs/ARCHITECTURE.md."""
 import collections
 import contextlib
-import resource
-import shutil
 import sys
 import time
 
 LENGTH_BUCKET_COUNT = 32
-
-FREE_DISK_WARNING_BYTES = 2 * 1024 * 1024 * 1024
-
-# getrusage reports ru_maxrss in bytes on macOS and in kibibytes on Linux.
-_MAX_RSS_SCALE = 1 if sys.platform == "darwin" else 1024
-
-
-def peak_rss_bytes():
-    """This process's peak resident set size.
-
-    Returns:
-        The peak RSS in bytes, whichever unit the platform reports it in.
-    """
-    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * _MAX_RSS_SCALE
-
-
-def child_peak_rss_bytes():
-    """The peak resident set size reached by this process's children.
-
-    Returns:
-        The largest peak RSS any one child reached, in bytes. The kernel
-        reports children together, so a pool of them does not sum.
-    """
-    return resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss * _MAX_RSS_SCALE
-
-
-def free_disk_bytes(path, threshold=FREE_DISK_WARNING_BYTES):
-    """How much room is left where the shards are written.
-
-    Warns below the threshold, because a shard that fills the disk fails
-    part-way through an INSERT rather than before it starts.
-
-    Args:
-        path: A path on the filesystem to measure.
-        threshold: The figure to warn below, in bytes.
-
-    Returns:
-        The free bytes.
-    """
-    free = shutil.disk_usage(path).free
-    if free < threshold:
-        print(f"::warning title=shard disk::{free} bytes free under {path!r}, under the "
-              f"{threshold}-byte mark; a shard that fills the disk fails mid-INSERT",
-              file=sys.stderr)
-    return free
 
 
 def _format(value):
@@ -209,5 +162,4 @@ def report_chunk(usage, chunk_index, blob_bytes):
         chunk_index: Which chunk this is, counting from one.
         blob_bytes: How many bytes the chunk was handed.
     """
-    report("chunk", chunk=chunk_index, blob_bytes=blob_bytes,
-           peak_rss=peak_rss_bytes(), **usage.fields())
+    report("chunk", chunk=chunk_index, blob_bytes=blob_bytes, **usage.fields())

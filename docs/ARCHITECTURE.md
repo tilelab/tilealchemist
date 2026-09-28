@@ -440,9 +440,9 @@ Three scopes:
   amplification -- the number that decides whether the deduplicated shard
   layout pays for itself (see "Shard layout").
 - **`scope=worker`**, one per worker: wall-clock seconds split by phase
-  (`fetch`, `transform`, `write`, `close`), bytes fetched, entry counts, and
-  peak RSS. `PhaseSeconds` nests exclusively, so the `write` time spent
-  inside the transform loop is not also counted as `transform`.
+  (`fetch`, `transform`, `write`, `close`), bytes fetched, and entry counts.
+  `PhaseSeconds` nests exclusively, so the `write` time spent inside the
+  transform loop is not also counted as `transform`.
 
 `decode_seconds` and `transform_seconds` are reported separately because they
 are different work on different inputs. `Tile.decode()` is gunzip plus
@@ -466,13 +466,13 @@ The instrumentation is two `perf_counter()` calls per distinct entry. At 26ns
 a call that is 2.3s across the reference run's 43,272,366 distinct entries --
 0.004% of its 15.7 core-hours.
 
-Peak RSS is read twice, because `RUSAGE_CHILDREN.ru_maxrss` is the *maximum*
-over finished children, not their sum: taken alone it under-reports a pooled
-worker's real peak by up to `--transform-workers`x. Each `_transform_chunk`
-therefore prints its own `RUSAGE_SELF` peak on the way back, which is what
-makes the *simultaneous* per-process peak visible. `getrusage` reports
-`ru_maxrss` in bytes on macOS and in kibibytes on Linux, so `usage.py` scales
-by platform; every `usage:` byte figure is bytes.
+Peak RSS is not measured. It used to be read twice -- a `RUSAGE_SELF` peak
+per chunk alongside the worker's `RUSAGE_CHILDREN` figure, because the latter
+is the *maximum* over finished children rather than their sum and alone
+under-reports a pooled worker by up to `--transform-workers`x -- and both
+were removed. Anything added back needs that pair, not one half of it, and
+needs to scale `ru_maxrss` by platform: `getrusage` reports it in bytes on
+macOS and in kibibytes on Linux. Every `usage:` byte figure is bytes.
 
 `WORKER_SETUP_SECONDS` sits next to `AXIS_SECONDS` and is a property of the
 runner rather than of the run: runner boot, artifact download, and the
@@ -675,10 +675,10 @@ merge-side check itself is not in this repository yet.) `tile-join` ignores
 the unknown metadata key; verified locally, output byte-identical with and
 without it.
 
-Free disk space is checked before every batch (`usage.free_disk_bytes()`)
-and reported on the worker's `usage:` line. Falling below the threshold is a
-loud warning, not an abort: the approach shows up in the log instead of
-arriving as an `ENOSPC` in the middle of an `INSERT`.
+Free disk space is not checked: a worker that fills the disk finds out as an
+`ENOSPC` in the middle of an `INSERT`. A pre-batch check that warned below a
+threshold lived here and was removed; add it back if the failure mode turns
+out to be worth the warning.
 
 ### Runs stay runs until the writer
 
@@ -964,9 +964,8 @@ slowest worker sat a factor of **10.5** under the cap and the whole run used
 either -- it is simply the only one that has ever been worth enforcing, and
 the only one a measured run has never quietly broken.
 
-`calibrate` still fits a `runner` block from `usage:`'s `peak_rss`,
-`peak_batch_bytes` and shard bytes per output tile, and writes it to
-`calibration.json`. Sizing reads none of it. It is there to be read by a
+`calibrate` still fits a `runner` block from `usage:`'s shard bytes per
+output tile, and writes it to `calibration.json`. Sizing reads none of it. It is there to be read by a
 person deciding whether a resource has become binding -- which is the
 evidence a new limit would be built from, and the reason the figures are
 still collected with no limit to spend them on. What `--axis-seconds` feeds

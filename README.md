@@ -95,7 +95,7 @@ else.
 | `tilealchemist/fetch_batching.py` | Groups a worker's manifest entries into range-GET batches (split at wide unread gaps) and fetches one batch's bytes. |
 | `tilealchemist/transform.py` | Fetched bytes to output tiles: one decode per tile shared by every selected `Profile`, timed apart from the per-profile transform. |
 | `tilealchemist/transform_pool.py` | Splits a batch into cost-balanced chunks and runs them across this machine's cores (`--transform-workers`), throttling how many are in flight. |
-| `tilealchemist/usage.py` | What the run actually cost: per-chunk and per-worker `usage:` lines (seconds by phase, bytes, distinct blobs, peak RSS, free disk). |
+| `tilealchemist/usage.py` | What the run actually cost: per-chunk and per-worker `usage:` lines (seconds by phase, bytes, distinct blobs). |
 | `tilealchemist/mbtiles.py` | The shard files themselves: creating one mbtiles per profile in either layout (`--shard-layout`), expanding runs into rows (including the XYZ-to-TMS row flip). |
 | `tilealchemist/profile_requirements.py` | Reads a profile's inline PEP 723 dependency block without importing it, so CI can install what the profile needs before loading it. |
 | `tilealchemist/profiles/` | The `Profile` ABC and the path-based `load_profile()`. No profiles: those live in their own repositories. |
