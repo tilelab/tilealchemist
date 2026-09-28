@@ -107,17 +107,17 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
     with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
         pending = {}
 
-        def submit_next():
+        def top_up():
+            """Submit chunks until `in_flight` are queued, or none are left."""
             for index, chunk in waiting:
                 blob_slice, blob_slice_offset = _blob_slice_for_chunk(blob, batch_offset, chunk)
                 future = executor.submit(_transform_chunk, job, blob_slice, blob_slice_offset,
                                           chunk, index)
                 pending[future] = (index, len(chunk), len(blob_slice))
-                return True
-            return False
+                if len(pending) >= in_flight:
+                    return
 
-        while len(pending) < in_flight and submit_next():
-            pass
+        top_up()
         while pending:
             ready = concurrent.futures.wait(
                 pending, return_when=concurrent.futures.FIRST_COMPLETED).done
@@ -127,7 +127,8 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
             index, entry_count, byte_count = pending.pop(future)
             chunk_results = future.result()
             future = None
-            submit_next()
+            # Before the yield: the pool keeps running while the caller writes.
+            top_up()
             yield index, entry_count, byte_count, chunk_results
 
 
