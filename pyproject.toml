@@ -27,6 +27,7 @@ Repository = "https://github.com/tilelab/tilealchemist"
 tilealchemist-prepare-shards = "tilealchemist.prepare_shards:main"
 tilealchemist-build-shard = "tilealchemist.build_shard:main"
 tilealchemist-calibrate = "tilealchemist.calibrate:main"
+tilealchemist-merge-axes = "tilealchemist.merge_axes:main"
 tilealchemist-profile-requirements = "tilealchemist.profile_requirements:main"
 
 [build-system]

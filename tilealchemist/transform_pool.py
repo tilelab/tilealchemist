@@ -8,7 +8,7 @@ from tilealchemist.partition import partition_by_cost
 from tilealchemist.profiles import load_profile
 from tilealchemist.schemas import SCHEMAS
 from tilealchemist.transform import TransformProgress, transform_batch_blob_multi
-from tilealchemist.usage import TransformUsage, report_chunk
+from tilealchemist.usage import TransformUsage
 
 # Spare chunks per process, so one finishing early pulls the next instead of idling.
 TRANSFORM_CHUNKS_PER_WORKER = 8
@@ -71,17 +71,18 @@ def _transform_chunk(job, blob_slice, blob_slice_offset, chunk_entries, chunk_in
         chunk_index: Which chunk this is, counting from zero.
 
     Returns:
-        One list of `(tile_id, run_length, payload)` runs per profile.
+        One list of `(tile_id, run_length, payload)` runs per profile, and what
+        the chunk cost. The measurements travel back rather than being reported
+        here: a worker reports once, having merged every chunk it ran.
     """
     profiles = [load_profile(path)() for path in job.profile_paths]
     batch = (blob_slice_offset, len(blob_slice), chunk_entries)
     progress = TransformProgress(len(chunk_entries), job.report_interval,
                                   label=f"transforming chunk {chunk_index + 1}")
-    usage = TransformUsage()
+    usage = TransformUsage(len(profiles))
     results = transform_batch_blob_multi(blob_slice, batch, job.min_zoom, job.max_zoom, progress,
                                           profiles, SCHEMAS[job.schema_name], usage)
-    report_chunk(usage, chunk_index + 1, len(blob_slice))
-    return results
+    return results, usage
 
 
 def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
@@ -99,8 +100,8 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
         max_workers: How many processes to run.
 
     Yields:
-        `(chunk index, entry count, byte count, results)` per chunk, in the
-        order they finish.
+        `(chunk index, entry count, byte count, results, usage)` per chunk, in
+        the order they finish.
     """
     in_flight = max_workers + SUBMIT_LEAD
     waiting = iter(list(enumerate(chunks)))
@@ -125,14 +126,14 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
             ready = None
             # pop, not index: a live Future pins its chunk's output for the whole phase.
             index, entry_count, byte_count = pending.pop(future)
-            chunk_results = future.result()
+            chunk_results, chunk_usage = future.result()
             future = None
             # Before the yield: the pool keeps running while the caller writes.
             top_up()
-            yield index, entry_count, byte_count, chunk_results
+            yield index, entry_count, byte_count, chunk_results, chunk_usage
 
 
-def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args):
+def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args, usage):
     """Transform one fetched batch, in this process or across a pool.
 
     Args:
@@ -144,6 +145,8 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args):
         schema: The schema the source tiles are in.
         args: The worker's parsed command line, read for its profile paths,
             transform worker count and report interval.
+        usage: The worker's running measurements, which every chunk this batch
+            is split into is merged into.
 
     Yields:
         One list of per-profile results per chunk, in the order the chunks
@@ -160,16 +163,17 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args):
 
     if len(chunks) <= 1:
         transform_progress = TransformProgress(len(real_entries), args.report_interval)
-        usage = TransformUsage()
+        # Straight into the worker's own totals: with no pool there is nothing to merge back.
         results = transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress,
                                              profiles, schema, usage)
-        report_chunk(usage, 1, len(blob))
         yield results
         return
 
     job = ChunkJob(args.profile, schema.name, min_zoom, max_zoom, args.report_interval)
     completed = _pooled_chunk_results(blob, batch_offset, chunks, job, args.transform_workers)
-    for done, (index, entry_count, byte_count, chunk_results) in enumerate(completed, start=1):
+    for done, (index, entry_count, byte_count, chunk_results,
+                chunk_usage) in enumerate(completed, start=1):
+        usage.merge(chunk_usage)
         yield chunk_results
         print(f"chunk {index + 1} done ({done}/{len(chunks)} chunks, "
               f"{entry_count} entries, {byte_count} bytes)", file=sys.stderr)

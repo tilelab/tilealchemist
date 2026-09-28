@@ -61,6 +61,11 @@ jobs:
       # expensive.
       max_zoom: "4"
       concurrency: "1"
+      # No state branch from CI. These runs stop at z4 on one worker, and a
+      # coefficient fitted on ~6 MB of tile data has no business setting the
+      # median a planet run is then partitioned by. Calibration is exercised by
+      # tilealchemist-merge-axes' own guards, not by writing to this repository.
+      axis_state: "false"
       # No `attribution:`: this call covers the inherited path, where each
       # layer carries what its source archive declares for itself.
 
@@ -91,6 +96,11 @@ jobs:
       # artifacts it hands between its own jobs per pipeline, not per call.
       # Namespacing this one is enough: the other's `shards-*` does not reach
       # into `protomaps-shards-*` (see _pipeline.yml's `artifact_namespace`).
+      # No state branch from CI. These runs stop at z4 on one worker, and a
+      # coefficient fitted on ~6 MB of tile data has no business setting the
+      # median a planet run is then partitioned by. Calibration is exercised by
+      # tilealchemist-merge-axes' own guards, not by writing to this repository.
+      axis_state: "false"
       artifact_namespace: "protomaps"
       # Covers the other path: the input replacing the archive's own.
       attribution: "CI test run, not for real use"

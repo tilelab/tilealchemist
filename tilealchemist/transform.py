@@ -87,16 +87,20 @@ def _entry_outputs(tile_data, entry, profiles, schema, usage):
     """
     decode_start = time.perf_counter()
     tile = Tile.decode(tile_data, schema)
-    transform_start = time.perf_counter()
-    outputs = []
+    profile_start = time.perf_counter()
+    decode_seconds = profile_start - decode_start
+    outputs, profile_seconds = [], []
     for profile in profiles:
         try:
             outputs.append(profile.transform_tile(tile))
         except Exception as error:
             raise RuntimeError(
                 f"profile {profile.name!r} failed on {_describe_entry(entry)}") from error
-    usage.add_decode(len(tile_data), transform_start - decode_start,
-                     time.perf_counter() - transform_start)
+        # One clock serves as this profile's end and the next one's start: no gap goes unbilled.
+        finished = time.perf_counter()
+        profile_seconds.append(finished - profile_start)
+        profile_start = finished
+    usage.add_decode(len(tile_data), decode_seconds, profile_seconds)
     return outputs
 
 
@@ -142,6 +146,8 @@ def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progre
         if run_length <= 0:
             continue
         usage.output_tiles += run_length
-        for profile_results, output_data in zip(results, outputs):
+        for index, (profile_results, output_data) in enumerate(zip(results, outputs)):
             profile_results.append((run_start, run_length, output_data))
+            if output_data:
+                usage.profile_output_bytes[index] += len(output_data) * run_length
     return results

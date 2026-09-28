@@ -22,27 +22,28 @@ DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS, concurrency=DEFAULT_CON
                         tail_factor=TAIL_SAFETY_FACTOR)
 
 
-def block_load(block, axis, profiles=None):
+def block_load(block, axis, profile_costs=None, setup_seconds=WORKER_SETUP_SECONDS):
     """Predict what one worker's block will cost it.
 
     Args:
         block: The entries assigned to that worker.
         axis: The per-axis seconds to charge.
-        profiles: The profiles the run builds, priced per deduped tile. None
+        profile_costs: What each profile costs, as settled for this run. None
             costs tilealchemist's own work alone.
+        setup_seconds: What a worker costs before it reaches its first record.
 
     Returns:
         The block's predicted seconds, output tiles, record count and peak
         batch size, as a BlockLoad.
     """
     return BlockLoad(
-        seconds=WORKER_SETUP_SECONDS + cost_weights(block, axis, profiles)[1],
+        seconds=setup_seconds + cost_weights(block, axis, profile_costs)[1],
         tiles=count_output_tiles(block),
         records=len(block),
         batch_bytes=peak_batch_bytes(block))
 
 
-def worst_load(blocks, axis, profiles=None):
+def worst_load(blocks, axis, profile_costs=None, setup_seconds=WORKER_SETUP_SECONDS):
     """Take the worst value of each axis across every block.
 
     No single worker need be the worst on every axis, so the result is the
@@ -51,12 +52,13 @@ def worst_load(blocks, axis, profiles=None):
     Args:
         blocks: One entry block per worker.
         axis: The per-axis seconds to charge.
-        profiles: The profiles the run builds.
+        profile_costs: What each profile costs, as settled for this run.
+        setup_seconds: What a worker costs before it reaches its first record.
 
     Returns:
         A BlockLoad whose every field is the maximum across the blocks.
     """
-    loads = [block_load(block, axis, profiles) for block in blocks]
+    loads = [block_load(block, axis, profile_costs, setup_seconds) for block in blocks]
     return BlockLoad(*(max(getattr(load, field) for load in loads)
                        for field in BlockLoad._fields))
 
@@ -94,7 +96,8 @@ def candidate_worker_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
 
 
 def choose_worker_count(entries, gaps, axis, limits=DEFAULT_LIMITS,
-                        cell_limit=MATRIX_CELL_LIMIT, profiles=None):
+                        cell_limit=MATRIX_CELL_LIMIT, profile_costs=None,
+                        setup_seconds=WORKER_SETUP_SECONDS):
     """Pick the first worker count whose worst worker stays inside the limits.
 
     Partitions at the concurrency limit and doubles until every limit holds,
@@ -108,7 +111,8 @@ def choose_worker_count(entries, gaps, axis, limits=DEFAULT_LIMITS,
         axis: The per-axis seconds to charge.
         limits: The run's hard limits.
         cell_limit: The most matrix cells a run may have.
-        profiles: The profiles the run builds, priced into the time.
+        profile_costs: What each profile costs, as settled for this run.
+        setup_seconds: What a worker costs before it reaches its first record.
 
     Returns:
         The chosen count, its blocks, its worst load, and every
@@ -118,7 +122,7 @@ def choose_worker_count(entries, gaps, axis, limits=DEFAULT_LIMITS,
     attempts = []
     for worker_count in candidate_worker_counts(limits, cell_limit):
         blocks = partition_into_worker_blocks(entries, gaps, worker_count, axis)
-        load = worst_load(blocks, axis, profiles)
+        load = worst_load(blocks, axis, profile_costs, setup_seconds)
         broken = breaches(load, limits)
         attempts.append((worker_count, load, broken))
         if not broken:

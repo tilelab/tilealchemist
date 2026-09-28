@@ -1,22 +1,41 @@
 """Fitting the next run's cost coefficients from the last run's `usage:` lines."""
 import json
 import math
+import os
 from collections import namedtuple
 
-from tilealchemist.cost import AXIS_SECONDS, WORKER_SETUP_SECONDS, AxisSeconds
+from tilealchemist.cost import (AXIS_SECONDS, DEFAULT_BYTES_PER_OUTPUT_TILE,
+                                DEFAULT_SECONDS_PER_TILE, WORKER_SETUP_SECONDS, AxisSeconds,
+                                cost_weights)
+from tilealchemist.manifest import read_manifest
 
 # A measured coefficient may differ from the reviewed one by this factor, and no further.
 CLAMP_FACTOR = 4.0
 
 MIN_SCORED_WORKERS = 8
 
-Calibration = namedtuple(
-    "Calibration", "axis_seconds worker_setup_seconds runner diagnostics notes")
+# What the archive costs: its fetch rate, and what its tiles cost to decode.
+SourceAxes = namedtuple("SourceAxes", "fetched_byte decode_call decoded_byte")
 
-RunnerProfile = namedtuple("RunnerProfile", "bytes_per_output_tile")
+# What a profile costs: its own shapely, and how heavy the tiles it writes are.
+ProfileAxes = namedtuple("ProfileAxes", "seconds_per_tile bytes_per_output_tile")
 
-# What a worker's shard size comes to, before any measurement replaces it.
-DEFAULT_RUNNER = RunnerProfile(bytes_per_output_tile=250.0)
+# What belongs to neither: tilealchemist's own bookkeeping and the runner's disk.
+SharedAxes = namedtuple("SharedAxes", "manifest_record written_byte worker_setup_seconds")
+
+REVIEWED_SOURCE = SourceAxes(fetched_byte=AXIS_SECONDS.fetched_byte,
+                             decode_call=AXIS_SECONDS.decode_call,
+                             decoded_byte=AXIS_SECONDS.decoded_byte)
+
+REVIEWED_PROFILE = ProfileAxes(seconds_per_tile=DEFAULT_SECONDS_PER_TILE,
+                               bytes_per_output_tile=DEFAULT_BYTES_PER_OUTPUT_TILE)
+
+REVIEWED_SHARED = SharedAxes(manifest_record=AXIS_SECONDS.manifest_record,
+                             written_byte=AXIS_SECONDS.written_byte,
+                             worker_setup_seconds=WORKER_SETUP_SECONDS)
+
+RunMeasurement = namedtuple(
+    "RunMeasurement", "source_key source profiles shared diagnostics notes")
 
 
 def parse_usage_lines(lines):
@@ -48,7 +67,7 @@ def _scoped(rows, scope):
 
     Args:
         rows: Parsed usage rows.
-        scope: The scope to keep, such as "worker" or "chunk".
+        scope: The scope to keep, such as "worker" or "profile".
 
     Returns:
         The matching rows, in order.
@@ -86,27 +105,26 @@ def _ratio(seconds, units):
     return seconds / units if units else None
 
 
-def length_buckets(chunk_rows):
-    """Total the per-length histograms across every chunk.
+def length_buckets(worker_rows):
+    """Total the per-length histograms across every worker.
 
     Args:
-        chunk_rows: Parsed usage rows for scope "chunk".
+        worker_rows: Parsed usage rows for scope "worker".
 
     Returns:
-        A mapping of bit length to `[calls, bytes, decode, transform]`.
+        A mapping of bit length to `[calls, bytes, decode]`.
     """
     totals = {}
-    for row in chunk_rows:
+    for row in worker_rows:
         histogram = row.get("length_hist", "-")
         if histogram == "-":
             continue
         for item in histogram.split("|"):
-            bits, count, byte_count, decode, transform = item.split(":")
-            bucket = totals.setdefault(int(bits), [0, 0, 0.0, 0.0])
+            bits, count, byte_count, decode = item.split(":")
+            bucket = totals.setdefault(int(bits), [0, 0, 0.0])
             bucket[0] += int(count)
             bucket[1] += int(byte_count)
             bucket[2] += float(decode)
-            bucket[3] += float(transform)
     return totals
 
 
@@ -135,19 +153,21 @@ def _fit_two(samples):
 
 
 def _entry_samples(buckets):
-    """Turn the length buckets into samples for the per-entry fit.
+    """Turn the length buckets into samples for the per-entry decode fit.
 
     The byte term is the bucket's byte total outright: decode is charged on
-    length itself, so `calls * mean length` is just that total again.
+    length itself, so `calls * mean length` is just that total again. The
+    target is the decode alone -- the profiles' own seconds are attributed to
+    the profiles that spent them, not to the archive.
 
     Args:
         buckets: The totalled histograms, by bit length.
 
     Returns:
-        `(calls, bytes, seconds)` per non-empty bucket.
+        `(calls, bytes, decode_seconds)` per non-empty bucket.
     """
-    return [(count, byte_count, decode + transform)
-            for count, byte_count, decode, transform in buckets.values() if count]
+    return [(count, byte_count, decode)
+            for count, byte_count, decode in buckets.values() if count]
 
 
 def correlation(left, right):
@@ -199,101 +219,172 @@ def _clamped(name, measured, reviewed, notes):
     return measured
 
 
-def fit_runner_profile(rows, fallback=DEFAULT_RUNNER):
-    """Fit a runner's disk rate from a run's logs.
+def source_key_of(rows):
+    """Which archive this run's workers read.
 
     Args:
         rows: Parsed usage rows for the whole run.
-        fallback: The rate to keep where nothing usable was measured.
 
     Returns:
-        The fitted RunnerProfile.
+        The one key every worker reported, or None where they disagree or none
+        said. Disagreement means two runs' logs were concatenated, and no fit
+        should treat that as one archive.
     """
-    chunks, profiles = _scoped(rows, "chunk"), _scoped(rows, "profile")
-    per_tile = _ratio(_total(profiles, "shard_bytes"), _total(chunks, "output_tiles"))
-    return RunnerProfile(
-        bytes_per_output_tile=per_tile if per_tile else fallback.bytes_per_output_tile)
+    keys = {row["source_key"] for row in _scoped(rows, "worker") if "source_key" in row}
+    return keys.pop() if len(keys) == 1 else None
 
 
-def runner_profile_from_json(data):
-    """Read a runner profile out of a calibration document.
-
-    Args:
-        data: The parsed calibration JSON.
-
-    Returns:
-        The RunnerProfile it carries, each field defaulted where absent.
-    """
-    runner = data.get("runner", {}) if isinstance(data, dict) else {}
-    return RunnerProfile(**{name: float(runner[name]) if name in runner
-                            else getattr(DEFAULT_RUNNER, name)
-                            for name in RunnerProfile._fields})
-
-
-def calibrate(rows, reviewed=AXIS_SECONDS, reviewed_setup=WORKER_SETUP_SECONDS,
-              runner_overhead_seconds=None):
-    """Fit the next run's cost coefficients from the last run's logs.
-
-    Every coefficient is measured and then clamped towards the reviewed one,
-    so that a single unusual run moves the model without taking it over.
-    What was clamped, and why, comes back in the notes.
+def measure_source(rows):
+    """Fit what the archive costs, from the workers that read it.
 
     Args:
         rows: Parsed usage rows for the whole run.
-        reviewed: The reviewed per-axis seconds to measure against.
-        reviewed_setup: The reviewed per-worker setup seconds.
+
+    Returns:
+        The measured SourceAxes, any field None where nothing usable was
+        measured.
+    """
+    workers = _scoped(rows, "worker")
+    fetched = _ratio(_total(workers, "fetch_seconds"), _total(workers, "fetched_bytes"))
+    decode_fit = _fit_two(_entry_samples(length_buckets(workers)))
+    return SourceAxes(fetched_byte=fetched,
+                      decode_call=decode_fit[0] if decode_fit else None,
+                      decoded_byte=decode_fit[1] if decode_fit else None)
+
+
+def measure_profiles(rows):
+    """Fit what each profile costs, from its own usage rows.
+
+    A profile's seconds are charged per *distinct* entry, because
+    `_entry_outputs()` runs it once per decode rather than once per record, so
+    the run's decode count is the denominator its rate belongs over.
+
+    `bytes_per_output_tile` counts real tiles only. Gap tiles are excluded from
+    both sides of it: they are a different size, their share of a run swings
+    from 0% to 94%, and their size is known exactly anyway -- `prepare-shards`
+    asks `transform_gap()` rather than fitting it. Averaging the two
+    populations would let the mix set the figure instead of either one.
+
+    Args:
+        rows: Parsed usage rows for the whole run.
+
+    Returns:
+        A mapping of profile name to its measured ProfileAxes, any field None
+        where nothing usable was measured.
+    """
+    decode_calls = _total(_scoped(rows, "worker"), "decode_calls")
+    measured = {}
+    for name in sorted({row["profile"] for row in _scoped(rows, "profile") if "profile" in row}):
+        owned = [row for row in _scoped(rows, "profile") if row.get("profile") == name]
+        real_tiles = _total(owned, "written") - _total(owned, "gap_tiles")
+        measured[name] = ProfileAxes(
+            seconds_per_tile=_ratio(_total(owned, "transform_seconds"), decode_calls),
+            bytes_per_output_tile=_ratio(_total(owned, "output_bytes"), real_tiles))
+    return measured
+
+
+def measure_shared(rows, runner_overhead_seconds=None):
+    """Fit what belongs to neither the archive nor a profile.
+
+    Args:
+        rows: Parsed usage rows for the whole run.
         runner_overhead_seconds: What a runner costs before the worker's own
             code starts, which no log of that worker can see. None leaves the
-            reviewed setup figure alone, and says so in the notes.
+            setup figure unmeasured.
 
     Returns:
-        The fitted Calibration, with its diagnostics and its notes.
+        The measured SharedAxes, any field None where nothing usable was
+        measured.
     """
-    workers, chunks = _scoped(rows, "worker"), _scoped(rows, "chunk")
-    notes, diagnostics = [], {}
-
-    fetched = _ratio(_total(workers, "fetch_seconds"), _total(workers, "fetched_bytes"))
-    output = _ratio(_total(workers, "write_seconds"), _total(chunks, "output_tiles"))
-
-    buckets = length_buckets(chunks)
-    entry_fit = _fit_two(_entry_samples(buckets))
+    workers, profiles = _scoped(rows, "worker"), _scoped(rows, "profile")
     setup_fit = _fit_two([(1.0, float(row.get("real_entries", 0)) + float(
         row.get("gap_entries", 0)), float(row["setup_seconds"]))
         for row in workers if "setup_seconds" in row])
-
-    decode_total = sum(bucket[2] for bucket in buckets.values())
-    transform_total = sum(bucket[3] for bucket in buckets.values())
-    diagnostics["workers"] = len(workers)
-    diagnostics["chunks"] = len(chunks)
-    diagnostics["decode_share"] = _ratio(decode_total, decode_total + transform_total)
-    diagnostics["measured"] = {
-        "manifest_record": setup_fit[1] if setup_fit else None,
-        "decode_call": entry_fit[0] if entry_fit else None,
-        "fetched_byte": fetched,
-        "decoded_byte": entry_fit[1] if entry_fit else None,
-        "output_tile": output,
-    }
     # The in-process residual only: a log cannot see runner boot, artifact download or pip.
     in_process_setup = setup_fit[0] if setup_fit else None
-    diagnostics["in_process_setup_seconds"] = in_process_setup
-    diagnostics["measured"]["worker_setup_seconds"] = (
-        None if in_process_setup is None or runner_overhead_seconds is None
-        else runner_overhead_seconds + in_process_setup)
+    # Payload bytes, real and gap alike: both were written, and both took time.
+    written_bytes = _total(profiles, "output_bytes") + _total(profiles, "gap_bytes")
+    return SharedAxes(
+        manifest_record=setup_fit[1] if setup_fit else None,
+        written_byte=_ratio(_total(workers, "write_seconds"), written_bytes),
+        worker_setup_seconds=(None if in_process_setup is None
+                              or runner_overhead_seconds is None
+                              else runner_overhead_seconds + in_process_setup))
 
-    axis = AxisSeconds(**{name: _clamped(name, diagnostics["measured"][name],
-                                         getattr(reviewed, name), notes)
-                          for name in AxisSeconds._fields})
+
+def measure_run(rows, runner_overhead_seconds=None):
+    """Measure one run, split by what each coefficient belongs to.
+
+    Nothing is clamped here: this is what the run says, and the clamping
+    against the reviewed model happens where a value is adopted.
+
+    Args:
+        rows: Parsed usage rows for the whole run.
+        runner_overhead_seconds: What a runner costs before the worker's own
+            code starts. None leaves the setup figure unmeasured.
+
+    Returns:
+        The RunMeasurement, whose notes say what could not be measured.
+    """
+    workers, profiles = _scoped(rows, "worker"), _scoped(rows, "profile")
+    buckets = length_buckets(workers)
+    decode_total = sum(bucket[2] for bucket in buckets.values())
+    transform_total = _total(profiles, "transform_seconds")
+    notes = []
+    key = source_key_of(rows)
+    if key is None:
+        notes.append("source_key: the workers do not agree on one archive, so the archive's "
+                     "own coefficients cannot be filed")
     if runner_overhead_seconds is None:
         notes.append("worker_setup_seconds: a worker's log cannot see runner boot, artifact "
-                     "download or pip install, so this needs --runner-overhead-seconds; "
-                     f"keeping the reviewed {reviewed_setup:g}")
-        setup = reviewed_setup
-    else:
-        setup = _clamped("worker_setup_seconds",
-                         diagnostics["measured"]["worker_setup_seconds"], reviewed_setup, notes)
-    runner = fit_runner_profile(rows)
-    diagnostics["runner"] = runner._asdict()
-    return Calibration(axis, setup, runner, diagnostics, notes)
+                     "download or pip install, so this needs --runner-overhead-seconds")
+    diagnostics = {
+        "workers": len(workers),
+        "profile_rows": len(profiles),
+        "decode_share": _ratio(decode_total, decode_total + transform_total),
+        "decode_seconds": decode_total,
+        "transform_seconds": transform_total,
+    }
+    return RunMeasurement(source_key=key, source=measure_source(rows),
+                          profiles=measure_profiles(rows),
+                          shared=measure_shared(rows, runner_overhead_seconds),
+                          diagnostics=diagnostics, notes=notes)
+
+
+def clamp_group(measured, reviewed, notes, prefix=""):
+    """Clamp every field of one measured group towards the reviewed one.
+
+    Args:
+        measured: The measured group, whose fields may be None.
+        reviewed: The reviewed group of the same type.
+        notes: The list any explanation is appended to.
+        prefix: Prepended to each coefficient's name in a note, so that a note
+            says which profile or archive it is about.
+
+    Returns:
+        A group of the same type, every field usable.
+    """
+    return type(reviewed)(**{
+        name: _clamped(prefix + name, getattr(measured, name), getattr(reviewed, name), notes)
+        for name in reviewed._fields})
+
+
+def axis_seconds_of(source, shared):
+    """Assemble the five cost-model coefficients from two of the groups.
+
+    Args:
+        source: The archive's coefficients.
+        shared: The coefficients belonging to neither archive nor profile.
+
+    Returns:
+        The AxisSeconds the cost model charges. A profile's own two
+        coefficients are not here: they travel on the profile.
+    """
+    return AxisSeconds(manifest_record=shared.manifest_record,
+                       decode_call=source.decode_call,
+                       fetched_byte=source.fetched_byte,
+                       decoded_byte=source.decoded_byte,
+                       written_byte=shared.written_byte)
 
 
 def axis_seconds_from_json(data):
@@ -318,13 +409,13 @@ def axis_seconds_from_json(data):
 
 
 def load_calibration_file(path):
-    """Read a calibration file.
+    """Read a flat calibration file, as `tilealchemist-calibrate --out` writes it.
 
     Args:
         path: The file to read.
 
     Returns:
-        Its per-axis seconds, and its runner profile.
+        Its per-axis seconds.
 
     Raises:
         OSError: If the file cannot be read.
@@ -332,4 +423,84 @@ def load_calibration_file(path):
     """
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
-    return axis_seconds_from_json(data), runner_profile_from_json(data)
+    return axis_seconds_from_json(data)
+
+
+def score_axes(manifest_dir, worker_rows, axis, profile_costs=None):
+    """Score predicted worker durations against the ones the run measured.
+
+    A calibration that ranks a run's own workers worse than the reviewed
+    coefficients did is a worse model, whatever its individual coefficients
+    look like, so this is the guard that catches a fit which improved every
+    ratio and the whole no better.
+
+    Args:
+        manifest_dir: The run's manifests, to price each worker's block from.
+        worker_rows: Parsed usage rows for scope "worker".
+        axis: The per-axis seconds to price with.
+        profile_costs: What each profile cost, where the caller knows.
+
+    Returns:
+        The correlation between predicted and measured durations, or None
+        where a manifest is missing or too few workers reported to score it.
+    """
+    predicted, measured = [], []
+    for row in worker_rows:
+        path = os.path.join(manifest_dir, f"worker-{int(row['worker']):03d}.bin")
+        if not os.path.exists(path):
+            return None
+        predicted.append(cost_weights(read_manifest(path), axis, profile_costs)[1])
+        measured.append(float(row["wall_seconds"]))
+    return correlation(predicted, measured)
+
+
+def worker_rows(rows):
+    """The run's per-worker usage rows.
+
+    Args:
+        rows: Parsed usage rows for the whole run.
+
+    Returns:
+        The rows for scope "worker", in order.
+    """
+    return _scoped(rows, "worker")
+
+
+def _group_lines(title, measured, reviewed):
+    """Render one group's measurements against the reviewed values.
+
+    Args:
+        title: What the group is, for the heading.
+        measured: The measured group, whose fields may be None.
+        reviewed: The reviewed group of the same type.
+
+    Returns:
+        The heading and one line per coefficient.
+    """
+    lines = [f"{title}:"]
+    for name in reviewed._fields:
+        value = getattr(measured, name)
+        shown = "n/a" if value is None else f"{value:.4g}"
+        lines.append(f"  {name:<24}{getattr(reviewed, name):>14.4g}{shown:>14}")
+    return lines
+
+
+def proposal_lines(measurement):
+    """Render a whole run's measurements, grouped by what each belongs to.
+
+    Args:
+        measurement: The run's RunMeasurement.
+
+    Returns:
+        The lines to print, header first.
+    """
+    lines = [f"{'coefficient':<26}{'reviewed':>14}{'measured':>14}"]
+    lines.extend(_group_lines(f"source {measurement.source_key}", measurement.source,
+                              REVIEWED_SOURCE))
+    for name, measured in sorted(measurement.profiles.items()):
+        lines.extend(_group_lines(f"profile {name}", measured, REVIEWED_PROFILE))
+    lines.extend(_group_lines("shared", measurement.shared, REVIEWED_SHARED))
+    share = measurement.diagnostics.get("decode_share")
+    if share is not None:
+        lines.append(f"decode is {share:.1%} of per-entry CPU, the profiles {1 - share:.1%}")
+    return lines

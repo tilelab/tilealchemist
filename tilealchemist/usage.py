@@ -5,7 +5,7 @@ import sys
 import time
 
 LENGTH_BUCKET_COUNT = 32
-#todo
+
 
 def _format(value):
     """Render one field value for a usage line.
@@ -26,11 +26,17 @@ def report(scope, **fields):
     over its job logs.
 
     Args:
-        scope: What the line is about, such as "chunk" or "worker".
+        scope: What the line is about, such as "profile" or "worker".
         **fields: The measurements to print, as `name=value` pairs.
+
+    Returns:
+        The line as printed, so that a caller can also keep it for the job that
+        collects every worker's measurements.
     """
     formatted = " ".join(f"{name}={_format(value)}" for name, value in fields.items())
-    print(f"usage: scope={scope} {formatted}", file=sys.stderr)
+    line = f"usage: scope={scope} {formatted}"
+    print(line, file=sys.stderr)
+    return line
 
 
 class PhaseSeconds:
@@ -83,62 +89,114 @@ class PhaseSeconds:
 
 
 class TransformUsage:
-    """What one chunk's transform cost, measured as it ran.
+    """What a transform cost, measured as it ran, for one chunk or a whole worker.
+
+    A chunk's measurements are taken in the process that ran it and merged into
+    the worker's own on the way back, so that a worker reports once rather than
+    once per chunk; see docs/ARCHITECTURE.md "Measuring a run".
 
     Attributes:
         entries: Manifest entries walked.
         decode_calls: Tiles actually decoded, a duplicate not counted twice.
         decoded_bytes: Source bytes decoded.
         decode_seconds: Seconds spent decoding.
-        transform_seconds: Seconds spent inside the profiles.
-        output_tiles: Tiles written out.
-        buckets: Per-bucket `[calls, bytes, decode, transform]`, bucketed by
-            the bit length of the tile, which is the shape the cost model is
-            fitted against.
+        profile_seconds: Seconds spent inside each profile, in profile order, so
+            that a profile's own cost is attributable to it rather than to the
+            run's profile set as a whole.
+        profile_output_bytes: Output payload bytes each profile wrote, in the
+            same order, counted once per output tile. Measured here rather than
+            from the finished shard so it is payload alone -- no sqlite page
+            overhead, and no gap tiles, which are a different size entirely and
+            counted separately.
+        output_tiles: Tiles written out, per profile: every profile is offered
+            the same tiles.
+        buckets: Per-bucket `[calls, bytes, decode]`, bucketed by the bit length
+            of the tile, which is the shape the decode axes are fitted against.
     """
 
-    def __init__(self):
-        """Start every measurement at zero."""
+    def __init__(self, profile_count=0):
+        """Start every measurement at zero.
+
+        Args:
+            profile_count: How many profiles the run builds, which fixes the
+                length of `profile_seconds` for the run.
+        """
         self.entries = 0
         self.decode_calls = 0
         self.decoded_bytes = 0
         self.decode_seconds = 0.0
-        self.transform_seconds = 0.0
         self.output_tiles = 0
-        self.buckets = [[0, 0, 0.0, 0.0] for _ in range(LENGTH_BUCKET_COUNT)]
+        self.profile_seconds = [0.0] * profile_count
+        self.profile_output_bytes = [0] * profile_count
+        self.buckets = [[0, 0, 0.0] for _ in range(LENGTH_BUCKET_COUNT)]
 
-    def add_decode(self, length, decode_seconds, transform_seconds):
-        """Record one tile's decode and transform.
+    def add_decode(self, length, decode_seconds, profile_seconds):
+        """Record one tile's decode, and what each profile spent on it.
 
         Args:
             length: The tile's source bytes.
             decode_seconds: Seconds spent decoding it.
-            transform_seconds: Seconds spent in the profiles over it.
+            profile_seconds: Seconds each profile spent on it, in profile order.
         """
         self.decode_calls += 1
         self.decoded_bytes += length
         self.decode_seconds += decode_seconds
-        self.transform_seconds += transform_seconds
+        for index, seconds in enumerate(profile_seconds):
+            self.profile_seconds[index] += seconds
         bucket = self.buckets[min(length.bit_length(), LENGTH_BUCKET_COUNT - 1)]
         bucket[0] += 1
         bucket[1] += length
         bucket[2] += decode_seconds
-        bucket[3] += transform_seconds
+
+    def merge(self, other):
+        """Fold one chunk's measurements into these.
+
+        Every field is a running total, so merging is addition throughout; the
+        run's profile set is fixed, which is what lets `profile_seconds` add
+        position by position.
+
+        Args:
+            other: The measurements to add, from a chunk this worker ran.
+        """
+        self.entries += other.entries
+        self.decode_calls += other.decode_calls
+        self.decoded_bytes += other.decoded_bytes
+        self.decode_seconds += other.decode_seconds
+        self.output_tiles += other.output_tiles
+        for index, seconds in enumerate(other.profile_seconds):
+            self.profile_seconds[index] += seconds
+        for index, byte_count in enumerate(other.profile_output_bytes):
+            self.profile_output_bytes[index] += byte_count
+        for bucket, addend in zip(self.buckets, other.buckets):
+            bucket[0] += addend[0]
+            bucket[1] += addend[1]
+            bucket[2] += addend[2]
+
+    def transform_seconds(self):
+        """What every profile spent together.
+
+        Returns:
+            The summed per-profile seconds.
+        """
+        return sum(self.profile_seconds)
 
     def length_histogram(self):
         """The per-length buckets, as one usage-line field value.
 
         Returns:
-            `bits:calls:bytes:decode:transform` per non-empty bucket, separated
-            by `|`, or `-` where nothing was decoded at all.
+            `bits:calls:bytes:decode` per non-empty bucket, separated by `|`, or
+            `-` where nothing was decoded at all.
         """
         return "|".join(
-            f"{bits}:{count}:{byte_count}:{decode:.6f}:{transform:.6f}"
-            for bits, (count, byte_count, decode, transform) in enumerate(self.buckets)
+            f"{bits}:{count}:{byte_count}:{decode:.6f}"
+            for bits, (count, byte_count, decode) in enumerate(self.buckets)
             if count) or "-"
 
     def fields(self):
         """These measurements as usage-line fields.
+
+        The per-profile seconds are left out: they belong on the `scope=profile`
+        line, which is already keyed by the profile they were measured on.
 
         Returns:
             A mapping of field name to value.
@@ -148,18 +206,6 @@ class TransformUsage:
             "decode_calls": self.decode_calls,
             "decoded_bytes": self.decoded_bytes,
             "decode_seconds": self.decode_seconds,
-            "transform_seconds": self.transform_seconds,
             "output_tiles": self.output_tiles,
             "length_hist": self.length_histogram(),
         }
-
-
-def report_chunk(usage, chunk_index, blob_bytes):
-    """Print one chunk's usage line.
-
-    Args:
-        usage: That chunk's measurements.
-        chunk_index: Which chunk this is, counting from one.
-        blob_bytes: How many bytes the chunk was handed.
-    """
-    report("chunk", chunk=chunk_index, blob_bytes=blob_bytes, **usage.fields())

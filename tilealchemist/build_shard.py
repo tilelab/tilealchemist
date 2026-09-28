@@ -49,6 +49,10 @@ def parse_args():
     parser.add_argument("--out", required=True,
                          help="comma-separated output mbtiles path(s), one per --profile, "
                               "matched by position")
+    parser.add_argument("--usage-out", default=None,
+                         help="where to write this worker's `usage:` lines, for the merge-axes "
+                              "job to collect them as an artifact; left off, they go to the log "
+                              "alone")
     parser.add_argument("--profile", required=True,
                          help="comma-separated path(s) to a profile's .py file to apply, e.g. "
                               "\"./my_profile.py\" or "

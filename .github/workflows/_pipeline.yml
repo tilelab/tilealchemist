@@ -69,6 +69,16 @@ on:
         description: "Base name for each profile's output .pmtiles file and artifact: one value, or a comma-separated list matched 1:1 with profile, e.g. \"land\" or \"land,cropped-waterways\"."
         required: true
         type: string
+      axis_state:
+        description: "Whether to keep the measured cost coefficients on a state branch in the CALLING repository, so each run is partitioned by what the last few actually cost instead of by the reviewed constants in cost.py. The merge-axes job appends one observation per run and prepare-shards reads the median of the last few; see docs/ARCHITECTURE.md \"Measuring a run\". Needs `contents: write` on the calling workflow; the job is non-fatal, so a caller that withholds it loses the calibration and nothing else. Set to \"false\" to keep the reviewed constants and write nothing."
+        required: false
+        type: string
+        default: "true"
+      axis_state_branch:
+        description: "Branch in the calling repository that the measured coefficients live on. Created as an empty orphan on first use, sharing no history with your default branch."
+        required: false
+        type: string
+        default: "state"
       attribution:
         description: "What the built layers credit, as a template in which \"{source}\" stands for the attribution the source archive declares for itself, e.g. \"<a href=\\\"https://example.org\\\">&copy; Example</a> {source}\". Left off, the archive's own attribution is carried through unchanged; given without the placeholder, it replaces it outright. See docs/ARCHITECTURE.md \"Source attribution\"."
         required: false
@@ -166,6 +176,19 @@ jobs:
             fi
           done
 
+      # The calling repository's own branch, not tilealchemist's: the
+      # coefficients belong to the profile set and archive being measured. It
+      # does not exist before the first merge-axes run, and a build must not
+      # fail for that, so a miss here leaves prepare-shards on the reviewed
+      # constants. See docs/ARCHITECTURE.md "Measuring a run".
+      - name: Read the measured axes off the state branch
+        if: inputs.axis_state == 'true'
+        continue-on-error: true
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.axis_state_branch }}
+          path: .axis-state
+
       - id: walk
         name: Walk archive directory and partition into per-worker manifests
         env:
@@ -179,6 +202,10 @@ jobs:
           PROFILE: ${{ inputs.profile }}
         run: |
           ARGS=(--concurrency "$CONCURRENCY" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests --profile "$PROFILE")
+          # Absent on the first ever run, which prepare-shards treats as "nothing measured yet".
+          if [ -f .axis-state/state/axes.json ]; then
+            ARGS+=(--axis-state .axis-state/state/axes.json)
+          fi
           if [ -n "$SOURCE_URL" ]; then
             ARGS+=(--source-url "$SOURCE_URL")
           fi
@@ -303,6 +330,7 @@ jobs:
             --profile "$PROFILE" \
             --manifest "manifests/worker-${WORKER_ID}.bin" \
             --source manifests/source.json \
+            --usage-out "usage-worker-${WORKER_ID}.txt" \
             --out "$OUT_JOINED"
 
       # A missing file is expected, not a failure. One artifact per worker
@@ -314,6 +342,83 @@ jobs:
           name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shards-${{ matrix.worker }}
           path: "*-shard-${{ matrix.worker }}.mbtiles"
           if-no-files-found: ignore
+
+      # What this worker actually cost. Same "a worker that died wrote no file"
+      # caveat as the shards above: merge-axes refuses to record a partial run
+      # anyway, so a missing file is not a failure here.
+      - uses: actions/upload-artifact@v4
+        if: always() && inputs.axis_state == 'true'
+        with:
+          name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}usage-${{ matrix.worker }}
+          path: "usage-worker-*.txt"
+          if-no-files-found: ignore
+
+  # One writer for the whole run, the way tiledistillery's record-timings job
+  # is: every worker measured its own share, and the coefficients only mean
+  # something summed across all of them. `if: always()` so a failed build leg
+  # does not cost the others' measurements, and non-fatal throughout because a
+  # calibration is an optimisation -- never a reason to fail a finished build.
+  # See docs/ARCHITECTURE.md "Measuring a run".
+  merge-axes:
+    needs: [prepare-shards, build-shards]
+    if: always() && inputs.axis_state == 'true'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          repository: ${{ job.workflow_repository }}
+          ref: ${{ job.workflow_sha }}
+          path: .tilealchemist
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # No profile dependencies: this job fits numbers out of log lines and
+      # never imports a profile.
+      - name: Install tilealchemist
+        run: pip install ./.tilealchemist
+
+      # No merge-multiple: every worker's file is named after its own index,
+      # but per-artifact subdirectories are fine either way since merge-axes
+      # searches --usage-dir recursively.
+      #
+      # continue-on-error: download-artifact errors when a pattern matches zero
+      # artifacts, which is what happens when every worker died before writing.
+      - name: Download every worker's usage lines
+        continue-on-error: true
+        uses: actions/download-artifact@v4
+        with:
+          pattern: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}usage-*
+          path: usage
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shard-manifests
+          path: manifests
+
+      # --expect-workers is the guard that matters: a partial run is a biased
+      # sample, because the workers that failed are the expensive ones, so
+      # nothing is pushed unless every one of them reported. --manifest-dir
+      # adds the second guard, refusing a fit that predicts this run's own
+      # workers worse than the reviewed constants already did.
+      - name: Merge the measured axes into the state branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WORKER_COUNT: ${{ needs.prepare-shards.outputs.worker_count }}
+          STATE_BRANCH: ${{ inputs.axis_state_branch }}
+        run: |
+          tilealchemist-merge-axes \
+            --usage-dir usage \
+            --expect-workers "$WORKER_COUNT" \
+            --manifest-dir manifests \
+            --source manifests/source.json \
+            --repo "$GITHUB_REPOSITORY" \
+            --token "$GH_TOKEN" \
+            --state-branch "$STATE_BRANCH"
 
   merge:
     needs: [prepare-shards, build-shards]

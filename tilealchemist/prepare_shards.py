@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """CLI entry point for the planning step; the run itself is in shard_prep.py."""
 import argparse
+import json
+import os
 
 from tilealchemist.calibration import load_calibration_file
 from tilealchemist.cost import AXIS_SECONDS
@@ -110,6 +112,12 @@ def parse_args():
                               "replace the reviewed ones in cost.py for this run; the "
                               "coefficients are profile-dependent, so a calibration belongs to "
                               "the profile set and archive it was measured on")
+    parser.add_argument("--axis-state", default=None,
+                         help="state/axes.json off the state branch, as tilealchemist-merge-axes "
+                              "writes it. Its coefficients are the median of the last few runs "
+                              "and replace both the reviewed ones and each profile's declared "
+                              "per-tile figures, for the archive this run reads. A missing file "
+                              "is not an error: the first run has nothing measured yet")
     parser.add_argument("--attribution", default=None,
                          help="what the built layer credits, as a template in which "
                               "`{source}` stands for the attribution the archive declares "
@@ -126,10 +134,14 @@ def parse_args():
     args = parser.parse_args()
 
     try:
-        args.axis_seconds = (load_calibration_file(args.axis_seconds)[0]
+        args.axis_seconds = (load_calibration_file(args.axis_seconds)
                              if args.axis_seconds else AXIS_SECONDS)
     except (OSError, ValueError, KeyError, TypeError) as error:
         parser.error(f"--axis-seconds: {error}")
+    try:
+        args.axis_state_document = _read_axis_state(args.axis_state)
+    except (OSError, ValueError) as error:
+        parser.error(f"--axis-state: {error}")
     args.limits = Limits(job_seconds=args.job_seconds, concurrency=args.concurrency,
                           tail_factor=TAIL_SAFETY_FACTOR)
     if args.concurrency < 1:
@@ -147,6 +159,30 @@ def parse_args():
     except ValueError as error:
         parser.error(str(error))
     return args
+
+
+def _read_axis_state(path):
+    """Read the state document, treating a missing file as nothing measured.
+
+    Args:
+        path: The file to read, or None where the run was given none.
+
+    Returns:
+        The parsed document, or None where there is nothing to read. A path
+        that is not there reads as None rather than failing: the first run of a
+        new repository has no state branch yet, and that is not a mistake.
+
+    Raises:
+        ValueError: If the file exists but does not hold a JSON object, which
+            would otherwise silently cost the run its calibration.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        raise ValueError(f"{path} holds {type(document).__name__}, not a JSON object")
+    return document
 
 
 def main():

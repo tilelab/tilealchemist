@@ -88,14 +88,17 @@ else.
 | `tilealchemist/pmtiles_index.py` | The source archive's directory index: header + root, then only the leaf directories the zoom range needs, in two range requests, walked and zoom-pruned in memory into directory entries -- and the gaps those entries leave, the tile id ranges the archive holds nothing for. |
 | `tilealchemist/partition.py` | Those entries and gaps into one balanced, contiguous block of work per worker. No network, no files. |
 | `tilealchemist/sizing.py` | Picks `worker_count` itself, always: partitions at `--concurrency` and doubles until the worst worker fits the job's time limit, stopping at GitHub's 256-cell matrix limit. |
-| `tilealchemist/calibration.py` | Fits the next run's cost coefficients from the last run's `usage:` lines, with the guards that stop a bad fit being adopted. |
-| `tilealchemist/calibrate.py` | CLI for that: prints what it would change and, with `--out`, writes a `calibration.json`. It never edits `cost.py`. |
+| `tilealchemist/calibration.py` | Fits the next run's cost coefficients from the last run's `usage:` lines, split into what belongs to the archive, to a profile, and to neither, with the guards that stop a bad fit being adopted. |
+| `tilealchemist/axis_state.py` | Those coefficients across runs: a ring buffer of the last 5 observations per coefficient, summarised by median so one bad runner cannot move the model. |
+| `tilealchemist/state_branch.py` | Reading and writing that state on its own orphan branch through the GitHub contents API, read-modify-write against the blob sha so concurrent runs cannot lose each other's observations. |
+| `tilealchemist/merge_axes.py` | The single-writer CLI a pipeline runs once per run: collects every worker's usage, fits, and pushes to the state branch -- but only if every worker reported. |
+| `tilealchemist/calibrate.py` | The by-hand equivalent: prints what it would change and, with `--out`, writes a flat `calibration.json`. It never edits `cost.py` and never writes the state branch. |
 | `tilealchemist/build_shard.py` | One worker's entry point: parses its flags, then hands off to `shard_worker.py`. |
 | `tilealchemist/shard_worker.py` | One worker's control flow: fetches its manifest's tiles in a single range request per contiguous run of them, drives the transform and the shard writing, logs the run. |
 | `tilealchemist/fetch_batching.py` | Groups a worker's manifest entries into range-GET batches (split at wide unread gaps) and fetches one batch's bytes. |
 | `tilealchemist/transform.py` | Fetched bytes to output tiles: one decode per tile shared by every selected `Profile`, timed apart from the per-profile transform. |
 | `tilealchemist/transform_pool.py` | Splits a batch into cost-balanced chunks and runs them across this machine's cores (`--transform-workers`), throttling how many are in flight. |
-| `tilealchemist/usage.py` | What the run actually cost: per-chunk and per-worker `usage:` lines (seconds by phase, bytes, distinct blobs). |
+| `tilealchemist/usage.py` | What the run actually cost: one `usage:` line per worker and one per profile (seconds by phase, bytes, distinct blobs, each profile's own transform seconds). A chunk measures itself and is merged into its worker's totals. |
 | `tilealchemist/mbtiles.py` | The shard files themselves: creating one mbtiles per profile in either layout (`--shard-layout`), expanding runs into rows (including the XYZ-to-TMS row flip). |
 | `tilealchemist/profile_requirements.py` | Reads a profile's inline PEP 723 dependency block without importing it, so CI can install what the profile needs before loading it. |
 | `tilealchemist/profiles/` | The `Profile` ABC and the path-based `load_profile()`. No profiles: those live in their own repositories. |

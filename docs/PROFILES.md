@@ -97,15 +97,30 @@ The defaults a profile can override, but usually doesn't:
   once per profile and reuses the result across the whole gap, which can be
   hundreds of thousands of tiles (e.g. an ice sheet interior).
 - **`seconds_per_tile`** is what `prepare-shards` sizes the run's *time*
-  with, and the one number about a profile tilealchemist cannot work out for
-  itself: what `transform_tile()` costs on one deduped source tile. It is a
-  profile's own measurement — the work is its shapely, not tilealchemist's —
+  with: what `transform_tile()` costs on one deduped source tile. It is a
+  profile's own estimate — the work is its shapely, not tilealchemist's —
   and the default is deliberately pessimistic, so an undeclared profile
-  plans a bigger run rather than one that runs out of time. There is no
-  storage figure to declare beside it: nothing bounds what a worker writes,
-  and a run is sized on time alone. See
+  plans a bigger run rather than one that runs out of time. See
   [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#why-no-budget-caps-a-worker)
   "Why no budget caps a worker" for the caps that were tried and dropped.
+- **`bytes_per_output_tile`** is what one of this profile's output tiles
+  weighs in the shard. The write is charged on bytes rather than on tiles,
+  because a tile is only as expensive to store as it is large, and how large
+  it is belongs to the profile that shaped it: a coastline profile's tiles are
+  not a label profile's. It still does not *bound* anything — nothing caps what
+  a worker writes, and a run is sized on time alone.
+
+- **`gap_bytes(schema)`** is a method, not a figure, because the answer is
+  knowable exactly rather than worth estimating: the default implementation
+  measures your own `transform_gap()` once, at plan time. Override it only if
+  your profile can answer without building the tile.
+
+  Neither declared figure is a promise you have to get right. A pipeline keeping
+  its measured axes on a state branch replaces both with what the last few runs
+  actually cost this profile, and a declared value is only what the first run
+  plans with; see
+  [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#the-state-branch-and-the-job-that-writes-it)
+  "The state branch, and the job that writes it".
 - **`_encode_tile(features, extent)`** wraps `mvt.encode_tile()` with this
   profile's own `output_layer_name` filled in, and is the one place a profile
   touches the MVT codec directly, for a `transform_gap` or

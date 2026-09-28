@@ -1,9 +1,11 @@
 """Everything `prepare_shards.py` hands the `build_shard.py` workers."""
 import json
 import os
+import re
 import struct
 from collections import namedtuple
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 from tilealchemist.schemas import SchemaName
 from tilealchemist.zoom import ZoomLevel
@@ -51,6 +53,39 @@ def write_worker_manifests(out_dir, blocks):
         write_manifest(os.path.join(out_dir, f"worker-{worker_index:03d}.bin"), block)
 
 
+def axis_key_for(url, schema):
+    """What an archive's measured fetch and decode costs are filed under.
+
+    Host and schema, and deliberately not the build: a provider's fetch rate
+    and tile density are properties of the provider, not of this month's
+    extract, and putting the build in the key would start every build's history
+    from nothing -- which is the one thing a median over several runs cannot
+    survive. Both the planning step and the worker derive the key here, so they
+    cannot disagree about which archive a measurement belongs to.
+
+    Args:
+        url: Absolute URL of the archive.
+        schema: The SchemaName its tiles are encoded in.
+
+    Returns:
+        The key, safe to use as a path segment.
+    """
+    host = urlparse(url).netloc or "unknown-host"
+    return _slug(f"{host}-{schema.value}")
+
+
+def _slug(value):
+    """Reduce a label to what is safe in a path segment and a usage line.
+
+    Args:
+        value: The label to reduce.
+
+    Returns:
+        The label with every run of other characters turned into a single dash.
+    """
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-").lower() or "unknown"
+
+
 @dataclass(frozen=True)
 class SourceMetadata:
     """What every worker needs to know about the archive it reads.
@@ -73,6 +108,15 @@ class SourceMetadata:
     min_zoom: ZoomLevel
     max_zoom: ZoomLevel
     tile_data_offset: int
+
+    @property
+    def axis_key(self):
+        """What this archive's measured fetch and decode costs are filed under.
+
+        Returns:
+            The key, as `axis_key_for()` derives it.
+        """
+        return axis_key_for(self.url, self.schema)
 
     def as_json(self):
         """Plain strings and numbers, exactly what the matching CLI flags take."""

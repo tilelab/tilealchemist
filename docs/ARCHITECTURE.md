@@ -423,26 +423,44 @@ reports what it actually did. `usage.py` prints one `usage:` line per scope,
 in `name=value` form: a whole run's budget is one `grep '^usage:'` over the
 job logs, and that grep is what the next run's coefficients are fitted from.
 
-Three scopes:
+Two scopes:
 
-- **`scope=chunk`**, one per transform chunk, printed by the process that ran
-  it. `TRANSFORM_CHUNKS_PER_WORKER = 8` on 4 vCPU makes that ~32 lines per
-  worker rather than one, so a 128-worker run yields ~4,096 measurements
-  instead of 128. Chunks also vary far more in composition than the
-  deliberately equal-cost worker blocks do, which is what breaks the
-  collinearity a worker-level regression cannot get past (bytes against
-  output tiles at -0.80, by construction, because the run was partitioned by
-  the model being fitted). A chunk measurement contains no runner boot and no
-  `pip install` either.
 - **`scope=profile`**, one per profile per worker: `written`, `skipped`,
-  `blobs`, and the finished shard's size on disk. `blobs` counts *distinct*
-  blob objects rather than rows, so `written / blobs` is the storage
-  amplification -- the number that decides whether the deduplicated shard
-  layout pays for itself (see "Shard layout").
-- **`scope=worker`**, one per worker: wall-clock seconds split by phase
-  (`fetch`, `transform`, `write`, `close`), bytes fetched, and entry counts.
+  `blobs`, `transform_seconds`, `output_bytes`, `gap_tiles`, `gap_bytes`, and
+  the finished shard's size on disk. `blobs` counts *distinct* blob objects
+  rather than rows, so `written / blobs` is the storage amplification -- the
+  number that decides whether the deduplicated shard layout pays for itself
+  (see "Shard layout"). The gap figures are reported apart from the real
+  tiles' so a fit can keep two populations of very different size from
+  averaging each other out. This row is where a profile's own coefficients
+  come from, and it is already keyed by the profile they belong to.
+- **`scope=worker`**, one per worker: the archive key it read, wall-clock
+  seconds split by phase (`fetch`, `transform`, `write`, `close`), bytes
+  fetched, entry counts, and the decode totals including `length_hist`.
   `PhaseSeconds` nests exclusively, so the `write` time spent inside the
   transform loop is not also counted as `transform`.
+
+**There used to be a third, `scope=chunk`, one line per transform chunk, and
+it was removed.** The reasoning for it recorded here was that
+`TRANSFORM_CHUNKS_PER_WORKER = 8` turns 128 worker measurements into ~4,096
+chunk ones, and that chunks vary in composition where the deliberately
+equal-cost worker blocks do not, which would break a collinearity a
+worker-level regression cannot get past. That argument describes a fit nobody
+wrote. Every consumer of those rows in `calibration.py` summed them first --
+`sum(output_tiles)`, and `length_buckets()` adding the histograms together --
+and no regression ever ran chunk against chunk. The variance the per-entry fit
+actually draws on comes from the 32 log2 length buckets, not from the number
+of rows carrying them, and summation is associative: one aggregated row per
+worker yields bit-identical coefficients. What the per-chunk lines bought was
+~32 lines of log per worker.
+
+The worker is therefore the reporting unit. Each chunk still measures itself in
+the process that ran it -- that is where the clock is -- and `TransformUsage`
+travels back through the pool and is merged into the worker's own totals
+(`TransformUsage.merge()`), which is addition throughout. The archive key
+travels on the row with the measurement, so a fit never has to guess which
+archive a number came from, and two runs' logs concatenated by accident are
+detected rather than averaged together.
 
 `decode_seconds` and `transform_seconds` are reported separately because they
 are different work on different inputs. `Tile.decode()` is gunzip plus
@@ -454,17 +472,20 @@ number they are indistinguishable, and an R² of 0.29 cannot be read as either
 transform". The split also makes profile count a real factor: a run costs
 `1 x decode + N x transform`, which one fused measurement cannot express.
 
-`length_hist` accumulates the same two times into log2 buckets of entry
-length (bucket `i` holds lengths whose bit length is `i`, i.e.
-`[2**(i-1), 2**i)`), as `bits:count:bytes:decode_seconds:transform_seconds`.
+`length_hist` accumulates the decode into log2 buckets of entry length
+(bucket `i` holds lengths whose bit length is `i`, i.e. `[2**(i-1), 2**i)`),
+as `bits:count:bytes:decode_seconds`. The profiles' seconds are not in here:
+they are on the `scope=profile` rows, one per profile.
 Buckets rather than 43M individual samples: the curve is what the per-entry
 coefficients are fitted from, and it fits in a log line. It is also what
 retired the decode exponent (see "Where the coefficients come from") and what
 would catch decode going superlinear again.
 
-The instrumentation is two `perf_counter()` calls per distinct entry. At 26ns
-a call that is 2.3s across the reference run's 43,272,366 distinct entries --
-0.004% of its 15.7 core-hours.
+The instrumentation is `2 + N` `perf_counter()` calls per distinct entry, for
+`N` profiles: one clock serves as each profile's end and the next one's start,
+so attributing the seconds per profile costs one extra call per profile rather
+than two. At 26ns a call that is 3.4s across the reference run's 43,272,366
+distinct entries at two profiles -- 0.006% of its 15.7 core-hours.
 
 Peak RSS is not measured. It used to be read twice -- a `RUSAGE_SELF` peak
 per chunk alongside the worker's `RUSAGE_CHILDREN` figure, because the latter
@@ -482,6 +503,41 @@ two things that matter. The printed core-hours stop hiding it inside the byte
 terms (128 x 39s is 1.4 of the reference run's 15.7 core-hours, about 9%),
 and the `worker_count` search has to weigh it, every extra worker bringing
 its own setup with it.
+
+### The state branch, and the job that writes it
+
+The whole loop, in the order it runs:
+
+1. **`prepare-shards`** checks the calling repository's `state` branch out
+   (`continue-on-error`, because before the first run there is no such branch)
+   and passes `state/axes.json` as `--axis-state`. A missing file is not an
+   error; it means nothing has been measured yet. For the archive this run
+   reads it takes the median of each recorded coefficient, clamps it towards
+   the reviewed one, and hands each profile its own measured `seconds_per_tile`
+   and `bytes_per_output_tile` in place of what the profile declared. That is
+   what the run is then partitioned and sized by.
+2. **Each worker** writes its two-or-more `usage:` lines to `--usage-out` as
+   well as to its log, and uploads that file. A file, not a log scrape: the job
+   that fits these has artifacts, not log access.
+3. **`merge-axes`** is the single writer, the way tiledistillery's
+   `record-timings` is. It collects every worker's file, fits the run, appends
+   one observation per coefficient to its own ring buffer, and pushes. It
+   refuses to push unless `--expect-workers` matches what reported, because a
+   partial run is a biased sample -- the workers that failed are the expensive
+   ones -- and refuses again if `--manifest-dir` scoring says the fit predicts
+   this run's own workers worse than the reviewed constants already did.
+
+The write is a read-modify-write against the blob sha through the contents
+API, so two pipelines finishing together cannot lose each other's
+observations: the second write is refused and the whole change reapplied to the
+newer document (`state_branch.update_json`). The branch is an orphan sharing no
+history with the default branch, so a state write can never touch what the run
+was built from.
+
+`tilealchemist-calibrate` remains the by-hand tool. It prints the same
+proposal and writes a flat `calibration.json` for `--axis-seconds`, and it
+touches no branch. The automatic path is `merge-axes`; the manual one is
+`calibrate`, and neither edits `cost.py`.
 
 ### Why no budget caps a worker
 
@@ -541,6 +597,12 @@ it, so:
   one blob for 40 identical ocean tiles and the worker writes 40 rows, because
   a shard is flat and only the merge deduplicates (see "Shard layout").
 - a **gap** contributes every tile id it covers, for exactly the same reason.
+  It is *priced* differently, though: a gap record is charged its write and
+  nothing else. It has no source bytes to fetch or decode, and
+  `transform_gap()` answers the whole run with one call, so charging a gap a
+  decode or a profile's per-tile seconds bills it for work no worker does. At
+  `GAP_CHUNK_SIZE = 200_000` tiles per record that used to be a rounding error;
+  it is wrong either way, and the fix is one branch in `_record_costs()`.
 - a **record** contributes nothing by itself. Its ~184 B of namedtuple
   against a row's ~250 B of shard is not worth a second axis.
 
@@ -798,9 +860,51 @@ Each coefficient comes from the measurement that isolates it:
 | coefficient | fitted from |
 | --- | --- |
 | `fetched_byte` | `sum(fetch_seconds) / sum(fetched_bytes)` over workers |
-| `output_tile` | `sum(write_seconds) / sum(output_tiles)` |
+| `written_byte` | `sum(write_seconds) / sum(shard_bytes)` over the profile rows |
 | `decode_call`, `decoded_byte` | two-parameter least squares over the `length_hist` buckets, against `(count, bytes)` |
 | `manifest_record` | the slope of `setup_seconds` against a worker's record count |
+| `seconds_per_tile`, per profile | `sum(transform_seconds)` for that profile `/ sum(decode_calls)` |
+| `bytes_per_output_tile`, per profile | `sum(output_bytes) / sum(written - gap_tiles)` for that profile |
+
+The write cost is charged on bytes rather than on tiles. A tile is only as
+expensive to store as it is large, and how large it is belongs to the profile
+that shaped it: a coastline profile's tiles are not a label profile's. So the
+old flat `output_tile` second is now `written_byte x bytes_per_output_tile`,
+the first a property of the runner's disk and the second of the profile. At
+the reviewed figures the product is the same 4.9e-7s the single coefficient
+carried, so splitting it changed no prediction on the day it landed -- it only
+gave the two halves somewhere separate to move.
+
+**A gap tile's size is measured, not fitted.** `transform_gap()` answers every
+gap tile in a run with the same bytes, so `prepare-shards` asks each profile
+once at plan time and gets an exact figure. That is why `gap_bytes()` is a
+*method* on `Profile` rather than a number: the default implementation just
+measures its own `transform_gap()`, and a profile that can answer without
+building the tile overrides it. There is no
+statistic to estimate and nothing for the state branch to remember. That also
+keeps gap tiles out of `bytes_per_output_tile`, which is the whole reason to do
+it: a run is anywhere from 0% to 94% gap tiles, and the two populations differ
+by an order of magnitude, so one averaged figure would be set by the mix rather
+than by either. On a `land`-style profile over open ocean the measured gap tile
+is 54 B against the 250 B default a real tile is assumed to weigh.
+
+**Nothing settled here is written back onto a profile.** `prepare-shards`
+resolves the three sources of a profile's cost -- measured gap bytes, the
+state branch's medians, the profile's own declared estimates -- into one
+`cost.ProfileCost` per profile and holds it (`shard_prep._settle_costs()`).
+A `Profile` stays the behaviour it is; it declares estimates and answers
+questions, and it never doubles as the mutable ledger of what a run decided to
+charge. `cost_weights()` takes those settled costs as an argument, so what a
+prediction was made from is visible at the call rather than sitting on an
+object somebody may have rewritten.
+
+`bytes_per_output_tile` is therefore measured from `output_bytes` -- the
+payload the transform actually produced, counted once per output tile and
+summed per profile as the run goes -- rather than from the finished shard's size
+on disk. `shard_bytes` stays reported, but as the storage-amplification
+diagnostic it always was, not as the basis of a coefficient: it carries sqlite
+page overhead and indices, and under `--shard-layout dedup` it carries the
+collapse of a whole gap into one `images` row.
 
 Every aggregate is `sum(seconds) / sum(units)`, never the mean of per-unit
 rates. That is the same choice tiledistillery's `fit_seconds_per_byte()`
@@ -808,21 +912,25 @@ documents: small units carry a fixed overhead, so averaging their rates lets
 the smallest ones dominate. Here that would let the worker holding one
 distinct entry weigh as much as the one holding 2M.
 
-The entry-cost fit targets `decode_seconds + transform_seconds` together,
-because the model charges both to the same per-distinct-entry axes. Keeping
-them apart in the *measurement* is what makes the fit reviewable: the
-proposal prints the split, so "the model is bad" and "decode is clean, the
-variance is all in transform" stop looking alike. The byte term is the
-bucket's byte total outright, decode being linear in length; the sweep that
-used to search for an exponent there is gone with it.
+The entry-cost fit targets the decode alone. It used to target
+`decode_seconds + transform_seconds` together, because the model charged both
+to the same per-distinct-entry axes -- but the profiles' own seconds are now
+measured per profile and charged to the profile that spent them, so folding
+them back into the archive's coefficients would bill one profile's shapely to
+the other's. The byte term is the bucket's byte total outright, decode being
+linear in length; the sweep that used to search for an exponent there is gone
+with it.
 
-This does not port tiledistillery's approach, and it is worth saying why.
-`leaves.py` looks each Geofabrik region up in `timings.json`, where a
-measurement *beats* the model; the fitted `seconds_per_byte` exists only to
-place regions that were never built. tilealchemist's unit of work is a
-worker block recomputed every run, so `worker-042.bin` means something
-different next time and there is no key to hang a measurement on. Only the
-*coefficients* carry over.
+This borrows tiledistillery's mechanism but not its unit. `leaves.py` looks
+each Geofabrik region up in `timings.json`, where a measurement *beats* the
+model; the fitted `seconds_per_byte` exists only to place regions that were
+never built. tilealchemist's unit of work is a worker block recomputed every
+run, so `worker-042.bin` means something different next time and there is no
+key to hang a per-block measurement on. Only the *coefficients* carry over --
+but those do have stable keys, the archive and the profile, and that is what
+the state branch files them under. The ring buffer, the median, the
+single-writer job and the orphan `state` branch are all the same shapes
+tiledistillery uses, down to `HISTORY_LENGTH = 5`.
 
 Four guards, because a bad calibration does its damage quietly, inside
 `partition_by_cost()` on every later run:
@@ -837,12 +945,17 @@ Four guards, because a bad calibration does its damage quietly, inside
   Below `MIN_SCORED_WORKERS` the score is withheld rather than printed: over
   two points a correlation is always exactly +/-1, which would read as a
   verdict while meaning nothing.
-- **Nothing is written automatically.** `--out` writes a `calibration.json`
-  for a caller to keep; committing it, or passing it to
-  `prepare-shards --axis-seconds`, is a human decision. The model shapes the
-  distribution it is then fitted on, which is why two of the current five
-  coefficients had to be set by hand from single observations in the first
-  place.
+- **A coefficient is the median of the last few runs, not the newest one.**
+  `axis_state.py` keeps `HISTORY_LENGTH = 5` observations per coefficient and
+  reads the median of them. A mean would let one bad runner through at a fifth
+  of its full weight; a median ignores it outright, which is the whole reason
+  the history exists. The model shapes the distribution it is then fitted on,
+  and a median over several runs is what keeps that feedback slow enough to
+  stay stable.
+- **The push is all-or-nothing, and it is not the build's problem.** The
+  `merge-axes` job runs `if: always()` so a failed build leg does not cost the
+  others' measurements, and `continue-on-error: true` because a calibration is
+  an optimisation and never a reason to fail a finished build.
 
 `worker_setup_seconds` is deliberately not learned from logs alone. A
 worker's own `setup_seconds` is the *in-process* residual (wall clock minus
@@ -851,13 +964,34 @@ the process exists and no line in its log can see them. The proposal
 therefore leaves it alone unless `--runner-overhead-seconds` supplies that
 half, and says so.
 
-The coefficients are profile-dependent -- `_entry_outputs()` runs
-`transform_tile()` once per profile, so the seconds per byte belong to
-`land` + `cropped_waterways` rather than to tilealchemist. A single constant
-in the library cannot be right for every caller at once, which is why the
-calibration is a file, keyed by the caller on
-`(output_basename, schema, source.build)` the way tiledistillery keys
-`timings.json` by region, and kept in the caller's state rather than here.
+The coefficients are not all of a kind, and the state splits them by what
+each one actually depends on:
+
+| group | key | coefficients |
+| --- | --- | --- |
+| source | host + schema | `fetched_byte`, `decode_call`, `decoded_byte` |
+| profile | profile name | `seconds_per_tile`, `bytes_per_output_tile` |
+| shared | none | `manifest_record`, `written_byte`, `worker_setup_seconds` |
+
+The archive's fetch rate and tile density belong to the provider. A profile's
+seconds belong to its own shapely -- `_entry_outputs()` runs
+`transform_tile()` once per profile, so a fused figure bills `land` for
+`cropped_waterways`' work. What is left over is tilealchemist's own
+bookkeeping and the runner's disk, which belong to neither. Splitting them
+this way is also what lets one measured profile be reused against a new
+archive, and one measured archive against a new profile, instead of every
+combination starting from the reviewed constants.
+
+**The archive's build is deliberately not part of its key.** A provider's
+fetch rate and tile density are properties of the provider, not of this
+month's extract, and putting the build in the key would start every build's
+history from nothing -- which is the one thing a median over several runs
+cannot survive. The build is recorded beside the coefficients so a reader can
+see which extract last moved them, and that is all it is for.
+
+A single constant in the library cannot be right for every caller at once,
+which is why the state lives in the *calling* repository, on its own branch,
+the way tiledistillery keeps `timings.json` -- and not here.
 
 What makes the fit identifiable in the long run is runs of *different shape*
 -- planet, a regional extract, a high-zoom range. That mixture is exactly
@@ -1212,7 +1346,7 @@ could break silently, so change the code and this section together.
         Profile.transform_gap()    one blob for every gap tile in the run
         write_gap_tiles()          mbtiles.py: nothing to fetch
       close_shards()
-      _report_worker_usage()     usage.py: one `usage:` line per scope
+      _report_worker_usage()     usage.py: one line per profile, one per worker
 
 ### Zoom levels (`zoom.py`)
 
