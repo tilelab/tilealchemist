@@ -2,7 +2,7 @@
 import itertools
 import operator
 
-from tilealchemist.cost import AXIS_SECONDS, cost_weights
+from tilealchemist.cost import DEFAULT_COST_MODEL, cost_weights
 
 
 def count_output_tiles(entries):
@@ -71,20 +71,24 @@ def _atomic_groups(weighted_records, atomic_key, share_limit):
         yield run, run_weight
 
 
-def partition_by_cost(records, worker_count, atomic_key=None, axis=AXIS_SECONDS):
+def partition_by_cost(records, worker_count, atomic_key=None, model=DEFAULT_COST_MODEL):
     """Spread records across workers so each carries a similar predicted cost.
 
     Args:
         records: The records to spread, in walk order.
         worker_count: How many blocks to produce.
         atomic_key: What makes two records inseparable, or None.
-        axis: The per-axis seconds to charge.
+        model: The CostModel to price with. It must be the same one the run is
+            sized by: balancing on the axes alone while sizing on the axes and
+            the profiles together handed six workers of one planet run 14.9M
+            output tiles apiece that every profile then declined to write, so
+            they finished in 1.5s against 762s predicted.
 
     Returns:
         One list of records per worker, in worker order. The last block takes
         whatever is left, however far past its share that puts it.
     """
-    weights, total_weight = cost_weights(records, axis)
+    weights, total_weight = cost_weights(records, model)
     groups = _atomic_groups(zip(records, weights), atomic_key,
                              total_weight / worker_count)
     blocks = [[] for _ in range(worker_count)]
@@ -100,7 +104,7 @@ def partition_by_cost(records, worker_count, atomic_key=None, axis=AXIS_SECONDS)
     return blocks
 
 
-def partition_into_worker_blocks(entries, gaps, worker_count, axis=AXIS_SECONDS):
+def partition_into_worker_blocks(entries, gaps, worker_count, model=DEFAULT_COST_MODEL):
     """Build each worker's block from both the real entries and the gaps.
 
     The two are spread separately, so that gap work, which needs no fetch at
@@ -110,14 +114,14 @@ def partition_into_worker_blocks(entries, gaps, worker_count, axis=AXIS_SECONDS)
         entries: The archive's directory entries for this run.
         gaps: The gap records covering what the archive does not hold.
         worker_count: How many blocks to produce.
-        axis: The per-axis seconds to charge.
+        model: The CostModel to price with.
 
     Returns:
         One list of records per worker, its real entries before its gaps.
     """
-    gap_blocks = partition_by_cost(gaps, worker_count, axis=axis)
+    gap_blocks = partition_by_cost(gaps, worker_count, model=model)
     real_blocks = partition_by_cost(entries, worker_count,
-                                    atomic_key=operator.attrgetter("offset"), axis=axis)
+                                    atomic_key=operator.attrgetter("offset"), model=model)
     return [real_block + gap_block
             for real_block, gap_block in zip(real_blocks, gap_blocks)]
 

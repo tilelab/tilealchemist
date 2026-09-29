@@ -61,7 +61,7 @@ def run_worker(args):
                              args.shard_layout)
                 for out, profile in zip(args.out, profiles)]
     counts = [ProfileTileCounts() for _ in profiles]
-    gap_totals = [(0, 0) for _ in profiles]
+    gap_totals = [(0, 0, 0) for _ in profiles]
     usage = TransformUsage(len(profiles))
     # The key travels with the measurement: the fit must never guess which archive it read.
     totals = {"source_key": source.axis_key,
@@ -110,12 +110,17 @@ def _report_worker_usage(args, profiles, counts, phases, wall_start, totals, usa
             archive key the measurements belong to.
         usage: What the transform cost, merged across every chunk this worker
             ran.
-        gap_totals: Each profile's `(gap tiles, gap payload bytes)`, reported
-            apart from the real tiles' so a fit can keep the two populations
-            separate.
+        gap_totals: Each profile's `(gap tiles written, gap tiles skipped, gap
+            payload bytes)`, reported apart from the real tiles' so a fit can
+            keep the two populations separate. Both halves of the gap count are
+            needed, not just the written one: `written_share` is a real-tile
+            figure, and subtracting only the written gaps from `written` while
+            leaving the skipped ones in `skipped` would read a profile that
+            declines gaps as one that declines tiles.
     """
     lines = []
-    for profile, out, profile_counts, profile_seconds, output_bytes, (gap_tiles, gap_bytes) in zip(
+    for (profile, out, profile_counts, profile_seconds, output_bytes,
+            (gap_tiles, gap_skipped, gap_bytes)) in zip(
             profiles, args.out, counts, usage.profile_seconds, usage.profile_output_bytes,
             gap_totals):
         lines.append(report("profile", worker=args.worker_index, profile=profile.name,
@@ -123,7 +128,7 @@ def _report_worker_usage(args, profiles, counts, phases, wall_start, totals, usa
                             blobs=profile_counts.blobs,
                             transform_seconds=profile_seconds,
                             output_bytes=output_bytes,
-                            gap_tiles=gap_tiles, gap_bytes=gap_bytes,
+                            gap_tiles=gap_tiles, gap_skipped=gap_skipped, gap_bytes=gap_bytes,
                             shard_bytes=os.path.getsize(out) if os.path.exists(out) else 0))
     wall_seconds = time.perf_counter() - wall_start
     lines.append(report("worker", worker=args.worker_index, wall_seconds=wall_seconds,
@@ -197,14 +202,15 @@ def _process_gap_entries(gap_entries, schema, profiles, writers, counts):
         counts: Each profile's tile counts, in the same order.
 
     Returns:
-        Each profile's `(gap tiles, gap payload bytes)`, in the same order.
-        Kept apart from the real tiles' totals because the two are different
-        sizes and a run's mix of them swings far too wide to average.
+        Each profile's `(gap tiles written, gap tiles skipped, gap payload
+        bytes)`, in the same order. Kept apart from the real tiles' totals
+        because the two are different sizes and a run's mix of them swings far
+        too wide to average.
     """
     gap_totals = []
     for profile_counts, profile, writer in zip(counts, profiles, writers):
         gap_data = profile.transform_gap(schema)
         written, skipped, blobs = write_gap_tiles(gap_entries, writer, gap_data)
         profile_counts.add(written, skipped, blobs)
-        gap_totals.append((written, written * len(gap_data) if gap_data else 0))
+        gap_totals.append((written, skipped, written * len(gap_data) if gap_data else 0))
     return gap_totals

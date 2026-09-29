@@ -97,8 +97,9 @@ def parse_args():
     parser.add_argument("--job-seconds", type=float, default=DEFAULT_JOB_SECONDS,
                          help=f"a worker job's runtime limit (default {DEFAULT_JOB_SECONDS}); "
                               f"predicted seconds are charged against it at "
-                              f"{TAIL_SAFETY_FACTOR:g}x, the factor by which the model "
-                              "under-predicts the slow tail")
+                              f"{TAIL_SAFETY_FACTOR:g}x, to leave room for the tail the model "
+                              "cannot see -- content complexity, which no manifest record "
+                              "exposes")
     parser.add_argument("--profile", default=None,
                          help="comma-separated path(s) to the profile .py files this run will "
                               "build, the same value build-shard is given. Their per-tile "

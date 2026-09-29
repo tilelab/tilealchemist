@@ -297,9 +297,34 @@ in seconds, and a record's cost is their terms added up:
   for is nothing now (see "Why no budget caps a worker").
 - **Per output tile**, one sqlite insert per tile per profile.
 
+Two things scale those terms rather than adding to them, and both are
+corrections the model needed rather than refinements it wanted (see "Two units
+bugs, and what they cost").
+
+**The decode and the profiles' seconds are divided by
+`transform_parallelism`, and the fetch and the write are not.** That split is
+the one the worker itself makes: `run_transform()` fans a batch out across
+`--transform-workers` processes, so `length_hist` and a profile's
+`transform_seconds` come back *summed across the pool*, while
+`fetch_batch_blob()` and `ShardWriter.write()` run in the worker, one batch at
+a time. Charging a summed figure to a wall clock overstates it by whatever the
+pool bought.
+
+**The write is charged on `bytes_per_output_tile × written_share`.** A profile
+is handed every tile in the run and writes only the ones it has something to
+say about; `bytes_per_output_tile` is measured over the tiles it *wrote*, so
+charging it on every tile in a record bills an ocean for a coastline that is
+not in it.
+
 `cost_weights()` therefore returns a predicted *duration* rather than a
 share of something: `partition_by_cost()` splits on that number, and
 `prepare_shards` prints the run's predicted core-hours and slowest worker.
+
+**All of it travels as one `CostModel`** — the axes, the settled profile costs
+and the parallelism in a single tuple — because the alternative was tried and
+failed quietly. `partition_by_cost()` used to take the axes alone while
+`worst_load()` took the axes *and* the profile costs, so a run was split by one
+model and judged by another, and nothing in either signature said so.
 
 The coefficients are fixed rather than recomputed per run, which is the
 correction to an earlier version of this model. That one normalized each
@@ -366,6 +391,44 @@ measured duration (Spearman 0.059) -- it is, for practical purposes,
 uncorrelated with what the workers went on to do. The fitted coefficients
 score 0.538 (Spearman 0.644).
 
+### Two units bugs, and what they cost
+
+Standardprofiles run 36573352744, a `land` + `cropped_waterways` planet build
+on 160 workers, was predicted at **61.6 core-hours and measured 15.9** — 3.88x
+over on the total, while *under*-predicting its own slowest workers. Both
+halves of that were one kind of mistake: a coefficient measured in one unit and
+spent in another.
+
+**The pooled seconds.** 38.9 of the 61.6 predicted core-hours were the
+profiles' `seconds_per_tile`, and the run's profile rows report 38.4
+core-hours of `transform_seconds` — the prediction was almost exactly right.
+It was right about *CPU*. Those seconds are measured inside the pool processes
+`run_transform()` fans a batch across and merged by `TransformUsage.merge()`,
+which is addition, so a 4-process worker reports about four seconds of them per
+second of its own clock. Its `transform` phase measured 12.9 core-hours of wall
+time against 50.1 of pooled CPU (decode included), a ratio of **3.88** — the
+run's whole overshoot, and the reason `transform_parallelism` is now measured
+and divided out. `decode_call` and `decoded_byte` are fitted from `length_hist`,
+which is taken in the same processes, so they carry the same factor.
+
+**The unwritten tiles.** The model charged 423 B on each of 715.8M
+profile-tiles. The run wrote 167.4M of them and skipped **77%**: a profile
+returns None wherever it has nothing to say, and `_run_counts()` stores
+nothing for those. `bytes_per_output_tile` was fitted over the written tiles
+alone (`output_bytes / (written - gap_tiles)`) and then charged on every tile
+in a record, a denominator and a numerator that never matched. Predicted write
+cost 4.8 core-hours against 0.5 measured. `written_share` is what reconciles
+them, and it is per profile because the profiles disagree wildly: 0.411 for
+`land` against 0.057 for `cropped_waterways` on that run.
+
+Refitting that run with both corrections and predicting it back gives **16.8
+core-hours against 15.9 measured, 1.06x**. The per-worker spread is what
+actually improved: the worst over-prediction falls from 16.2x to 4.4x and the
+90th percentile from 12.2x to 2.8x. `written_share` alone is worth little on
+the total (3.79x to 3.58x) and a great deal on the shape — it is what stops the
+model handing a worker 14.9M ocean tiles and predicting 762s for work that took
+1.5s, because nothing was written at all.
+
 ### What the model still cannot see
 
 Its R² against those durations caps out at **0.29**, and it under-predicts
@@ -426,8 +489,11 @@ job logs, and that grep is what the next run's coefficients are fitted from.
 Two scopes:
 
 - **`scope=profile`**, one per profile per worker: `written`, `skipped`,
-  `blobs`, `transform_seconds`, `output_bytes`, `gap_tiles`, `gap_bytes`, and
-  the finished shard's size on disk. `blobs` counts *distinct* blob objects
+  `blobs`, `transform_seconds`, `output_bytes`, `gap_tiles`, `gap_skipped`,
+  `gap_bytes`, and the finished shard's size on disk. The gap counts come in
+  both halves because `written_share` is a real-tile figure: netting only the
+  written gaps out of `written` while leaving the skipped ones in `skipped`
+  would read a profile that declines to fill gaps as one that declines tiles. `blobs` counts *distinct* blob objects
   rather than rows, so `written / blobs` is the storage amplification -- the
   number that decides whether the deduplicated shard layout pays for itself
   (see "Shard layout"). The gap figures are reported apart from the real
@@ -871,11 +937,13 @@ Each coefficient comes from the measurement that isolates it:
 | coefficient | fitted from |
 | --- | --- |
 | `fetched_byte` | `sum(fetch_seconds) / sum(fetched_bytes)` over workers |
-| `written_byte` | `sum(write_seconds) / sum(shard_bytes)` over the profile rows |
+| `written_byte` | `sum(write_seconds) / sum(output_bytes + gap_bytes)` over the profile rows |
 | `decode_call`, `decoded_byte` | two-parameter least squares over the `length_hist` buckets, against `(count, bytes)` |
 | `manifest_record` | the slope of `setup_seconds` against a worker's record count |
+| `transform_parallelism` | `sum(decode_seconds) + sum(transform_seconds)` over the profile rows, `/ sum(transform_seconds)` over the workers |
 | `seconds_per_tile`, per profile | `sum(transform_seconds)` for that profile `/ sum(decode_calls)` |
 | `bytes_per_output_tile`, per profile | `sum(output_bytes) / sum(written - gap_tiles)` for that profile |
+| `written_share`, per profile | `sum(written - gap_tiles) / sum(written - gap_tiles + skipped - gap_skipped)` |
 
 The write cost is charged on bytes rather than on tiles. A tile is only as
 expensive to store as it is large, and how large it is belongs to the profile
@@ -979,14 +1047,18 @@ each one actually depends on:
 | group | key | coefficients |
 | --- | --- | --- |
 | source | host + schema | `fetched_byte`, `decode_call`, `decoded_byte` |
-| profile | profile name | `seconds_per_tile`, `bytes_per_output_tile` |
-| shared | none | `manifest_record`, `written_byte`, `worker_setup_seconds` |
+| profile | profile name | `seconds_per_tile`, `bytes_per_output_tile`, `written_share` |
+| shared | none | `manifest_record`, `written_byte`, `worker_setup_seconds`, `transform_parallelism` |
 
 The archive's fetch rate and tile density belong to the provider. A profile's
 seconds belong to its own shapely -- `_entry_outputs()` runs
 `transform_tile()` once per profile, so a fused figure bills `land` for
 `cropped_waterways`' work. What is left over is tilealchemist's own
-bookkeeping and the runner's disk, which belong to neither. Splitting them
+bookkeeping, the runner's disk and the runner's cores, which belong to neither
+— `transform_parallelism` is shared for exactly that reason: how many seconds
+of shapely fit into one second of wall clock is a fact about the machine, not
+about the profile that spent them, which is why the profile's own figure stays
+the CPU seconds it was measured as. Splitting them
 this way is also what lets one measured profile be reused against a new
 archive, and one measured archive against a new profile, instead of every
 combination starting from the reviewed constants.
@@ -1100,7 +1172,21 @@ The time budget is charged at `TAIL_SAFETY_FACTOR` (4x), not at face value,
 and that is the honest way to use a model that under-predicts its slow tail
 by 2-4x -- the reference run's worst worker was predicted at 8m and ran
 34m12s. Sizing against a *hard* 6h limit with such a model would otherwise
-mean either a blind guess or a silent overrun. Which is also why this comes
+mean either a blind guess or a silent overrun.
+
+**The factor has not been re-derived since the units bugs above were fixed,
+and it should be.** It was set against a model that over-predicted a whole run
+by 3.8x while still under-predicting that run's slowest worker, so 4x of stated
+margin was about 1x of real margin, and the two errors cancelling is why
+nothing looked wrong. Against the corrected model the same planet run scores
+1.06x on the total, 1.27x on a median worker and 0.40x on its worst, so 4x now
+means roughly what it says. That changes what this search returns, in the
+direction of *fewer* workers: those same 160 blocks price at a 16m worst worker
+now against 58m before, which clears 4x of the 6h cap with room to spare and
+would have stopped the doubling several steps earlier. Fewer workers is not
+free -- with `--concurrency` waves, it trades runner setup for wall-clock -- and
+the search has no term for wall-clock at all, so this is a decision to make
+deliberately rather than to inherit from a coefficient nobody re-read. Which is also why this comes
 last: it needs measured coefficients to mean anything. For scale, that run's
 slowest worker sat a factor of **10.5** under the cap and the whole run used
 15.7 of 120 available lane-hours. So time is not the binding limit today

@@ -22,6 +22,13 @@ def _chunk_entries(real_entries, transform_workers):
     Several chunks per process, so that one finishing early pulls the next
     rather than idling.
 
+    On the reviewed cost model and not the run's settled one, deliberately:
+    `prepare-shards` settles what each profile costs and a worker is never
+    told, carrying manifests rather than coefficients. What a chunk split
+    needs is the relative weight of entries within one batch, where the
+    profiles' per-entry seconds are a constant every chunk pays alike, and the
+    over-chunking above is what absorbs the rest.
+
     Args:
         real_entries: The batch's real entries, in offset order.
         transform_workers: How many processes will run them.

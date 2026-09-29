@@ -4,7 +4,8 @@ from abc import ABC, abstractmethod
 from shapely.geometry.base import BaseGeometry
 
 from tilealchemist import mvt
-from tilealchemist.cost import DEFAULT_BYTES_PER_OUTPUT_TILE, DEFAULT_SECONDS_PER_TILE
+from tilealchemist.cost import (DEFAULT_BYTES_PER_OUTPUT_TILE, DEFAULT_SECONDS_PER_TILE,
+                                DEFAULT_WRITTEN_SHARE)
 from tilealchemist.features import Feature
 from tilealchemist.tile import Tile
 
@@ -26,11 +27,18 @@ class Profile(ABC):
             tiles, and how heavy a tile is belongs to the profile that shaped
             it: a coastline profile's tiles are not a label profile's. A gap
             tile is not covered by this; `gap_bytes()` answers for those.
+        written_share: The share of the tiles handed to this profile that come
+            back with bytes in them. `transform_tile()` returns None wherever
+            there is nothing to say and the writer skips those, so a profile
+            that speaks for a coastline is silent across an ocean: one planet
+            run left 77% of its tiles unwritten. `bytes_per_output_tile` is
+            measured over the written ones alone, and this is what scales it
+            onto every tile in a record.
 
-    Both figures above are this profile's own *estimate*, used until something
-    measures better. Neither is stored here once a run is under way: the caller
-    settles what it will charge and keeps it (`cost.ProfileCost`), so nothing
-    can quietly rewrite a profile object mid-run.
+    All three figures above are this profile's own *estimate*, used until
+    something measures better. None is stored here once a run is under way: the
+    caller settles what it will charge and keeps it (`cost.ProfileCost`), so
+    nothing can quietly rewrite a profile object mid-run.
     """
 
     name: str
@@ -38,6 +46,8 @@ class Profile(ABC):
     seconds_per_tile: float = DEFAULT_SECONDS_PER_TILE
 
     bytes_per_output_tile: float = DEFAULT_BYTES_PER_OUTPUT_TILE
+
+    written_share: float = DEFAULT_WRITTEN_SHARE
 
     @property
     def output_layer_name(self):

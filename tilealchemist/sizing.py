@@ -1,7 +1,7 @@
 """Choosing worker_count against the run's hard limits; see docs/ARCHITECTURE.md "Sizing"."""
 from collections import namedtuple
 
-from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_weights
+from tilealchemist.cost import DEFAULT_COST_MODEL, WORKER_SETUP_SECONDS, cost_weights
 from tilealchemist.fetch_batching import peak_batch_bytes
 from tilealchemist.partition import count_output_tiles, partition_into_worker_blocks
 
@@ -11,7 +11,7 @@ DEFAULT_CONCURRENCY = 20
 MATRIX_CELL_LIMIT = 256
 DEFAULT_JOB_SECONDS = 6 * 3600
 
-# The model under-predicts the slow tail by 2-4x, so a time budget is spent at this rate.
+# A budget is spent at this rate, for the tail the model cannot see; see "Sizing a run".
 TAIL_SAFETY_FACTOR = 4.0
 
 Limits = namedtuple("Limits", "job_seconds concurrency tail_factor")
@@ -22,14 +22,12 @@ DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS, concurrency=DEFAULT_CON
                         tail_factor=TAIL_SAFETY_FACTOR)
 
 
-def block_load(block, axis, profile_costs=None, setup_seconds=WORKER_SETUP_SECONDS):
+def block_load(block, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECONDS):
     """Predict what one worker's block will cost it.
 
     Args:
         block: The entries assigned to that worker.
-        axis: The per-axis seconds to charge.
-        profile_costs: What each profile costs, as settled for this run. None
-            costs tilealchemist's own work alone.
+        model: The CostModel to price with.
         setup_seconds: What a worker costs before it reaches its first record.
 
     Returns:
@@ -37,13 +35,13 @@ def block_load(block, axis, profile_costs=None, setup_seconds=WORKER_SETUP_SECON
         batch size, as a BlockLoad.
     """
     return BlockLoad(
-        seconds=setup_seconds + cost_weights(block, axis, profile_costs)[1],
+        seconds=setup_seconds + cost_weights(block, model)[1],
         tiles=count_output_tiles(block),
         records=len(block),
         batch_bytes=peak_batch_bytes(block))
 
 
-def worst_load(blocks, axis, profile_costs=None, setup_seconds=WORKER_SETUP_SECONDS):
+def worst_load(blocks, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECONDS):
     """Take the worst value of each axis across every block.
 
     No single worker need be the worst on every axis, so the result is the
@@ -51,14 +49,13 @@ def worst_load(blocks, axis, profile_costs=None, setup_seconds=WORKER_SETUP_SECO
 
     Args:
         blocks: One entry block per worker.
-        axis: The per-axis seconds to charge.
-        profile_costs: What each profile costs, as settled for this run.
+        model: The CostModel to price with.
         setup_seconds: What a worker costs before it reaches its first record.
 
     Returns:
         A BlockLoad whose every field is the maximum across the blocks.
     """
-    loads = [block_load(block, axis, profile_costs, setup_seconds) for block in blocks]
+    loads = [block_load(block, model, setup_seconds) for block in blocks]
     return BlockLoad(*(max(getattr(load, field) for load in loads)
                        for field in BlockLoad._fields))
 
@@ -95,8 +92,8 @@ def candidate_worker_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
     return counts + [cell_limit]
 
 
-def choose_worker_count(entries, gaps, axis, limits=DEFAULT_LIMITS,
-                        cell_limit=MATRIX_CELL_LIMIT, profile_costs=None,
+def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL, limits=DEFAULT_LIMITS,
+                        cell_limit=MATRIX_CELL_LIMIT,
                         setup_seconds=WORKER_SETUP_SECONDS):
     """Pick the first worker count whose worst worker stays inside the limits.
 
@@ -108,10 +105,11 @@ def choose_worker_count(entries, gaps, axis, limits=DEFAULT_LIMITS,
     Args:
         entries: The archive entries this run will walk.
         gaps: The gap records covering tiles the archive does not hold.
-        axis: The per-axis seconds to charge.
+        model: The CostModel to price with, which is also what the blocks are
+            partitioned by, so that a run is judged by the model it was split
+            with.
         limits: The run's hard limits.
         cell_limit: The most matrix cells a run may have.
-        profile_costs: What each profile costs, as settled for this run.
         setup_seconds: What a worker costs before it reaches its first record.
 
     Returns:
@@ -121,8 +119,8 @@ def choose_worker_count(entries, gaps, axis, limits=DEFAULT_LIMITS,
     """
     attempts = []
     for worker_count in candidate_worker_counts(limits, cell_limit):
-        blocks = partition_into_worker_blocks(entries, gaps, worker_count, axis)
-        load = worst_load(blocks, axis, profile_costs, setup_seconds)
+        blocks = partition_into_worker_blocks(entries, gaps, worker_count, model)
+        load = worst_load(blocks, model, setup_seconds)
         broken = breaches(load, limits)
         attempts.append((worker_count, load, broken))
         if not broken:

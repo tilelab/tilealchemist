@@ -5,8 +5,9 @@ import os
 from collections import namedtuple
 
 from tilealchemist.cost import (AXIS_SECONDS, DEFAULT_BYTES_PER_OUTPUT_TILE,
-                                DEFAULT_SECONDS_PER_TILE, WORKER_SETUP_SECONDS, AxisSeconds,
-                                cost_weights)
+                                DEFAULT_SECONDS_PER_TILE, DEFAULT_TRANSFORM_PARALLELISM,
+                                DEFAULT_WRITTEN_SHARE, WORKER_SETUP_SECONDS, AxisSeconds,
+                                cost_model, cost_weights)
 from tilealchemist.manifest import read_manifest
 
 MIN_SCORED_WORKERS = 8
@@ -14,22 +15,26 @@ MIN_SCORED_WORKERS = 8
 # What the archive costs: its fetch rate, and what its tiles cost to decode.
 SourceAxes = namedtuple("SourceAxes", "fetched_byte decode_call decoded_byte")
 
-# What a profile costs: its own shapely, and how heavy the tiles it writes are.
-ProfileAxes = namedtuple("ProfileAxes", "seconds_per_tile bytes_per_output_tile")
+# What a profile costs: its own shapely, how heavy its tiles are, and how many it writes at all.
+ProfileAxes = namedtuple(
+    "ProfileAxes", "seconds_per_tile bytes_per_output_tile written_share")
 
-# What belongs to neither: tilealchemist's own bookkeeping and the runner's disk.
-SharedAxes = namedtuple("SharedAxes", "manifest_record written_byte worker_setup_seconds")
+# What belongs to neither: tilealchemist's own bookkeeping, the runner's disk, and its cores.
+SharedAxes = namedtuple(
+    "SharedAxes", "manifest_record written_byte worker_setup_seconds transform_parallelism")
 
 REVIEWED_SOURCE = SourceAxes(fetched_byte=AXIS_SECONDS.fetched_byte,
                              decode_call=AXIS_SECONDS.decode_call,
                              decoded_byte=AXIS_SECONDS.decoded_byte)
 
 REVIEWED_PROFILE = ProfileAxes(seconds_per_tile=DEFAULT_SECONDS_PER_TILE,
-                               bytes_per_output_tile=DEFAULT_BYTES_PER_OUTPUT_TILE)
+                               bytes_per_output_tile=DEFAULT_BYTES_PER_OUTPUT_TILE,
+                               written_share=DEFAULT_WRITTEN_SHARE)
 
 REVIEWED_SHARED = SharedAxes(manifest_record=AXIS_SECONDS.manifest_record,
                              written_byte=AXIS_SECONDS.written_byte,
-                             worker_setup_seconds=WORKER_SETUP_SECONDS)
+                             worker_setup_seconds=WORKER_SETUP_SECONDS,
+                             transform_parallelism=DEFAULT_TRANSFORM_PARALLELISM)
 
 RunMeasurement = namedtuple(
     "RunMeasurement", "source_key source profiles shared diagnostics notes")
@@ -248,13 +253,23 @@ def measure_profiles(rows):
 
     A profile's seconds are charged per *distinct* entry, because
     `_entry_outputs()` runs it once per decode rather than once per record, so
-    the run's decode count is the denominator its rate belongs over.
+    the run's decode count is the denominator its rate belongs over. They stay
+    the CPU seconds they were measured as, summed across the pool processes
+    that spent them: what a profile's shapely costs belongs to the profile,
+    and how many of those seconds fit into one worker's wall clock belongs to
+    the runner, where `transform_parallelism` keeps it.
 
     `bytes_per_output_tile` counts real tiles only. Gap tiles are excluded from
     both sides of it: they are a different size, their share of a run swings
     from 0% to 94%, and their size is known exactly anyway -- `prepare-shards`
     asks `transform_gap()` rather than fitting it. Averaging the two
     populations would let the mix set the figure instead of either one.
+
+    `written_share` is what reconciles that denominator with the cost model's
+    numerator. A profile is handed every tile in the run and writes only the
+    ones it has something to say about, so a figure measured per *written*
+    tile must be scaled by the share written before it can be charged on every
+    tile in a record.
 
     Args:
         rows: Parsed usage rows for the whole run.
@@ -267,11 +282,38 @@ def measure_profiles(rows):
     measured = {}
     for name in sorted({row["profile"] for row in _scoped(rows, "profile") if "profile" in row}):
         owned = [row for row in _scoped(rows, "profile") if row.get("profile") == name]
-        real_tiles = _total(owned, "written") - _total(owned, "gap_tiles")
+        real_written = _total(owned, "written") - _total(owned, "gap_tiles")
+        real_skipped = _total(owned, "skipped") - _total(owned, "gap_skipped")
         measured[name] = ProfileAxes(
             seconds_per_tile=_ratio(_total(owned, "transform_seconds"), decode_calls),
-            bytes_per_output_tile=_ratio(_total(owned, "output_bytes"), real_tiles))
+            bytes_per_output_tile=_ratio(_total(owned, "output_bytes"), real_written),
+            written_share=_ratio(real_written, real_written + real_skipped))
     return measured
+
+
+def measure_transform_parallelism(rows):
+    """Fit how many seconds of in-pool work one second of wall clock buys.
+
+    `run_transform()` fans a batch out across `--transform-workers` processes,
+    and every measurement taken inside one of them -- `length_hist`'s decode
+    seconds, and each profile's `transform_seconds` -- comes back summed across
+    the pool. The worker's own `transform` phase is the wall clock those
+    seconds were spent in, so their ratio is what the pool actually bought,
+    pool overhead and stragglers already deducted. Charging the summed figure
+    to a worker's wall-clock budget without it over-predicts every run by
+    about that factor.
+
+    Args:
+        rows: Parsed usage rows for the whole run.
+
+    Returns:
+        The ratio, or None where nothing usable was measured. It is deliberately
+        not clamped to the process count: a pool that never pays off is a
+        measurement, not an error.
+    """
+    workers, profiles = _scoped(rows, "worker"), _scoped(rows, "profile")
+    pooled = _total(workers, "decode_seconds") + _total(profiles, "transform_seconds")
+    return _ratio(pooled, _total(workers, "transform_seconds"))
 
 
 def measure_shared(rows, runner_overhead_seconds=None):
@@ -300,7 +342,8 @@ def measure_shared(rows, runner_overhead_seconds=None):
         written_byte=_ratio(_total(workers, "write_seconds"), written_bytes),
         worker_setup_seconds=(None if in_process_setup is None
                               or runner_overhead_seconds is None
-                              else runner_overhead_seconds + in_process_setup))
+                              else runner_overhead_seconds + in_process_setup),
+        transform_parallelism=measure_transform_parallelism(rows))
 
 
 def measure_run(rows, runner_overhead_seconds=None):
@@ -417,7 +460,7 @@ def load_calibration_file(path):
     return axis_seconds_from_json(data)
 
 
-def score_axes(manifest_dir, worker_rows, axis, profile_costs=None):
+def score_axes(manifest_dir, worker_rows, axis):
     """Score predicted worker durations against the ones the run measured.
 
     A calibration that ranks a run's own workers worse than the reviewed
@@ -425,22 +468,26 @@ def score_axes(manifest_dir, worker_rows, axis, profile_costs=None):
     look like, so this is the guard that catches a fit which improved every
     ratio and the whole no better.
 
+    The axes alone are scored, with no profiles and no parallelism: this is a
+    ranking, and both of those enter the prediction as factors common to every
+    worker, which a correlation cannot see either way.
+
     Args:
         manifest_dir: The run's manifests, to price each worker's block from.
         worker_rows: Parsed usage rows for scope "worker".
         axis: The per-axis seconds to price with.
-        profile_costs: What each profile cost, where the caller knows.
 
     Returns:
         The correlation between predicted and measured durations, or None
         where a manifest is missing or too few workers reported to score it.
     """
+    model = cost_model(axis=axis)
     predicted, measured = [], []
     for row in worker_rows:
         path = os.path.join(manifest_dir, f"worker-{int(row['worker']):03d}.bin")
         if not os.path.exists(path):
             return None
-        predicted.append(cost_weights(read_manifest(path), axis, profile_costs)[1])
+        predicted.append(cost_weights(read_manifest(path), model)[1])
         measured.append(float(row["wall_seconds"]))
     return correlation(predicted, measured)
 

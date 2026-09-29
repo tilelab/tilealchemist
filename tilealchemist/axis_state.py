@@ -188,9 +188,9 @@ def settle_profile_costs(document, profiles, schema, notes):
 
     Three sources, in order of authority. A gap tile's weight is *measured*,
     by asking the profile once -- there is nothing to estimate. A real tile's
-    weight and the profile's seconds come from the recorded runs where there
-    are any, as the median of them. Failing that they fall back to what the
-    profile declared.
+    weight, the share of tiles written at all, and the profile's seconds come
+    from the recorded runs where there are any, as the median of them. Failing
+    that they fall back to what the profile declared.
 
     The result is returned rather than written back onto the profiles: the
     caller owns what it decided to charge, and a profile object stays the
@@ -212,15 +212,20 @@ def settle_profile_costs(document, profiles, schema, notes):
         # Only asked where something was recorded: its notes would name the wrong fallback.
         if recorded:
             measured = profile_axes(document, profile.name, notes)
-            seconds, per_tile = measured.seconds_per_tile, measured.bytes_per_output_tile
         else:
-            seconds, per_tile = profile.seconds_per_tile, profile.bytes_per_output_tile
-        costs.append(ProfileCost(name=profile.name, seconds_per_tile=seconds,
-                                 bytes_per_output_tile=per_tile,
-                                 gap_bytes=profile.gap_bytes(schema)))
+            measured = ProfileAxes(seconds_per_tile=profile.seconds_per_tile,
+                                   bytes_per_output_tile=profile.bytes_per_output_tile,
+                                   written_share=profile.written_share)
+        costs.append(ProfileCost(name=profile.name,
+                                 seconds_per_tile=measured.seconds_per_tile,
+                                 bytes_per_output_tile=measured.bytes_per_output_tile,
+                                 gap_bytes=profile.gap_bytes(schema),
+                                 written_share=measured.written_share))
         origin = "measured" if recorded else "declared, nothing measured yet"
-        lines.append(f"profile {profile.name}: {seconds:.3g}s and {per_tile:.0f}B per real "
-                     f"tile ({origin}), {costs[-1].gap_bytes:.0f}B per gap tile (measured)")
+        lines.append(f"profile {profile.name}: {measured.seconds_per_tile:.3g}s and "
+                     f"{measured.bytes_per_output_tile:.0f}B per real tile ({origin}), "
+                     f"written on {measured.written_share:.1%} of the tiles it is handed, "
+                     f"{costs[-1].gap_bytes:.0f}B per gap tile (measured)")
     return costs, lines
 
 

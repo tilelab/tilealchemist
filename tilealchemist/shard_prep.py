@@ -4,7 +4,7 @@ import sys
 
 from tilealchemist import axis_state
 from tilealchemist.attribution import compose_attribution, fetch_declared_attribution
-from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_weights
+from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_model, cost_weights
 from tilealchemist.manifest import axis_key_for, write_source_metadata, write_worker_manifests
 from tilealchemist.partition import count_gap_tiles, count_output_tiles
 from tilealchemist.sizing import breaches, choose_worker_count, worst_load
@@ -34,7 +34,7 @@ def run_prepare(args):
     print(f"source={resolved_source.url} (build {resolved_source.build}, "
           f"schema {resolved_source.schema.name})", file=sys.stderr)
 
-    axis, profile_costs, setup_seconds = _settle_costs(args, resolved_source)
+    model, setup_seconds = _settle_costs(args, resolved_source)
 
     session = make_session()
     header, entries = collect_entries(session, resolved_source.url,
@@ -53,7 +53,7 @@ def run_prepare(args):
     print(f"{len(gaps)} gap ranges covering {gap_tile_count} tiles with no archive "
           f"entry at all", file=sys.stderr)
 
-    worker_count, blocks = _size_run(args, entries, gaps, axis, profile_costs, setup_seconds)
+    worker_count, blocks = _size_run(args, entries, gaps, model, setup_seconds)
     write_worker_manifests(args.out_dir, blocks)
     write_source_metadata(args.out_dir, resolved_source, args.min_zoom, args.max_zoom,
                           header["tile_data_offset"])
@@ -63,15 +63,14 @@ def run_prepare(args):
           f"({non_empty_count} non-empty)", file=sys.stderr)
     print(f"largest block holds {max(len(block) for block in blocks)} records", file=sys.stderr)
     print(_tiles_line(blocks), file=sys.stderr)
-    load = worst_load(blocks, axis, profile_costs, setup_seconds)
+    load = worst_load(blocks, model, setup_seconds)
     broken = breaches(load, args.limits)
     print(f"worst worker: {load.seconds / 60:.0f}m predicted, {load.tiles} output tiles, "
           f"largest batch {load.batch_bytes / 2 ** 30:.2f} GiB", file=sys.stderr)
     if broken:
         print(f"::warning title=worker budget::the worst worker is over budget on "
               f"{', '.join(broken)} at {worker_count} workers", file=sys.stderr)
-    worker_seconds = [setup_seconds + cost_weights(block, axis, profile_costs)[1]
-                       for block in blocks]
+    worker_seconds = [setup_seconds + cost_weights(block, model)[1] for block in blocks]
     even_minutes = sum(worker_seconds) / len(blocks) / 60
     print(f"cost model predicts {sum(worker_seconds) / 3600:.1f} core-hours including "
           f"{setup_seconds:.0f}s setup per worker, slowest worker "
@@ -84,15 +83,19 @@ def run_prepare(args):
 def _settle_costs(args, resolved_source):
     """Work out what this run will be charged, and keep it here.
 
-    Three things are settled together because they are one decision: the five
-    per-axis seconds, what each profile costs, and what a worker costs before
-    it starts. Where the state branch has recorded runs, each figure is the
-    median of them, which one odd run cannot move far on its own. Where it has
-    none, the reviewed constants and the profiles' own declared estimates
-    stand.
+    Everything is settled together because it is one decision: the five
+    per-axis seconds, what each profile costs, what one worker's process pool
+    buys, and what a worker costs before it starts. Where the state branch has
+    recorded runs, each figure is the median of them, which one odd run cannot
+    move far on its own. Where it has none, the reviewed constants and the
+    profiles' own declared estimates stand.
 
     A gap tile's weight is settled by measurement either way, by asking each
     profile once before any network work happens.
+
+    The result is one CostModel, and every later step takes that one object:
+    partitioning and sizing used to be handed the axes and the profile costs
+    separately, and partitioning quietly went without the second.
 
     Args:
         args: The parsed command line, read for its profiles, its state
@@ -100,16 +103,16 @@ def _settle_costs(args, resolved_source):
         resolved_source: The archive this run will read.
 
     Returns:
-        The per-axis seconds, one ProfileCost per profile, and the per-worker
-        setup seconds.
+        The CostModel this run is priced by, and the per-worker setup seconds.
     """
     document = args.axis_state_document
     notes = []
-    axis, setup_seconds = args.axis_seconds, WORKER_SETUP_SECONDS
+    axis, setup_seconds, parallelism = args.axis_seconds, WORKER_SETUP_SECONDS, None
     if document is not None:
         source_key = axis_key_for(resolved_source.url, resolved_source.schema.name)
         axis, shared = axis_state.axis_seconds(document, source_key, notes)
         setup_seconds = shared.worker_setup_seconds
+        parallelism = shared.transform_parallelism
         print(f"axis state: {source_key} costed from "
               f"{axis_state.history_depth(document)} recorded run(s) of "
               f"{axis_state.HISTORY_LENGTH}, each coefficient the median of its own",
@@ -121,7 +124,10 @@ def _settle_costs(args, resolved_source):
         print(f"costing: {line}", file=sys.stderr)
     for note in notes:
         print(f"::warning title=axis state::{note}", file=sys.stderr)
-    return axis, profile_costs, setup_seconds
+    model = cost_model(axis=axis, profiles=profile_costs, transform_parallelism=parallelism)
+    print(f"costing: one worker's pool buys {model.transform_parallelism:.2f}s of decode and "
+          f"profile work per second of its wall clock", file=sys.stderr)
+    return model, setup_seconds
 
 
 def _tiles_line(blocks):
@@ -139,15 +145,14 @@ def _tiles_line(blocks):
             f"({gap_tiles} of them gap tiles)")
 
 
-def _size_run(args, entries, gaps, axis, profile_costs, setup_seconds):
+def _size_run(args, entries, gaps, model, setup_seconds):
     """The worker count this run sized itself to, and its blocks.
 
     Args:
         args: The parsed command line, for the limits.
         entries: The archive's directory entries for this run.
         gaps: The gap records covering what the archive does not hold.
-        axis: The per-axis seconds to charge.
-        profile_costs: What each profile costs, as settled for this run.
+        model: The CostModel this run is priced by.
         setup_seconds: What a worker costs before it reaches its first record.
 
     Returns:
@@ -155,8 +160,7 @@ def _size_run(args, entries, gaps, axis, profile_costs, setup_seconds):
         so the log says which limit pushed the run to the count it landed on.
     """
     worker_count, blocks, _load, attempts = choose_worker_count(
-        entries, gaps, axis, args.limits, profile_costs=profile_costs,
-        setup_seconds=setup_seconds)
+        entries, gaps, model, args.limits, setup_seconds=setup_seconds)
     for tried, load, broken in attempts:
         verdict = f"{', '.join(broken)} over budget" if broken else "fits"
         print(f"sizing: {tried} workers, worst worker {load.seconds / 60:.0f}m predicted, "
