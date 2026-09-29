@@ -41,11 +41,42 @@ def block_load(block, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECON
         batch_bytes=peak_batch_bytes(block))
 
 
-def worst_load(blocks, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECONDS):
-    """Take the worst value of each axis across every block.
+def block_loads(blocks, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECONDS):
+    """Predict what every worker's block will cost it, in worker order.
+
+    A caller that reports per-worker predictions and then judges the run as a
+    whole wants both from one pass: pricing a planet run's blocks twice is
+    work enough to notice, and two passes can only ever agree by accident.
+
+    Args:
+        blocks: One entry block per worker, in worker order.
+        model: The CostModel to price with.
+        setup_seconds: What a worker costs before it reaches its first record.
+
+    Returns:
+        One BlockLoad per block, in the same order.
+    """
+    return [block_load(block, model, setup_seconds) for block in blocks]
+
+
+def worst_of(loads):
+    """Take the worst value of each axis across loads already predicted.
 
     No single worker need be the worst on every axis, so the result is the
     envelope a limit has to hold against rather than any one worker's load.
+
+    Args:
+        loads: One BlockLoad per worker.
+
+    Returns:
+        A BlockLoad whose every field is the maximum across them.
+    """
+    return BlockLoad(*(max(getattr(load, field) for load in loads)
+                       for field in BlockLoad._fields))
+
+
+def worst_load(blocks, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECONDS):
+    """Take the worst value of each axis across every block.
 
     Args:
         blocks: One entry block per worker.
@@ -55,9 +86,7 @@ def worst_load(blocks, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECO
     Returns:
         A BlockLoad whose every field is the maximum across the blocks.
     """
-    loads = [block_load(block, model, setup_seconds) for block in blocks]
-    return BlockLoad(*(max(getattr(load, field) for load in loads)
-                       for field in BlockLoad._fields))
+    return worst_of(block_loads(blocks, model, setup_seconds))
 
 
 def breaches(load, limits):

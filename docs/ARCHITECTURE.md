@@ -318,7 +318,11 @@ not in it.
 
 `cost_weights()` therefore returns a predicted *duration* rather than a
 share of something: `partition_by_cost()` splits on that number, and
-`prepare_shards` prints the run's predicted core-hours and slowest worker.
+`prepare_shards` prints the run's predicted core-hours and slowest worker, plus
+one line per manifest — `worker-NNN: 12.3m predicted, ... 9% of budget` — in a
+folded `::group::`, so the shard that overran can be read back against what it
+was predicted to cost, and an uneven partition is visible as a spread rather
+than only as its worst cell.
 
 **All of it travels as one `CostModel`** — the axes, the settled profile costs
 and the parallelism in a single tuple — because the alternative was tried and

@@ -4,10 +4,10 @@ import sys
 
 from tilealchemist import axis_state
 from tilealchemist.attribution import compose_attribution, fetch_declared_attribution
-from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_model, cost_weights
+from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_model
 from tilealchemist.manifest import axis_key_for, write_source_metadata, write_worker_manifests
 from tilealchemist.partition import count_gap_tiles, count_output_tiles
-from tilealchemist.sizing import breaches, choose_worker_count, worst_load
+from tilealchemist.sizing import block_loads, breaches, choose_worker_count, worst_of
 from tilealchemist.pmtiles_index import collect_entries, compute_gaps
 from tilealchemist.ranged_fetch import make_session
 from tilealchemist.sources import resolve_source
@@ -63,14 +63,16 @@ def run_prepare(args):
           f"({non_empty_count} non-empty)", file=sys.stderr)
     print(f"largest block holds {max(len(block) for block in blocks)} records", file=sys.stderr)
     print(_tiles_line(blocks), file=sys.stderr)
-    load = worst_load(blocks, model, setup_seconds)
+    loads = block_loads(blocks, model, setup_seconds)
+    _print_worker_predictions(loads, args.limits)
+    load = worst_of(loads)
     broken = breaches(load, args.limits)
     print(f"worst worker: {load.seconds / 60:.0f}m predicted, {load.tiles} output tiles, "
           f"largest batch {load.batch_bytes / 2 ** 30:.2f} GiB", file=sys.stderr)
     if broken:
         print(f"::warning title=worker budget::the worst worker is over budget on "
               f"{', '.join(broken)} at {worker_count} workers", file=sys.stderr)
-    worker_seconds = [setup_seconds + cost_weights(block, model)[1] for block in blocks]
+    worker_seconds = [worker_load.seconds for worker_load in loads]
     even_minutes = sum(worker_seconds) / len(blocks) / 60
     print(f"cost model predicts {sum(worker_seconds) / 3600:.1f} core-hours including "
           f"{setup_seconds:.0f}s setup per worker, slowest worker "
@@ -78,6 +80,35 @@ def run_prepare(args):
           file=sys.stderr)
     # stdout carries the attribution alone, for _pipeline.yml to hand to tile-join.
     print(attribution)
+
+
+def _print_worker_predictions(loads, limits):
+    """Say what each worker is predicted to cost, one line per manifest.
+
+    The summary lines below say what the worst and the average worker come to,
+    which is what the sizing decision turns on, but not which worker is which.
+    A shard that overruns, or one that finishes in seconds, is only findable
+    from its own prediction, so every manifest gets its line, named as the file
+    it was written to and the matrix cell that will read it. The budget share
+    is the figure the limits are actually judged on: predicted seconds charged
+    at the tail factor, against `--job-seconds`.
+
+    A planet run has as many of these lines as it has workers, so they go in a
+    folded group: `::group::` is the same Actions annotation as the warnings
+    around them, and a terminal shows it as the plain line it is.
+
+    Args:
+        loads: One BlockLoad per worker, in worker order.
+        limits: The run's hard limits, for what share of its budget each
+            prediction spends.
+    """
+    print(f"::group::predicted per worker ({len(loads)} manifests)", file=sys.stderr)
+    for worker_index, load in enumerate(loads):
+        budget_share = load.seconds * limits.tail_factor / limits.job_seconds
+        print(f"worker-{worker_index:03d}: {load.seconds / 60:6.1f}m predicted, "
+              f"{load.tiles} output tiles, {load.records} records, "
+              f"{budget_share:.0%} of budget", file=sys.stderr)
+    print("::endgroup::", file=sys.stderr)
 
 
 def _settle_costs(args, resolved_source):
