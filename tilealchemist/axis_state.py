@@ -9,8 +9,8 @@ from tilealchemist.calibration import (
     ProfileAxes,
     SharedAxes,
     SourceAxes,
+    adopt_group,
     axis_seconds_of,
-    clamp_group,
 )
 
 # How many runs one coefficient keeps. Five is enough for a median to ignore one bad runner.
@@ -126,14 +126,14 @@ def source_axes(document, source_key, notes):
     Args:
         document: The state document.
         source_key: The archive's key, as `SourceMetadata.axis_key` gives it.
-        notes: The list any clamping explanation is appended to.
+        notes: The list any fallback explanation is appended to.
 
     Returns:
         The SourceAxes to charge, every field usable.
     """
     entry = document.get("sources", {}).get(source_key, {})
     measured = SourceAxes(**{name: _summarize(entry, name) for name in SourceAxes._fields})
-    return clamp_group(measured, REVIEWED_SOURCE, notes, prefix=f"{source_key}.")
+    return adopt_group(measured, REVIEWED_SOURCE, notes, prefix=f"{source_key}.")
 
 
 def profile_axes(document, profile_name, notes):
@@ -142,14 +142,14 @@ def profile_axes(document, profile_name, notes):
     Args:
         document: The state document.
         profile_name: The profile's name, as it reports itself.
-        notes: The list any clamping explanation is appended to.
+        notes: The list any fallback explanation is appended to.
 
     Returns:
         The ProfileAxes to charge, every field usable.
     """
     entry = document.get("profiles", {}).get(profile_name, {})
     measured = ProfileAxes(**{name: _summarize(entry, name) for name in ProfileAxes._fields})
-    return clamp_group(measured, REVIEWED_PROFILE, notes, prefix=f"{profile_name}.")
+    return adopt_group(measured, REVIEWED_PROFILE, notes, prefix=f"{profile_name}.")
 
 
 def shared_axes(document, notes):
@@ -157,14 +157,14 @@ def shared_axes(document, notes):
 
     Args:
         document: The state document.
-        notes: The list any clamping explanation is appended to.
+        notes: The list any fallback explanation is appended to.
 
     Returns:
         The SharedAxes to charge, every field usable.
     """
     entry = document.get("shared", {})
     measured = SharedAxes(**{name: _summarize(entry, name) for name in SharedAxes._fields})
-    return clamp_group(measured, REVIEWED_SHARED, notes)
+    return adopt_group(measured, REVIEWED_SHARED, notes)
 
 
 def axis_seconds(document, source_key, notes):
@@ -173,7 +173,7 @@ def axis_seconds(document, source_key, notes):
     Args:
         document: The state document.
         source_key: The archive the next run will read.
-        notes: The list any clamping explanation is appended to.
+        notes: The list any fallback explanation is appended to.
 
     Returns:
         The AxisSeconds to charge, and the shared group it was built from, so
@@ -200,7 +200,7 @@ def settle_profile_costs(document, profiles, schema, notes):
         document: The state document.
         profiles: The profile instances the run will build, or None.
         schema: The schema the output is written against, for the gap question.
-        notes: The list any clamping explanation is appended to.
+        notes: The list any fallback explanation is appended to.
 
     Returns:
         One ProfileCost per profile in the same order, and a line per profile

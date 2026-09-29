@@ -87,9 +87,9 @@ def _settle_costs(args, resolved_source):
     Three things are settled together because they are one decision: the five
     per-axis seconds, what each profile costs, and what a worker costs before
     it starts. Where the state branch has recorded runs, each figure is the
-    median of them, clamped towards the reviewed one so a single odd run moves
-    the model without taking it over. Where it has none, the reviewed constants
-    and the profiles' own declared estimates stand.
+    median of them, which one odd run cannot move far on its own. Where it has
+    none, the reviewed constants and the profiles' own declared estimates
+    stand.
 
     A gap tile's weight is settled by measurement either way, by asking each
     profile once before any network work happens.

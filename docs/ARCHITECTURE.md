@@ -512,10 +512,10 @@ The whole loop, in the order it runs:
    (`continue-on-error`, because before the first run there is no such branch)
    and passes `state/axes.json` as `--axis-state`. A missing file is not an
    error; it means nothing has been measured yet. For the archive this run
-   reads it takes the median of each recorded coefficient, clamps it towards
-   the reviewed one, and hands each profile its own measured `seconds_per_tile`
-   and `bytes_per_output_tile` in place of what the profile declared. That is
-   what the run is then partitioned and sized by.
+   reads it takes the median of each recorded coefficient, falling back to the
+   reviewed one only where nothing was measured, and hands each profile its own
+   measured `seconds_per_tile` and `bytes_per_output_tile` in place of what the
+   profile declared. That is what the run is then partitioned and sized by.
 2. **Each worker** writes its two-or-more `usage:` lines to `--usage-out` as
    well as to its log, and uploads that file. A file, not a log scrape: the job
    that fits these has artifacts, not log access.
@@ -943,13 +943,11 @@ the state branch files them under. The ring buffer, the median, the
 single-writer job and the orphan `state` branch are all the same shapes
 tiledistillery uses, down to `HISTORY_LENGTH = 5`.
 
-Four guards, because a bad calibration does its damage quietly, inside
+Three guards, because a bad calibration does its damage quietly, inside
 `partition_by_cost()` on every later run:
 
 - **Every worker must have reported.** A partial run is a biased sample --
   the workers that failed are exactly the expensive ones.
-- **Each coefficient is clamped** to within `CLAMP_FACTOR` of the reviewed
-  one, and every clamp is printed as a warning naming the raw measurement.
 - **With `--manifest-dir`**, the proposal is scored against the run's own
   measured worker durations alongside the reviewed coefficients. Ranking
   worse than what it would replace is a warning that says not to commit it.

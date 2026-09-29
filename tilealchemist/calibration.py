@@ -9,9 +9,6 @@ from tilealchemist.cost import (AXIS_SECONDS, DEFAULT_BYTES_PER_OUTPUT_TILE,
                                 cost_weights)
 from tilealchemist.manifest import read_manifest
 
-# A measured coefficient may differ from the reviewed one by this factor, and no further.
-CLAMP_FACTOR = 4.0
-
 MIN_SCORED_WORKERS = 8
 
 # What the archive costs: its fetch rate, and what its tiles cost to decode.
@@ -191,16 +188,16 @@ def correlation(left, right):
     return covariance / spread if spread else None
 
 
-def _clamped(name, measured, reviewed, notes):
-    """Keep a measured coefficient within reach of the reviewed one.
+def _adopted(name, measured, reviewed, notes):
+    """Take the measured coefficient, or the reviewed one where there is none.
 
-    One odd run should move a coefficient, not replace it, so a measurement
-    further than CLAMP_FACTOR from the reviewed value is pulled back to that
-    bound and the reason recorded.
+    A measurement is trusted however far it lands from the reviewed value:
+    the recorded runs are already a median over several of them, and pulling
+    an honest figure back towards a guess only hides that the guess was wrong.
 
     Args:
         name: The coefficient's name, for the note.
-        measured: What this run measured, or None.
+        measured: What the recorded runs say, or None.
         reviewed: The value the reviewed cost model carries.
         notes: The list any explanation is appended to.
 
@@ -210,12 +207,6 @@ def _clamped(name, measured, reviewed, notes):
     if measured is None or not math.isfinite(measured) or measured <= 0:
         notes.append(f"{name}: nothing usable measured, keeping the reviewed {reviewed:g}")
         return reviewed
-    low, high = reviewed / CLAMP_FACTOR, reviewed * CLAMP_FACTOR
-    if not low <= measured <= high:
-        clamped = min(max(measured, low), high)
-        notes.append(f"{name}: measured {measured:.4g} is outside {CLAMP_FACTOR:g}x of the "
-                     f"reviewed {reviewed:g}, clamped to {clamped:.4g}")
-        return clamped
     return measured
 
 
@@ -315,8 +306,8 @@ def measure_shared(rows, runner_overhead_seconds=None):
 def measure_run(rows, runner_overhead_seconds=None):
     """Measure one run, split by what each coefficient belongs to.
 
-    Nothing is clamped here: this is what the run says, and the clamping
-    against the reviewed model happens where a value is adopted.
+    Nothing falls back here: this is what the run says, and the reviewed
+    model only stands in where a value is adopted.
 
     Args:
         rows: Parsed usage rows for the whole run.
@@ -351,8 +342,8 @@ def measure_run(rows, runner_overhead_seconds=None):
                           diagnostics=diagnostics, notes=notes)
 
 
-def clamp_group(measured, reviewed, notes, prefix=""):
-    """Clamp every field of one measured group towards the reviewed one.
+def adopt_group(measured, reviewed, notes, prefix=""):
+    """Settle every field of one measured group against the reviewed one.
 
     Args:
         measured: The measured group, whose fields may be None.
@@ -365,7 +356,7 @@ def clamp_group(measured, reviewed, notes, prefix=""):
         A group of the same type, every field usable.
     """
     return type(reviewed)(**{
-        name: _clamped(prefix + name, getattr(measured, name), getattr(reviewed, name), notes)
+        name: _adopted(prefix + name, getattr(measured, name), getattr(reviewed, name), notes)
         for name in reviewed._fields})
 
 
