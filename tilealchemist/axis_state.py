@@ -37,15 +37,17 @@ def _observations(entry, name):
         name: The coefficient's name.
 
     Returns:
-        The finite, positive observations, oldest first. Anything else in the
-        file is dropped rather than trusted: a null or a zero would drag a
-        median to nonsense.
+        The finite, non-negative observations, oldest first. Anything else in
+        the file is dropped rather than trusted: a null or a negative cost
+        would drag a median to nonsense. Zero is kept, because it is a
+        measurement -- a decode fit that finds no per-call cost says so with
+        a zero, and dropping it left `decode_call` forever unmeasured.
     """
     raw = entry.get(name) if isinstance(entry, dict) else None
     if not isinstance(raw, list):
         return []
     return [float(value) for value in raw
-            if isinstance(value, (int, float)) and value > 0 and value == value]
+            if isinstance(value, (int, float)) and value >= 0 and value == value]
 
 
 def _summarize(entry, name):
@@ -82,7 +84,7 @@ def _record_group(entry, measured):
     recorded = []
     for name in measured._fields:
         value = getattr(measured, name)
-        if value is None or value <= 0 or value != value:
+        if value is None or value < 0 or value != value:
             continue
         entry[name] = (_observations(entry, name) + [float(value)])[-HISTORY_LENGTH:]
         recorded.append(name)

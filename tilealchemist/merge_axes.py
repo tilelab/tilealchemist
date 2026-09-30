@@ -5,7 +5,10 @@ import glob
 import json
 import os
 import pathlib
+import re
+import statistics
 import sys
+from datetime import datetime
 
 from tilealchemist import axis_state
 from tilealchemist.calibration import (
@@ -14,9 +17,14 @@ from tilealchemist.calibration import (
     proposal_lines,
 )
 from tilealchemist.manifest import read_source_metadata
-from tilealchemist.state_branch import DEFAULT_BRANCH, ensure_branch, update_json
+from tilealchemist.state_branch import DEFAULT_BRANCH, ensure_branch, request, update_json
 
 DEFAULT_STATE_PATH = "state/axes.json"
+
+# A worker job as `_pipeline.yml` names it, its matrix index being the manifest it read.
+WORKER_JOB = re.compile(r"build-shards \((\d+)\)$")
+
+JOBS_PER_PAGE = 100
 
 HELP = """Merges every worker's `usage:` lines into the shared axis state.
 
@@ -58,9 +66,15 @@ def parse_args():
                          help="source.json from the same run, read for the build label recorded "
                               "beside the archive's coefficients")
     parser.add_argument("--runner-overhead-seconds", type=float, default=None,
-                         help="seconds between a CI job starting and a worker's process starting "
-                              "-- runner boot, artifact download, pip install. No worker's log "
-                              "can see it, so worker_setup_seconds is left unmeasured without it")
+                         help="seconds a worker job spends outside the worker's process "
+                              "-- runner boot, artifact download, pip install, uploads. No "
+                              "worker's log can see it; left off, it is read off the run's job "
+                              "timings, which needs `actions: read`")
+    parser.add_argument("--run-id", default=os.environ.get("GITHUB_RUN_ID"),
+                         help="the run whose worker jobs are timed for the runner overhead "
+                              "(default: $GITHUB_RUN_ID)")
+    parser.add_argument("--run-attempt", default=os.environ.get("GITHUB_RUN_ATTEMPT", "1"),
+                         help="which attempt of that run (default: $GITHUB_RUN_ATTEMPT)")
     parser.add_argument("--repo", default=os.environ.get("GITHUB_REPOSITORY"),
                          help="the owner/name whose state branch holds the axes (default: "
                               "$GITHUB_REPOSITORY). The caller's repository, not tilealchemist's: "
@@ -106,6 +120,66 @@ def read_lines(usage_dir, patterns):
     return lines
 
 
+def measure_runner_overhead(repo, token, run_id, attempt, rows):
+    """Time what each worker job spent outside the worker's own process.
+
+    The job's span on GitHub, less the `wall_seconds` its process reported,
+    is everything the process could not see: runner boot, checkout, pip, the
+    manifest download before it and the uploads after it. All of that is paid
+    once per worker whatever its block holds, which is what
+    `worker_setup_seconds` charges. The median across workers, so one runner
+    that queued for a disk does not set it.
+
+    Args:
+        repo: The owner/name the run belongs to.
+        token: A token that can read the run's jobs, which takes
+            `actions: read`.
+        run_id: The run to time.
+        attempt: Which attempt of it.
+        rows: Parsed usage rows for the whole run, read for each worker's
+            `wall_seconds`.
+
+    Returns:
+        The median overhead in seconds, or None where the jobs could not be
+        read or none of them matched a reporting worker.
+    """
+    walls = {int(row["worker"]): float(row["wall_seconds"]) for row in rows
+             if row.get("scope") == "worker" and "wall_seconds" in row}
+    overheads, page = [], 1
+    while True:
+        response = request("GET", f"/repos/{repo}/actions/runs/{run_id}/attempts/{attempt}/jobs",
+                           token, params={"per_page": JOBS_PER_PAGE, "page": page})
+        if response.status_code != 200:
+            print(f"::warning title=merge-axes::cannot read this run's job timings "
+                  f"({response.status_code}), so worker_setup_seconds stays unmeasured; the "
+                  f"calling job needs `actions: read` beside `contents: write`", file=sys.stderr)
+            return None
+        jobs = response.json().get("jobs", [])
+        for job in jobs:
+            match = WORKER_JOB.search(job.get("name", ""))
+            if (not match or job.get("conclusion") != "success"
+                    or int(match.group(1)) not in walls):
+                continue
+            span = (_timestamp(job["completed_at"]) - _timestamp(job["started_at"])).total_seconds()
+            overheads.append(span - walls[int(match.group(1))])
+        if len(jobs) < JOBS_PER_PAGE:
+            break
+        page += 1
+    return statistics.median(overheads) if overheads else None
+
+
+def _timestamp(value):
+    """Read one of the API's ISO 8601 timestamps.
+
+    Args:
+        value: The timestamp, `Z`-suffixed as the API writes it.
+
+    Returns:
+        The aware datetime.
+    """
+    return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
 def main():
     """Merge the run's measurements into the state branch.
 
@@ -115,7 +189,14 @@ def main():
     """
     args = parse_args()
     rows = parse_usage_lines(read_lines(args.usage_dir, args.log))
-    measurement = measure_run(rows, runner_overhead_seconds=args.runner_overhead_seconds)
+    overhead = args.runner_overhead_seconds
+    if overhead is None and args.repo and args.token and args.run_id:
+        overhead = measure_runner_overhead(args.repo, args.token, args.run_id,
+                                           args.run_attempt, rows)
+        if overhead is not None:
+            print(f"runner overhead: {overhead:.1f}s per worker job outside its process, "
+                  f"the median across the run", file=sys.stderr)
+    measurement = measure_run(rows, runner_overhead_seconds=overhead)
 
     seen = measurement.diagnostics["workers"]
     print(f"{seen} workers and {measurement.diagnostics['profile_rows']} profile rows reported",

@@ -126,7 +126,17 @@ def length_buckets(worker_rows):
 
 
 def _fit_two(samples):
-    """Least-squares fit of a two-term model with no intercept.
+    """Least-squares fit of a two-term model with no intercept, neither term negative.
+
+    Both terms are costs, so a negative one is not a finding but the fit
+    buying a better line with a price nobody pays. Decode is the case that
+    forces it: GEOS work grows faster than the byte length, and an
+    unconstrained fit answers that curve with a negative per-call cost --
+    -0.00127s on worker 5 of standardprofiles run 36608758128 -- which the
+    state then discarded, so `decode_call` was never measured at all. Where
+    the unconstrained optimum leaves the positive quadrant, the best fit with
+    one term at zero is taken instead, and zero is a measurement like any
+    other.
 
     Args:
         samples: The `(x1, x2, target)` triples to fit.
@@ -145,8 +155,18 @@ def _fit_two(samples):
     determinant = left * right - cross * cross
     if determinant <= 0:
         return None
-    return ((first * right - second * cross) / determinant,
-            (second * left - first * cross) / determinant)
+    one = (first * right - second * cross) / determinant
+    two = (second * left - first * cross) / determinant
+    if one >= 0 and two >= 0:
+        return one, two
+
+    def excess(one, two):
+        """The squared error of a candidate, less the constant every candidate shares."""
+        return (one * one * left + 2 * one * two * cross + two * two * right
+                - 2 * (one * first + two * second))
+
+    return min(((max(first / left, 0.0), 0.0), (0.0, max(second / right, 0.0))),
+               key=lambda pair: excess(*pair))
 
 
 def _entry_samples(buckets):
@@ -183,7 +203,7 @@ def _adopted(name, measured, reviewed, notes):
     Returns:
         The value to use.
     """
-    if measured is None or not math.isfinite(measured) or measured <= 0:
+    if measured is None or not math.isfinite(measured) or measured < 0:
         notes.append(f"{name}: nothing usable measured, keeping the reviewed {reviewed:g}")
         return reviewed
     return measured
@@ -287,7 +307,8 @@ def measure_transform_parallelism(rows):
     """
     workers, profiles = _scoped(rows, "worker"), _scoped(rows, "profile")
     pooled = _total(workers, "decode_seconds") + _total(profiles, "transform_seconds")
-    return _ratio(pooled, _total(workers, "transform_seconds"))
+    # It divides every pooled second, so a run that pooled none has measured nothing.
+    return _ratio(pooled, _total(workers, "transform_seconds")) if pooled else None
 
 
 def measure_shared(rows, runner_overhead_seconds=None):
@@ -345,7 +366,8 @@ def measure_run(rows, runner_overhead_seconds=None):
                      "own coefficients cannot be filed")
     if runner_overhead_seconds is None:
         notes.append("worker_setup_seconds: a worker's log cannot see runner boot, artifact "
-                     "download or pip install, so this needs --runner-overhead-seconds")
+                     "download or pip install, so this needs the runner overhead, which "
+                     "merge-axes reads off the run's job timings given `actions: read`")
     diagnostics = {
         "workers": len(workers),
         "profile_rows": len(profiles),

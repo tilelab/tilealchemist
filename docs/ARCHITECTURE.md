@@ -600,7 +600,11 @@ The whole loop, in the order it runs:
    what keeps one odd run from moving the model.
 
 `merge-axes` pushes with the caller's own `GITHUB_TOKEN`, so the calling job
-has to grant `contents: write`; the default for a repository is `read`. The job
+has to grant `contents: write`; the default for a repository is `read`. It
+also needs `actions: read` to time the run's worker jobs, which is where
+`worker_setup_seconds` comes from: a job's span less the `wall_seconds` its
+process reported, the median across workers. Without it the push still
+happens and that one coefficient stays at the reviewed 39s. The job
 deliberately does not declare that permission for itself, because a called
 workflow may only narrow what its caller granted and never widen it, and that
 ceiling is checked before any `if:` is evaluated -- a `permissions:` block here
