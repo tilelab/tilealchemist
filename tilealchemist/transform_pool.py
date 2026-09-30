@@ -1,7 +1,6 @@
 """Chunking a batch and running it across processes; see docs/ARCHITECTURE.md "Parallelism"."""
 import collections
 import concurrent.futures
-import operator
 import sys
 
 from tilealchemist.partition import partition_by_cost
@@ -40,8 +39,7 @@ def _chunk_entries(real_entries, transform_workers):
     if transform_workers <= 1 or len(real_entries) <= 1:
         return [real_entries]
     chunk_count = min(len(real_entries), transform_workers * TRANSFORM_CHUNKS_PER_WORKER)
-    chunks = partition_by_cost(real_entries, chunk_count,
-                               atomic_key=operator.attrgetter("offset"))
+    chunks = partition_by_cost(real_entries, chunk_count)
     return [chunk for chunk in chunks if chunk]
 
 

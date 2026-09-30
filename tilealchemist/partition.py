@@ -1,7 +1,4 @@
 """One run's directory entries -> one block of work per worker."""
-import itertools
-import operator
-
 from tilealchemist.cost import DEFAULT_COST_MODEL, cost_weights
 
 
@@ -38,46 +35,19 @@ def _share_end_weight(total_weight, worker_index, worker_count):
     return total_weight * (worker_index + 1) / worker_count
 
 
-def _atomic_groups(weighted_records, atomic_key, share_limit):
-    """Group records that must not be split across two workers.
+def partition_by_cost(records, worker_count, model=DEFAULT_COST_MODEL):
+    """Spread records across workers so each carries the same predicted cost.
 
-    Records sharing an `atomic_key` come from one fetch, so splitting them
-    would have two workers download the same bytes. A run is broken up anyway
-    once it outgrows a worker's share, since the alternative is one worker
-    carrying it whole.
-
-    Args:
-        weighted_records: `(record, weight)` pairs, in walk order.
-        atomic_key: What makes two records inseparable, or None to treat each
-            record as its own group.
-        share_limit: The weight one worker's share carries.
-
-    Yields:
-        `(records, weight)` per group, in the order given.
-    """
-    if atomic_key is None:
-        for record, weight in weighted_records:
-            yield [record], weight
-        return
-    for _key, group in itertools.groupby(weighted_records,
-                                          key=lambda pair: atomic_key(pair[0])):
-        run, run_weight = [], 0.0
-        for record, weight in group:
-            if run and run_weight + weight > share_limit:
-                yield run, run_weight
-                run, run_weight = [], 0.0
-            run.append(record)
-            run_weight += weight
-        yield run, run_weight
-
-
-def partition_by_cost(records, worker_count, atomic_key=None, model=DEFAULT_COST_MODEL):
-    """Spread records across workers so each carries a similar predicted cost.
+    Every record is its own unit, so a block ends within one record of its
+    share. Records sharing an offset come from one fetch, and a boundary
+    through such a run has the next worker fetch and transform that one tile
+    again; keeping the run whole instead handed worker 0 of a planet run a
+    whole share of open ocean on top of the 1081s it already held, 63m
+    against an even 45m.
 
     Args:
         records: The records to spread, in walk order.
         worker_count: How many blocks to produce.
-        atomic_key: What makes two records inseparable, or None.
         model: The CostModel to price with. It must be the same one the run is
             sized by: balancing on the axes alone while sizing on the axes and
             the profiles together handed six workers of one planet run 14.9M
@@ -86,18 +56,16 @@ def partition_by_cost(records, worker_count, atomic_key=None, model=DEFAULT_COST
 
     Returns:
         One list of records per worker, in worker order. The last block takes
-        whatever is left, however far past its share that puts it.
+        whatever is left.
     """
     weights, total_weight = cost_weights(records, model)
-    groups = _atomic_groups(zip(records, weights), atomic_key,
-                             total_weight / worker_count)
     blocks = [[] for _ in range(worker_count)]
     worker_index = 0
     assigned_weight = 0.0
-    for group, group_weight in groups:
-        blocks[worker_index].extend(group)
-        assigned_weight += group_weight
-        # A group can span several shares, and every one it covered must be skipped.
+    for record, weight in zip(records, weights):
+        blocks[worker_index].append(record)
+        assigned_weight += weight
+        # A record heavier than a share would span several, and every one it covered must be skipped.
         while (worker_index < worker_count - 1
                and assigned_weight >= _share_end_weight(total_weight, worker_index, worker_count)):
             worker_index += 1
@@ -120,8 +88,7 @@ def partition_into_worker_blocks(entries, gaps, worker_count, model=DEFAULT_COST
         One list of records per worker, its real entries before its gaps.
     """
     gap_blocks = partition_by_cost(gaps, worker_count, model=model)
-    real_blocks = partition_by_cost(entries, worker_count,
-                                    atomic_key=operator.attrgetter("offset"), model=model)
+    real_blocks = partition_by_cost(entries, worker_count, model=model)
     return [real_block + gap_block
             for real_block, gap_block in zip(real_blocks, gap_blocks)]
 

@@ -166,16 +166,17 @@ community-run server. Instead:
    (e.g. the same "all water" tile recurring across different oceans) lands
    in the same worker as the tile it's deduped against, instead of a random
    other worker re-fetching the same bytes. `partition.py`'s
-   `partition_by_cost()` keeps a run of same-offset entries whole across
-   worker boundaries, past a worker's target size, but only up to one whole
-   share of the run's cost (see "Parallelism" for what that weighs). That
-   cap is not a detail: a Protomaps planet build dedupes its open ocean into
-   same-offset runs of hundreds of thousands of entries (315K and 306K at
-   z0..z11 alone, against a 128-worker share of 16K), and an unbounded rule
-   drops every one of them on a single worker however high `worker_count`
-   goes, while starving the workers after it. Splitting such a run costs
-   only what keeping it whole was buying — one tile's bytes re-fetched per
-   extra worker — so the cap is the cheap side of that trade.
+   `partition_by_cost()` cuts at the record where a worker's share ends,
+   through a run of same-offset entries or not (see "Parallelism" for what a
+   share weighs), so every block lands within one record of its share. A cut
+   through such a run costs one tile fetched and transformed again by the
+   next worker. Keeping runs whole was tried and cost far more: a Protomaps
+   planet build dedupes its open ocean into same-offset runs of millions of
+   entries, chopped into chunks of one whole share each, and a chunk landed
+   on a worker in one piece whatever it already held. Standardprofiles run
+   36608758128 handed worker 0 a 2660s chunk on top of the 1081s it had,
+   63m predicted against an even 45m, and the offset carried through the
+   next three workers until worker 4 was left with 18m.
 3. Each worker (`tilealchemist/build_shard.py` for the entry point,
    `shard_worker.py` for the run's flow, `fetch_batching.py` for splitting
    and fetching its manifest, `transform.py` for the CPU-bound transform,
