@@ -7,14 +7,10 @@ import sys
 
 from tilealchemist import axis_state
 from tilealchemist.calibration import (
-    MIN_SCORED_WORKERS,
     measure_run,
     parse_usage_lines,
     proposal_lines,
-    score_axes,
-    worker_rows,
 )
-from tilealchemist.cost import AXIS_SECONDS
 from tilealchemist.manifest import read_source_metadata
 
 HELP = """Proposes the next run's cost coefficients from the last run's logs.
@@ -30,7 +26,7 @@ human decides what gets committed.
 
     grep -h '^usage:' logs/*.txt | tilealchemist-calibrate --expect-workers 128
 
-    tilealchemist-calibrate --log 'logs/*.txt' --manifest-dir manifests \\
+    tilealchemist-calibrate --log 'logs/*.txt' \\
         --source manifests/source.json --out calibration.json
 """
 
@@ -54,9 +50,6 @@ def parse_args():
                               "starting -- runner boot, artifact download, pip install. A "
                               "worker's own log cannot see it, so worker_setup_seconds is left "
                               "alone unless this is given")
-    parser.add_argument("--manifest-dir", default=None,
-                         help="the run's manifests, to score predicted against measured "
-                              "durations for the reviewed and the proposed coefficients")
     parser.add_argument("--source", default=None,
                          help="source.json from the same run, recorded in --out so a caller "
                               "can key the calibration by archive build and schema")
@@ -120,18 +113,6 @@ def main():
     proposed, shared = axis_state.axis_seconds(document, measurement.source_key, notes)
     for note in notes:
         print(f"::warning title=calibration::{note}", file=sys.stderr)
-
-    if args.manifest_dir:
-        scores = {label: score_axes(args.manifest_dir, worker_rows(rows), axis)
-                  for label, axis in (("reviewed", AXIS_SECONDS), ("proposed", proposed))}
-        unscored = f"not scored, under {MIN_SCORED_WORKERS} workers"
-        for label, scored in scores.items():
-            shown = unscored if scored is None else f"{scored:.3f}"
-            print(f"predicted vs measured duration, {label}: {shown}", file=sys.stderr)
-        if None not in scores.values() and scores["proposed"] < scores["reviewed"]:
-            print(f"::warning title=calibration::the proposal ranks this run's own workers "
-                  f"worse than the reviewed coefficients do ({scores['proposed']:.3f} against "
-                  f"{scores['reviewed']:.3f}); do not commit it", file=sys.stderr)
 
     if args.out:
         payload = {"axis_seconds": proposed._asdict(),

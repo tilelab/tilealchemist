@@ -9,14 +9,10 @@ import sys
 
 from tilealchemist import axis_state
 from tilealchemist.calibration import (
-    MIN_SCORED_WORKERS,
     measure_run,
     parse_usage_lines,
     proposal_lines,
-    score_axes,
-    worker_rows,
 )
-from tilealchemist.cost import AXIS_SECONDS
 from tilealchemist.manifest import read_source_metadata
 from tilealchemist.state_branch import DEFAULT_BRANCH, ensure_branch, update_json
 
@@ -76,11 +72,6 @@ def parse_args():
                               f"an empty orphan if it is not there yet")
     parser.add_argument("--state-path", default=DEFAULT_STATE_PATH,
                          help=f"the state file's path on that branch (default {DEFAULT_STATE_PATH})")
-    parser.add_argument("--manifest-dir", default=None,
-                         help="the run's manifests, to score what the new coefficients predict "
-                              "against what the run measured. Ranking worse than the reviewed "
-                              "ones refuses the push: a fit can improve every ratio and still be "
-                              "a worse model")
     parser.add_argument("--out", default=None,
                          help="also write the merged document here, for a caller that wants it "
                               "as a job artifact")
@@ -115,54 +106,6 @@ def read_lines(usage_dir, patterns):
     return lines
 
 
-def _outranked(args, rows, measurement):
-    """Whether the new coefficients predict this run worse than the reviewed ones.
-
-    Args:
-        args: The parsed command line, read for its manifest directory.
-        rows: Parsed usage rows for the whole run.
-        measurement: The run's RunMeasurement.
-
-    Returns:
-        True where the proposal must not be pushed. Without --manifest-dir, or
-        with too few workers to score, nothing is claimed either way.
-    """
-    if not args.manifest_dir:
-        return False
-    notes = []
-    proposed = axis_state.axis_seconds(_document_of(measurement),
-                                        measurement.source_key, notes)[0]
-    scores = {label: score_axes(args.manifest_dir, worker_rows(rows), axis)
-              for label, axis in (("reviewed", AXIS_SECONDS), ("proposed", proposed))}
-    for label, scored in scores.items():
-        shown = (f"not scored, under {MIN_SCORED_WORKERS} workers" if scored is None
-                 else f"{scored:.3f}")
-        print(f"predicted vs measured duration, {label}: {shown}", file=sys.stderr)
-    if None in scores.values():
-        return False
-    if scores["proposed"] < scores["reviewed"]:
-        print(f"::error::the fit ranks this run's own workers worse than the reviewed "
-              f"coefficients do ({scores['proposed']:.3f} against {scores['reviewed']:.3f}); "
-              f"not pushing it", file=sys.stderr)
-        return True
-    return False
-
-
-def _document_of(measurement):
-    """This run's measurements alone, as a state document.
-
-    Args:
-        measurement: The run's RunMeasurement.
-
-    Returns:
-        A document holding only this run, for scoring what it would propose
-        before it is merged with the history.
-    """
-    document = axis_state.empty_document()
-    axis_state.record_run(document, measurement)
-    return document
-
-
 def main():
     """Merge the run's measurements into the state branch.
 
@@ -190,8 +133,6 @@ def main():
     for note in measurement.notes:
         print(f"::warning title=merge-axes::{note}", file=sys.stderr)
 
-    if _outranked(args, rows, measurement):
-        return 1
 
     build = read_source_metadata(args.source).build if args.source else None
 

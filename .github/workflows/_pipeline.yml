@@ -409,9 +409,7 @@ jobs:
 
       # --expect-workers is the guard that matters: a partial run is a biased
       # sample, because the workers that failed are the expensive ones, so
-      # nothing is pushed unless every one of them reported. --manifest-dir
-      # adds the second guard, refusing a fit that predicts this run's own
-      # workers worse than the reviewed constants already did.
+      # nothing is pushed unless every one of them reported.
       - name: Merge the measured axes into the state branch
         env:
           GH_TOKEN: ${{ github.token }}
@@ -421,7 +419,6 @@ jobs:
           tilealchemist-merge-axes \
             --usage-dir usage \
             --expect-workers "$WORKER_COUNT" \
-            --manifest-dir manifests \
             --source manifests/source.json \
             --repo "$GITHUB_REPOSITORY" \
             --token "$GH_TOKEN" \

@@ -595,8 +595,9 @@ The whole loop, in the order it runs:
    one observation per coefficient to its own ring buffer, and pushes. It
    refuses to push unless `--expect-workers` matches what reported, because a
    partial run is a biased sample -- the workers that failed are the expensive
-   ones -- and refuses again if `--manifest-dir` scoring says the fit predicts
-   this run's own workers worse than the reviewed constants already did.
+   ones. A complete run is always pushed: a new measurement describes the
+   code and the runners as they are now, and the median over the history is
+   what keeps one odd run from moving the model.
 
 `merge-axes` pushes with the caller's own `GITHUB_TOKEN`, so the calling job
 has to grant `contents: write`; the default for a repository is `read`. The job
@@ -1016,17 +1017,11 @@ the state branch files them under. The ring buffer, the median, the
 single-writer job and the orphan `state` branch are all the same shapes
 tiledistillery uses, down to `HISTORY_LENGTH = 5`.
 
-Three guards, because a bad calibration does its damage quietly, inside
+Two guards, because a bad calibration does its damage quietly, inside
 `partition_by_cost()` on every later run:
 
 - **Every worker must have reported.** A partial run is a biased sample --
   the workers that failed are exactly the expensive ones.
-- **With `--manifest-dir`**, the proposal is scored against the run's own
-  measured worker durations alongside the reviewed coefficients. Ranking
-  worse than what it would replace is a warning that says not to commit it.
-  Below `MIN_SCORED_WORKERS` the score is withheld rather than printed: over
-  two points a correlation is always exactly +/-1, which would read as a
-  verdict while meaning nothing.
 - **A coefficient is the median of the last few runs, not the newest one.**
   `axis_state.py` keeps `HISTORY_LENGTH = 5` observations per coefficient and
   reads the median of them. A mean would let one bad runner through at a fifth

@@ -1,16 +1,11 @@
 """Fitting the next run's cost coefficients from the last run's `usage:` lines."""
 import json
 import math
-import os
 from collections import namedtuple
 
 from tilealchemist.cost import (AXIS_SECONDS, DEFAULT_BYTES_PER_OUTPUT_TILE,
                                 DEFAULT_SECONDS_PER_TILE, DEFAULT_TRANSFORM_PARALLELISM,
-                                DEFAULT_WRITTEN_SHARE, WORKER_SETUP_SECONDS, AxisSeconds,
-                                cost_model, cost_weights)
-from tilealchemist.manifest import read_manifest
-
-MIN_SCORED_WORKERS = 8
+                                DEFAULT_WRITTEN_SHARE, WORKER_SETUP_SECONDS, AxisSeconds)
 
 # What the archive costs: its fetch rate, and what its tiles cost to decode.
 SourceAxes = namedtuple("SourceAxes", "fetched_byte decode_call decoded_byte")
@@ -170,27 +165,6 @@ def _entry_samples(buckets):
     """
     return [(count, byte_count, decode)
             for count, byte_count, decode in buckets.values() if count]
-
-
-def correlation(left, right):
-    """Pearson correlation between two equal-length series.
-
-    Args:
-        left: One series.
-        right: The other, in the same order.
-
-    Returns:
-        The coefficient, or None where there are too few workers to score it
-        or either series does not vary at all.
-    """
-    count = len(left)
-    if count < MIN_SCORED_WORKERS:
-        return None
-    mean_left, mean_right = sum(left) / count, sum(right) / count
-    covariance = sum((a - mean_left) * (b - mean_right) for a, b in zip(left, right))
-    spread = math.sqrt(sum((a - mean_left) ** 2 for a in left)
-                       * sum((b - mean_right) ** 2 for b in right))
-    return covariance / spread if spread else None
 
 
 def _adopted(name, measured, reviewed, notes):
@@ -458,50 +432,6 @@ def load_calibration_file(path):
     with open(path, encoding="utf-8") as handle:
         data = json.load(handle)
     return axis_seconds_from_json(data)
-
-
-def score_axes(manifest_dir, worker_rows, axis):
-    """Score predicted worker durations against the ones the run measured.
-
-    A calibration that ranks a run's own workers worse than the reviewed
-    coefficients did is a worse model, whatever its individual coefficients
-    look like, so this is the guard that catches a fit which improved every
-    ratio and the whole no better.
-
-    The axes alone are scored, with no profiles and no parallelism: this is a
-    ranking, and both of those enter the prediction as factors common to every
-    worker, which a correlation cannot see either way.
-
-    Args:
-        manifest_dir: The run's manifests, to price each worker's block from.
-        worker_rows: Parsed usage rows for scope "worker".
-        axis: The per-axis seconds to price with.
-
-    Returns:
-        The correlation between predicted and measured durations, or None
-        where a manifest is missing or too few workers reported to score it.
-    """
-    model = cost_model(axis=axis)
-    predicted, measured = [], []
-    for row in worker_rows:
-        path = os.path.join(manifest_dir, f"worker-{int(row['worker']):03d}.bin")
-        if not os.path.exists(path):
-            return None
-        predicted.append(cost_weights(read_manifest(path), model)[1])
-        measured.append(float(row["wall_seconds"]))
-    return correlation(predicted, measured)
-
-
-def worker_rows(rows):
-    """The run's per-worker usage rows.
-
-    Args:
-        rows: Parsed usage rows for the whole run.
-
-    Returns:
-        The rows for scope "worker", in order.
-    """
-    return _scoped(rows, "worker")
 
 
 def _group_lines(title, measured, reviewed):
