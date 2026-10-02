@@ -2,15 +2,16 @@
 import os
 import sys
 
-from tilealchemist import axis_state
+from tilealchemist import axis_state, block_state
 from tilealchemist.attribution import compose_attribution, fetch_declared_attribution
 from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_model
 from tilealchemist.manifest import axis_key_for, write_source_metadata, write_worker_manifests
-from tilealchemist.partition import count_gap_tiles, count_output_tiles
+from tilealchemist.partition import count_gap_tiles, count_output_tiles, tile_block_groups
 from tilealchemist.sizing import block_loads, breaches, choose_worker_count, worst_of
 from tilealchemist.pmtiles_index import collect_entries, compute_gaps
 from tilealchemist.ranged_fetch import make_session
 from tilealchemist.sources import resolve_source
+from tilealchemist.tile_blocks import TILE_BLOCK_BITS, profile_combo_key
 
 
 def run_prepare(args):
@@ -53,7 +54,16 @@ def run_prepare(args):
     print(f"{len(gaps)} gap ranges covering {gap_tile_count} tiles with no archive "
           f"entry at all", file=sys.stderr)
 
-    worker_count, blocks = _size_run(args, entries, gaps, model, setup_seconds)
+    groups = tile_block_groups(entries, model)
+    measured_count = sum(1 for block in groups.blocks if block in model.block_seconds)
+    largest = max(groups.seconds, default=0.0)
+    print(f"{len(groups.blocks)} tile blocks of up to {2 ** TILE_BLOCK_BITS} tiles, "
+          f"{measured_count} of them costed from their measured profile seconds and the rest "
+          f"from the model; "
+          f"the costliest is {largest / 60:.1f}m, which no worker's share can go below",
+          file=sys.stderr)
+
+    worker_count, blocks = _size_run(args, entries, gaps, model, setup_seconds, groups)
     write_worker_manifests(args.out_dir, blocks)
     write_source_metadata(args.out_dir, resolved_source, args.min_zoom, args.max_zoom,
                           header["tile_data_offset"])
@@ -128,9 +138,12 @@ def _settle_costs(args, resolved_source):
     partitioning and sizing used to be handed the axes and the profile costs
     separately, and partitioning quietly went without the second.
 
+    The profiles' seconds per tile block are settled here too, from the
+    block state for this archive and profile set, where there is any.
+
     Args:
         args: The parsed command line, read for its profiles, its state
-            document and any `--axis-seconds` override.
+            document, its block state and any `--axis-seconds` override.
         resolved_source: The archive this run will read.
 
     Returns:
@@ -155,7 +168,17 @@ def _settle_costs(args, resolved_source):
         print(f"costing: {line}", file=sys.stderr)
     for note in notes:
         print(f"::warning title=axis state::{note}", file=sys.stderr)
-    model = cost_model(axis=axis, profiles=profile_costs, transform_parallelism=parallelism)
+    block_seconds = {}
+    if args.block_state and args.profiles:
+        source_key = axis_key_for(resolved_source.url, resolved_source.schema.name)
+        profiles_key = profile_combo_key(profile.name for profile in args.profiles)
+        block_seconds = block_state.read_block_medians(args.block_state, source_key,
+                                                       profiles_key)
+        print(f"block state: {len(block_seconds)} tile blocks measured for "
+              f"{source_key}/{profiles_key}, each the median of up to "
+              f"{axis_state.HISTORY_LENGTH} runs", file=sys.stderr)
+    model = cost_model(axis=axis, profiles=profile_costs, transform_parallelism=parallelism,
+                       block_seconds=block_seconds)
     print(f"costing: one worker's pool buys {model.transform_parallelism:.2f}s of decode and "
           f"profile work per second of its wall clock", file=sys.stderr)
     return model, setup_seconds
@@ -176,7 +199,7 @@ def _tiles_line(blocks):
             f"({gap_tiles} of them gap tiles)")
 
 
-def _size_run(args, entries, gaps, model, setup_seconds):
+def _size_run(args, entries, gaps, model, setup_seconds, groups):
     """The worker count this run sized itself to, and its blocks.
 
     Args:
@@ -185,13 +208,14 @@ def _size_run(args, entries, gaps, model, setup_seconds):
         gaps: The gap records covering what the archive does not hold.
         model: The CostModel this run is priced by.
         setup_seconds: What a worker costs before it reaches its first record.
+        groups: The entries' TileBlockGroups under that model.
 
     Returns:
         The chosen worker count and its blocks. Every count tried is logged,
         so the log says which limit pushed the run to the count it landed on.
     """
     worker_count, blocks, _load, attempts = choose_worker_count(
-        entries, gaps, model, args.limits, setup_seconds=setup_seconds)
+        entries, gaps, model, args.limits, setup_seconds=setup_seconds, groups=groups)
     for tried, load, broken in attempts:
         verdict = f"{', '.join(broken)} over budget" if broken else "fits"
         print(f"sizing: {tried} workers, worst worker {load.seconds / 60:.0f}m predicted, "

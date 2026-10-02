@@ -6,6 +6,7 @@ from pmtiles.tile import tileid_to_zxy
 
 from tilealchemist.pmtiles_index import tile_id_bounds
 from tilealchemist.tile import Tile
+from tilealchemist.tile_blocks import tile_block
 from tilealchemist.throttle import UpdateLineThrottle
 
 
@@ -68,7 +69,7 @@ def _describe_entry(entry):
     return f"tile {zoom}/{column}/{row} (run of {entry.run_length} tiles)"
 
 
-def _entry_outputs(tile_data, entry, profiles, schema, usage):
+def _entry_outputs(tile_data, entry, profiles, schema, usage, block):
     """Decode one entry's tile and run every profile over it.
 
     Args:
@@ -77,6 +78,7 @@ def _entry_outputs(tile_data, entry, profiles, schema, usage):
         profiles: The profiles to run, in output order.
         schema: The schema the tile is encoded in.
         usage: The accounting to charge the decode and the transform to.
+        block: The tile block the profiles' seconds are charged to.
 
     Returns:
         One output per profile, in the same order, None where a profile
@@ -100,7 +102,7 @@ def _entry_outputs(tile_data, entry, profiles, schema, usage):
         finished = time.perf_counter()
         profile_seconds.append(finished - profile_start)
         profile_start = finished
-    usage.add_decode(len(tile_data), decode_seconds, profile_seconds)
+    usage.add_decode(len(tile_data), decode_seconds, profile_seconds, block)
     return outputs
 
 
@@ -134,11 +136,14 @@ def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progre
     for entry in batch_entries:
         # Offset order puts duplicate bytes adjacent, so one check dedupes for every profile.
         key = (entry.offset, entry.length)
+        block = tile_block(entry.tile_id)
         if key != previous_key:
             start = entry.offset - batch_offset
             outputs = _entry_outputs(blob[start:start + entry.length], entry, profiles, schema,
-                                      usage)
+                                      usage, block)
             previous_key = key
+        else:
+            usage.add_block(block, 0.0)
         usage.entries += 1
         transform_progress.tick(tileid_to_zxy(entry.tile_id))
         run_start = max(entry.tile_id, tile_id_start)

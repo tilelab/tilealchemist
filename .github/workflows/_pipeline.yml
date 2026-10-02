@@ -206,6 +206,9 @@ jobs:
           if [ -f .axis-state/state/axes.json ]; then
             ARGS+=(--axis-state .axis-state/state/axes.json)
           fi
+          if [ -d .axis-state/state/blocks ]; then
+            ARGS+=(--block-state .axis-state/state/blocks)
+          fi
           if [ -n "$SOURCE_URL" ]; then
             ARGS+=(--source-url "$SOURCE_URL")
           fi

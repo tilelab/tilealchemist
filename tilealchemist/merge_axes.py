@@ -10,7 +10,7 @@ import statistics
 import sys
 from datetime import datetime
 
-from tilealchemist import axis_state
+from tilealchemist import axis_state, block_state
 from tilealchemist.calibration import (
     measure_run,
     parse_usage_lines,
@@ -32,7 +32,9 @@ One writer for the whole run, the way tiledistillery's record-timings job is
 (see docs/ARCHITECTURE.md "Measuring a run"). It fits what the run measured,
 splits it by what each coefficient belongs to -- the archive, a profile, or
 neither -- and appends each to its own history on the state branch, where the
-next run reads the median of the last few.
+next run reads the median of the last few. The profiles' seconds per tile
+block go the same way, into a file of their own per archive and profile set
+(see "Measured tile blocks").
 
 It pushes nothing unless every worker reported: a partial run is a biased
 sample, because the workers that failed are the expensive ones.
@@ -86,6 +88,10 @@ def parse_args():
                               f"an empty orphan if it is not there yet")
     parser.add_argument("--state-path", default=DEFAULT_STATE_PATH,
                          help=f"the state file's path on that branch (default {DEFAULT_STATE_PATH})")
+    parser.add_argument("--block-state-dir", default=block_state.DEFAULT_BLOCK_STATE_DIR,
+                         help="directory on that branch holding the per-tile-block seconds, one "
+                              "file per archive and profile set (default "
+                              f"{block_state.DEFAULT_BLOCK_STATE_DIR})")
     parser.add_argument("--out", default=None,
                          help="also write the merged document here, for a caller that wants it "
                               "as a job artifact")
@@ -214,7 +220,7 @@ def main():
     for note in measurement.notes:
         print(f"::warning title=merge-axes::{note}", file=sys.stderr)
 
-
+    blocks = _measure_blocks(rows, seen)
     build = read_source_metadata(args.source).build if args.source else None
 
     def mutate(document):
@@ -232,8 +238,24 @@ def main():
             print(line, file=sys.stderr)
         return document
 
+    def mutate_blocks(document):
+        """Append this run's per-block seconds to whatever the branch already held.
+
+        Args:
+            document: The block document as read.
+
+        Returns:
+            The document to write back.
+        """
+        if not document:
+            document = block_state.empty_document(blocks.source_key, blocks.profiles)
+        print(block_state.record_blocks(document, blocks, build=build), file=sys.stderr)
+        return document
+
     if args.dry_run or not (args.repo and args.token):
         document = mutate(axis_state.empty_document())
+        if blocks:
+            mutate_blocks({})
         if not args.dry_run:
             print("::error::--repo and --token are needed to push; pass --dry-run to fit only",
                   file=sys.stderr)
@@ -249,9 +271,46 @@ def main():
     print(f"pushed to {args.repo}@{args.state_branch}:{args.state_path}; the shallowest "
           f"coefficient now rests on {depth} run(s) of {axis_state.HISTORY_LENGTH}",
           file=sys.stderr)
+    if blocks:
+        block_path = block_state.block_state_path(args.block_state_dir, blocks.source_key,
+                                                  blocks.profiles)
+        update_json(args.repo, args.token, args.state_branch, block_path, mutate_blocks,
+                    message=f"record {len(blocks.seconds)} tile blocks from {seen} workers",
+                    compact=True)
+        print(f"pushed to {args.repo}@{args.state_branch}:{block_path}", file=sys.stderr)
     if args.out:
         _write_out(args.out, document)
     return 0
+
+
+def _measure_blocks(rows, workers):
+    """The run's per-block seconds, where every worker reported them.
+
+    Args:
+        rows: Parsed usage rows for the whole run.
+        workers: How many workers reported at all.
+
+    Returns:
+        The BlockMeasurement, or None where it must not be recorded: no worker
+        reported blocks, only some did, or the rows mix two runs. Each of those
+        is a warning rather than a failure, costing the block history and
+        nothing else.
+    """
+    try:
+        blocks = block_state.measure_blocks(rows)
+    except ValueError as error:
+        print(f"::warning title=merge-axes::{error}; block seconds not recorded", file=sys.stderr)
+        return None
+    if blocks is None:
+        print("no worker reported per-block seconds; block history not recorded",
+              file=sys.stderr)
+        return None
+    if blocks.workers != workers:
+        print(f"::warning title=merge-axes::{blocks.workers} of {workers} workers reported "
+              f"per-block seconds; a partial set is a biased sample, so the block history "
+              f"is not recorded", file=sys.stderr)
+        return None
+    return blocks
 
 
 def _write_out(path, document):

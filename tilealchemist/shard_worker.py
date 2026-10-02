@@ -13,6 +13,7 @@ from tilealchemist.mbtiles import (
 )
 from tilealchemist.ranged_fetch import make_session
 from tilealchemist.schemas import SCHEMAS
+from tilealchemist.tile_blocks import format_block_seconds, profile_combo_key
 from tilealchemist.transform_pool import run_transform
 from tilealchemist.usage import PhaseSeconds, TransformUsage, report
 
@@ -99,6 +100,8 @@ def _report_worker_usage(args, profiles, counts, phases, wall_start, totals, usa
     -- the seconds its `transform_tile()` took, and the bytes its output came to
     -- goes on its own line, where the fit can key it by profile. Everything
     that belongs to the archive or the runner instead goes on the worker's line.
+    The profiles' seconds per tile block go on a third, written to the usage
+    file only.
 
     Args:
         args: The parsed command line.
@@ -134,6 +137,11 @@ def _report_worker_usage(args, profiles, counts, phases, wall_start, totals, usa
     lines.append(report("worker", worker=args.worker_index, wall_seconds=wall_seconds,
                         setup_seconds=wall_seconds - phases.total(),
                         **totals, **usage.fields(), **phases.fields()))
+    # Hundreds of blocks per worker: into the usage file, not the log.
+    lines.append(report("blocks", echo=False, worker=args.worker_index,
+                        source_key=totals["source_key"],
+                        profiles=profile_combo_key(profile.name for profile in profiles),
+                        seconds=format_block_seconds(usage.block_seconds)))
     if args.usage_out:
         # A file, not just the log: the job that fits these has artifacts, not log scrape access.
         with open(args.usage_out, "w", encoding="utf-8") as handle:

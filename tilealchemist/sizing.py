@@ -3,7 +3,11 @@ from collections import namedtuple
 
 from tilealchemist.cost import DEFAULT_COST_MODEL, WORKER_SETUP_SECONDS, cost_weights
 from tilealchemist.fetch_batching import peak_batch_bytes
-from tilealchemist.partition import count_output_tiles, partition_into_worker_blocks
+from tilealchemist.partition import (
+    count_output_tiles,
+    partition_into_worker_blocks,
+    tile_block_groups,
+)
 
 # GitHub queues past ~20 concurrently running jobs on a public repo, so a run goes in waves.
 DEFAULT_CONCURRENCY = 20
@@ -123,7 +127,7 @@ def candidate_worker_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
 
 def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL, limits=DEFAULT_LIMITS,
                         cell_limit=MATRIX_CELL_LIMIT,
-                        setup_seconds=WORKER_SETUP_SECONDS):
+                        setup_seconds=WORKER_SETUP_SECONDS, groups=None):
     """Pick the first worker count whose worst worker stays inside the limits.
 
     Partitions at the concurrency limit and doubles until every limit holds,
@@ -140,6 +144,8 @@ def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL, limits=DEFAULT_
         limits: The run's hard limits.
         cell_limit: The most matrix cells a run may have.
         setup_seconds: What a worker costs before it reaches its first record.
+        groups: The entries' TileBlockGroups under the same model, where the
+            caller already grouped them; grouped here, once, otherwise.
 
     Returns:
         The chosen count, its blocks, its worst load, and every
@@ -147,8 +153,10 @@ def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL, limits=DEFAULT_
         count fits, the largest is returned with the limits it still breaks.
     """
     attempts = []
+    if groups is None:
+        groups = tile_block_groups(entries, model)
     for worker_count in candidate_worker_counts(limits, cell_limit):
-        blocks = partition_into_worker_blocks(entries, gaps, worker_count, model)
+        blocks = partition_into_worker_blocks(entries, gaps, worker_count, model, groups)
         load = worst_load(blocks, model, setup_seconds)
         broken = breaches(load, limits)
         attempts.append((worker_count, load, broken))

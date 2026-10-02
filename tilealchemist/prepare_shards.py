@@ -119,6 +119,13 @@ def parse_args():
                               "and replace both the reviewed ones and each profile's declared "
                               "per-tile figures, for the archive this run reads. A missing file "
                               "is not an error: the first run has nothing measured yet")
+    parser.add_argument("--block-state", default=None,
+                         help="the state branch's state/blocks directory, as "
+                              "tilealchemist-merge-axes writes it: the profiles' measured "
+                              "seconds per tile block, one file per archive and profile set. A "
+                              "measured block is costed by the median of its own runs instead "
+                              "of by the profiles' per-tile seconds. A missing directory or "
+                              "file is not an error: nothing has been measured yet")
     parser.add_argument("--attribution", default=None,
                          help="what the built layer credits, as a template in which "
                               "`{source}` stands for the attribution the archive declares "

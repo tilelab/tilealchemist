@@ -19,7 +19,7 @@ def _format(value):
     return f"{value:.6f}" if isinstance(value, float) else str(value)
 
 
-def report(scope, **fields):
+def report(scope, *, echo=True, **fields):
     """Print one greppable usage line.
 
     One line per scope, so that a whole run's budget is one `grep '^usage:'`
@@ -27,6 +27,8 @@ def report(scope, **fields):
 
     Args:
         scope: What the line is about, such as "profile" or "worker".
+        echo: Whether to print it at all. A line too long to be worth reading
+            in a log is only returned, for the usage file.
         **fields: The measurements to print, as `name=value` pairs.
 
     Returns:
@@ -35,7 +37,8 @@ def report(scope, **fields):
     """
     formatted = " ".join(f"{name}={_format(value)}" for name, value in fields.items())
     line = f"usage: scope={scope} {formatted}"
-    print(line, file=sys.stderr)
+    if echo:
+        print(line, file=sys.stderr)
     return line
 
 
@@ -112,6 +115,9 @@ class TransformUsage:
             the same tiles.
         buckets: Per-bucket `[calls, bytes, decode]`, bucketed by the bit length
             of the tile, which is the shape the decode axes are fitted against.
+        block_seconds: Seconds every profile spent together, per tile block.
+            A block whose entries were all deduplicated against an earlier
+            decode is recorded at zero, which is a measurement, not a hole.
     """
 
     def __init__(self, profile_count=0):
@@ -129,15 +135,27 @@ class TransformUsage:
         self.profile_seconds = [0.0] * profile_count
         self.profile_output_bytes = [0] * profile_count
         self.buckets = [[0, 0, 0.0] for _ in range(LENGTH_BUCKET_COUNT)]
+        self.block_seconds = {}
 
-    def add_decode(self, length, decode_seconds, profile_seconds):
+    def add_block(self, block, seconds):
+        """Charge profile seconds to one tile block.
+
+        Args:
+            block: The block's key, as `tile_block()` gives it.
+            seconds: The seconds to add, zero to record the block as walked.
+        """
+        self.block_seconds[block] = self.block_seconds.get(block, 0.0) + seconds
+
+    def add_decode(self, length, decode_seconds, profile_seconds, block):
         """Record one tile's decode, and what each profile spent on it.
 
         Args:
             length: The tile's source bytes.
             decode_seconds: Seconds spent decoding it.
             profile_seconds: Seconds each profile spent on it, in profile order.
+            block: The tile block the profiles' seconds are charged to.
         """
+        self.add_block(block, sum(profile_seconds))
         self.decode_calls += 1
         self.decoded_bytes += length
         self.decode_seconds += decode_seconds
@@ -171,6 +189,8 @@ class TransformUsage:
             bucket[0] += addend[0]
             bucket[1] += addend[1]
             bucket[2] += addend[2]
+        for block, seconds in other.block_seconds.items():
+            self.add_block(block, seconds)
 
     def transform_seconds(self):
         """What every profile spent together.
@@ -196,7 +216,8 @@ class TransformUsage:
         """These measurements as usage-line fields.
 
         The per-profile seconds are left out: they belong on the `scope=profile`
-        line, which is already keyed by the profile they were measured on.
+        line, which is already keyed by the profile they were measured on. So
+        are the per-block seconds, which have a `scope=blocks` line of their own.
 
         Returns:
             A mapping of field name to value.

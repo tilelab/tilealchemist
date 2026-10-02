@@ -1,6 +1,8 @@
 """What one manifest record costs a worker, in seconds; see docs/ARCHITECTURE.md "Parallelism"."""
 from collections import namedtuple
 
+from tilealchemist.tile_blocks import tile_block
+
 # The 39s floor across a planet run's 128 workers: runner boot, artifact download, pip install.
 WORKER_SETUP_SECONDS = 39.0
 
@@ -33,13 +35,14 @@ DEFAULT_WRITTEN_SHARE = 1.0
 DEFAULT_TRANSFORM_PARALLELISM = 1.0
 
 # Everything a prediction is made from, so that no two callers can price a run differently.
-CostModel = namedtuple("CostModel", "axis profiles transform_parallelism")
+CostModel = namedtuple("CostModel", "axis profiles transform_parallelism block_seconds")
 
 
-def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None):
+def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None,
+               block_seconds=None):
     """Assemble what a run is priced by.
 
-    The three travel together because splitting them is how they drift apart:
+    These travel together because splitting them is how they drift apart:
     `partition_by_cost()` once balanced on the axes alone while `worst_load()`
     sized on the axes *and* the profiles, so a run was split by one model and
     judged by another.
@@ -50,6 +53,10 @@ def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None):
             prices tilealchemist's own work alone.
         transform_parallelism: Seconds of in-pool work one second of a
             worker's wall clock buys, or None for a worker with no pool.
+        block_seconds: The pooled profile seconds measured per tile block for
+            this run's archive and profile set, or None where nothing was
+            measured. A measured block's figure replaces the profiles'
+            per-tile seconds for every record in it.
 
     Returns:
         The CostModel to price with.
@@ -57,7 +64,8 @@ def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None):
     return CostModel(axis=axis, profiles=profiles,
                      transform_parallelism=(DEFAULT_TRANSFORM_PARALLELISM
                                             if transform_parallelism is None
-                                            else transform_parallelism))
+                                            else transform_parallelism),
+                     block_seconds=block_seconds or {})
 
 
 DEFAULT_COST_MODEL = cost_model()
@@ -81,6 +89,13 @@ def _record_costs(model, records):
     while `fetch_batch_blob()` and `ShardWriter.write()` run in the worker
     itself, one batch at a time.
 
+    Where the model carries a measurement for a record's tile block, the
+    profiles' share is that measurement instead, charged once on the block's
+    first record and nothing on the rest: the block is what was measured, and
+    a partition that keeps blocks whole never needs it spread any finer.
+    Records arrive in offset order, where one block's records are interleaved
+    with others', so "first" means the first seen, not the first in a run.
+
     Args:
         model: The CostModel to price with.
         records: Manifest records, in the order a worker will walk them.
@@ -92,18 +107,27 @@ def _record_costs(model, records):
     pooled_per_tile = profile_seconds(model.profiles) / model.transform_parallelism
     write_seconds = axis.written_byte * written_bytes_per_tile(model.profiles)
     gap_write_seconds = axis.written_byte * gap_bytes_per_tile(model.profiles)
+    measured = model.block_seconds
+    charged_blocks = set()
     previous_key = None
     for record in records:
         if not record.length:
             yield axis.manifest_record + gap_write_seconds * record.run_length
             continue
-        key = (record.offset, record.length)
         entry = 0.0
+        block_measured = False
+        if measured:
+            block = tile_block(record.tile_id)
+            block_measured = block in measured
+            if block_measured and block not in charged_blocks:
+                entry += measured[block] / model.transform_parallelism
+                charged_blocks.add(block)
+        key = (record.offset, record.length)
         if key != previous_key:
-            entry = (axis.fetched_byte * record.length
-                     + (axis.decode_call + axis.decoded_byte * record.length)
-                     / model.transform_parallelism
-                     + pooled_per_tile)
+            entry += (axis.fetched_byte * record.length
+                      + (axis.decode_call + axis.decoded_byte * record.length)
+                      / model.transform_parallelism
+                      + (0.0 if block_measured else pooled_per_tile))
             previous_key = key
         yield axis.manifest_record + entry + write_seconds * record.run_length
 

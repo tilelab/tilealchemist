@@ -276,8 +276,9 @@ across a worker's own CPU cores via `--transform-workers` (default: all
 available cores; `1` disables pooling and runs everything in the worker
 process).
 `real_entries` is split into contiguous chunks by `partition.py`'s
-`partition_by_cost()`, the same function that splits work across workers,
-deliberately producing several times more chunks than there are processes
+`partition_by_cost()`, the same function that splits a run's gaps across
+workers (its real entries go by whole tile blocks; see "Measured tile
+blocks"), deliberately producing several times more chunks than there are processes
 (`TRANSFORM_CHUNKS_PER_WORKER`). Both halves of that matter.
 
 ### What a record costs
@@ -442,7 +443,9 @@ What is missing is content complexity. A dense coastline tile costs far
 more to clip and union than an open-ocean tile of the same byte length, and
 nothing in a manifest record exposes that -- the same effect the
 over-chunking below exists to absorb. Treat the printed prediction as a
-ranking signal, not an estimate.
+ranking signal, not an estimate -- for the profiles' share, which is where the
+content complexity lives, "Measured tile blocks" replaces it with what the
+same piece of the world actually cost last time.
 
 Two further cautions on the fit. The run it is fitted against was itself
 partitioned by the normalized model, so the predictors are correlated by
@@ -491,7 +494,7 @@ reports what it actually did. `usage.py` prints one `usage:` line per scope,
 in `name=value` form: a whole run's budget is one `grep '^usage:'` over the
 job logs, and that grep is what the next run's coefficients are fitted from.
 
-Two scopes:
+Two scopes in the log, and a third in the usage file alone:
 
 - **`scope=profile`**, one per profile per worker: `written`, `skipped`,
   `blobs`, `transform_seconds`, `output_bytes`, `gap_tiles`, `gap_skipped`,
@@ -510,6 +513,10 @@ Two scopes:
   fetched, entry counts, and the decode totals including `length_hist`.
   `PhaseSeconds` nests exclusively, so the `write` time spent inside the
   transform loop is not also counted as `transform`.
+- **`scope=blocks`**, one per worker, written to `--usage-out` and never
+  printed: the profiles' seconds summed per tile block, as
+  `block:seconds|...`. It is hundreds of blocks per worker, which is a file's
+  business and not a log's; see "Measured tile blocks".
 
 **There used to be a third, `scope=chunk`, one line per transform chunk, and
 it was removed.** The reasoning for it recorded here was that
@@ -587,12 +594,15 @@ The whole loop, in the order it runs:
    reviewed one only where nothing was measured, and hands each profile its own
    measured `seconds_per_tile` and `bytes_per_output_tile` in place of what the
    profile declared. That is what the run is then partitioned and sized by.
+   Where `state/blocks/` exists it also passes that as `--block-state`, for the
+   profiles' measured seconds per tile block.
 2. **Each worker** writes its two-or-more `usage:` lines to `--usage-out` as
    well as to its log, and uploads that file. A file, not a log scrape: the job
    that fits these has artifacts, not log access.
 3. **`merge-axes`** is the single writer, the way tiledistillery's
    `record-timings` is. It collects every worker's file, fits the run, appends
-   one observation per coefficient to its own ring buffer, and pushes. It
+   one observation per coefficient to its own ring buffer, and pushes -- and
+   the same for every tile block, into its archive and profile set's own file. It
    refuses to push unless `--expect-workers` matches what reported, because a
    partial run is a biased sample -- the workers that failed are the expensive
    ones. A complete run is always pushed: a new measurement describes the
@@ -1010,14 +1020,15 @@ the other's. The byte term is the bucket's byte total outright, decode being
 linear in length; the sweep that used to search for an exponent there is gone
 with it.
 
-This borrows tiledistillery's mechanism but not its unit. `leaves.py` looks
-each Geofabrik region up in `timings.json`, where a measurement *beats* the
-model; the fitted `seconds_per_byte` exists only to place regions that were
-never built. tilealchemist's unit of work is a worker block recomputed every
-run, so `worker-042.bin` means something different next time and there is no
-key to hang a per-block measurement on. Only the *coefficients* carry over --
-but those do have stable keys, the archive and the profile, and that is what
-the state branch files them under. The ring buffer, the median, the
+This borrows tiledistillery's mechanism. `leaves.py` looks each Geofabrik
+region up in `timings.json`, where a measurement *beats* the model; the fitted
+`seconds_per_byte` exists only to place regions that were never built. A
+worker block is recomputed every run, so `worker-042.bin` means something
+different next time and is no key to hang a measurement on -- but a fixed
+range of tile ids is, and "Measured tile blocks" is the per-region half of
+tiledistillery's scheme built on that. The coefficients here are the other
+half, the fallback, and they have stable keys too: the archive and the
+profile, which is what the state branch files them under. The ring buffer, the median, the
 single-writer job and the orphan `state` branch are all the same shapes
 tiledistillery uses, down to `HISTORY_LENGTH = 5`.
 
@@ -1084,6 +1095,95 @@ what the earlier normalized model could not survive ("a z0..z11 ocean-heavy
 range is almost all sqlite inserts, a high-zoom extract is almost all
 decode"), which makes it the training set that separates the coefficients
 rather than the one that confounds them.
+
+### Measured tile blocks
+
+The coefficients above price a record by what its manifest entry says, and a
+manifest entry cannot say how hard a tile is to clip: R² 0.29, and the slow
+tail under-predicted 2-4x (see "What the model still cannot see"). What *can*
+say it is the last run that built the same tiles. So the profiles' seconds are
+measured per **tile block** and kept, and the next run charges a block what it
+cost last time instead of `seconds_per_tile` times its distinct entries.
+
+**A block is a fixed range of tile ids, not a piece of a partition.**
+`tile_blocks.tile_block()` cuts every zoom level into runs of
+`2 ** TILE_BLOCK_BITS` = 4096 consecutive Hilbert indices, a quadtree cell:
+one z8 cell at z14, one z7 cell at z13, and the whole level from z6 down. Its
+key is its first tile id. That depends on nothing but the tile id, so a block
+is the same piece of the world in every run -- whichever archive build, zoom
+range or worker count the run has -- which is exactly the stable key a worker
+block lacks. A z0..z14 run has about 87K of them.
+
+**Only the profiles' share is measured; fetch and decode stay modelled.** The
+two halves differ in kind. Fetch and decode are linear in the bytes, and this
+run's manifest knows its bytes exactly, for this build; last month's
+measurement of them would be strictly worse. Fetch also happens per range
+request, not per block, and has no clean per-block figure at all. The profiles'
+shapely is the part no manifest predicts, so that is the part a block carries.
+
+**The key is the archive and the whole profile set**, as
+`state/blocks/<source key>/<profile set>.json`, with the set as
+`profile_combo_key()` gives it (`cropped-waterways+land`). Not the profile
+alone: profiles share derived work through `Tile.derived()` -- the water
+union, for one -- and whichever runs first is billed for it, so one profile's
+seconds only mean anything beside the same others. Not the profile alone
+across archives either: the same profile clips different geometry out of
+OpenMapTiles than out of Protomaps tiles. A new combination starts with
+nothing measured, and the model carries it until it has run once.
+
+**How a block is measured.** `transform.py` already clocks every profile per
+distinct entry; `TransformUsage.add_block()` also adds the sum to that entry's
+block. An entry deduplicated against the decode before it adds zero, which
+still records the block as walked, so "costs nothing" stays distinct from
+"never measured". The figures are pooled seconds, summed across the worker's
+process pool, and are divided by `transform_parallelism` when charged, the same
+as the per-tile coefficient they replace. Each worker writes them as its
+`scope=blocks` line, `merge-axes` sums them across workers -- a block split
+between two workers, by a run partitioned before blocks were the unit, still
+comes to one figure -- and appends one observation per block to that block's
+own history, `HISTORY_LENGTH` deep, the median read back. It records nothing
+unless every worker that reported also reported blocks: same biased-sample
+rule as the coefficients.
+
+**How a block is charged.** `cost.py` charges a measured block's figure once,
+on the first of its records it meets, and drops `seconds_per_tile` from every
+record in it; a block with no measurement keeps the per-tile charge. "First it
+meets" and not "first in a run" because records travel in offset order,
+which is what a worker fetches by, and in offset order one block's records
+are interleaved with others': a deduplicated tile points back at the blob its
+first copy wrote, however far away that is.
+
+**How a run is split.** `partition_by_tile_block()` hands out whole blocks in
+tile-id order and fills each worker until the next block would overrun its
+share, then starts the next worker. The shares end at fixed points of the
+run's cumulative cost, `total * (i + 1) / N`, rather than at a per-worker
+budget, so what one worker leaves short is the next one's to take instead of
+piling up on the last. A block is never split, which keeps "what this block
+cost" a figure one worker measured whole. Each worker's records are then
+routed back out in offset order, so its manifest is still offset-sorted for
+the fetch batching. `tile_block_groups()` does the grouping once per run --
+one group index per record, in an `array('I')` -- and every worker count the
+sizing tries reuses it. Gaps are still split by record, having no profile
+seconds to measure.
+
+The price of an indivisible block is that no worker's share can go below the
+costliest one, and `prepare-shards` prints that figure beside how many of the
+run's blocks were measured. Measured on a z0..z6 OpenFreeMap run of `land` +
+`cropped_waterways` at two workers, the z6 block alone cost 99.7 pooled
+seconds against 6.4 for z0..z5 together. The reviewed model predicted the two
+workers at 1.1m and 1.2m, nearly even; they ran 9.8s and 57.8s. Re-planned
+from that one measurement it predicts 1.2m and 2.7m -- the right way round,
+the remaining overshoot being the modelled fetch and decode and a
+`transform_parallelism` that run had no state for. At planet scale a share is
+minutes and a z14 block seconds, so the bound is the low zooms, each a single
+block; a smaller `TILE_BLOCK_BITS` is the lever if they turn out to bind.
+
+**The file outgrows the contents API's 1 MB.** Five observations for ~87K
+blocks is a few MB even written compact, which `write_json(compact=True)` does
+for this file. Reading back past 1 MB the contents API answers only with the
+`object` media type and no content, so `read_json()` asks for that and falls
+back to the git blob API, which serves up to 100 MB. The write side has no
+documented limit short of that, but has not been exercised at full size yet.
 
 ### Sizing a run
 
