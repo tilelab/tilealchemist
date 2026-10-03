@@ -33,13 +33,16 @@ class OpenFreeMapSource(Source):
         for line in response.text.splitlines():
             match = PLANET_RE.match(line.strip())
             if match:
-                by_timestamp.setdefault(match.group(1), set()).add(match.group(2))
+                by_timestamp.setdefault(match.group(1), set()).add(
+                    match.group(2))
 
         # The newest directory listed is not necessarily finished converting.
         ready = [timestamp for timestamp, files in by_timestamp.items()
                  if "done" in files and "tiles.pmtiles" in files]
         if not ready:
-            raise RuntimeError(f"no fully-published planet build found in {FILES_URL}")
+            raise RuntimeError(
+                f"no fully-published planet build found in {FILES_URL}")
         latest = max(ready)
-        return ResolvedSource(f"{BASE_URL}areas/planet/{latest}_pt/tiles.pmtiles", latest,
-                              self.schema)
+        return ResolvedSource(
+            f"{BASE_URL}areas/planet/{latest}_pt/tiles.pmtiles", latest,
+            self.schema)

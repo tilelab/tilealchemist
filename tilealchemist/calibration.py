@@ -1,4 +1,4 @@
-"""Fitting the next run's cost coefficients from the last run's `usage:` lines."""
+"""Fitting the next run's cost coefficients from the last run's usage lines."""
 import json
 import math
 from collections import namedtuple
@@ -9,18 +9,21 @@ from tilealchemist.cost import (AXIS_SECONDS, DEFAULT_TRANSFORM_PARALLELISM,
 # What the archive costs: its fetch rate, and what its tiles cost to decode.
 SourceAxes = namedtuple("SourceAxes", "fetched_byte decode_call decoded_byte")
 
-# What belongs to neither: tilealchemist's own bookkeeping, the runner's disk, and its cores.
+# What belongs to neither: tilealchemist's own bookkeeping, the runner's disk,
+# and its cores.
 SharedAxes = namedtuple(
-    "SharedAxes", "manifest_record written_byte worker_setup_seconds transform_parallelism")
+    "SharedAxes",
+    "manifest_record written_byte worker_setup_seconds transform_parallelism")
 
 REVIEWED_SOURCE = SourceAxes(fetched_byte=AXIS_SECONDS.fetched_byte,
                              decode_call=AXIS_SECONDS.decode_call,
                              decoded_byte=AXIS_SECONDS.decoded_byte)
 
-REVIEWED_SHARED = SharedAxes(manifest_record=AXIS_SECONDS.manifest_record,
-                             written_byte=AXIS_SECONDS.written_byte,
-                             worker_setup_seconds=WORKER_SETUP_SECONDS,
-                             transform_parallelism=DEFAULT_TRANSFORM_PARALLELISM)
+REVIEWED_SHARED = SharedAxes(
+    manifest_record=AXIS_SECONDS.manifest_record,
+    written_byte=AXIS_SECONDS.written_byte,
+    worker_setup_seconds=WORKER_SETUP_SECONDS,
+    transform_parallelism=DEFAULT_TRANSFORM_PARALLELISM)
 
 RunMeasurement = namedtuple(
     "RunMeasurement", "source_key source shared diagnostics notes")
@@ -117,7 +120,7 @@ def length_buckets(worker_rows):
 
 
 def _fit_two(samples):
-    """Least-squares fit of a two-term model with no intercept, neither term negative.
+    """Least-squares fit of two terms, no intercept, neither term negative.
 
     Both terms are costs, so a negative one is not a finding but the fit
     buying a better line with a price nobody pays. Decode is the case that
@@ -152,7 +155,7 @@ def _fit_two(samples):
         return one, two
 
     def excess(one, two):
-        """The squared error of a candidate, less the constant every candidate shares."""
+        """The squared error of a candidate, less the shared constant."""
         return (one * one * left + 2 * one * two * cross + two * two * right
                 - 2 * (one * first + two * second))
 
@@ -195,7 +198,8 @@ def _adopted(name, measured, reviewed, notes):
         The value to use.
     """
     if measured is None or not math.isfinite(measured) or measured < 0:
-        notes.append(f"{name}: nothing usable measured, keeping the reviewed {reviewed:g}")
+        notes.append(f"{name}: nothing usable measured, keeping the reviewed "
+                     f"{reviewed:g}")
         return reviewed
     return measured
 
@@ -211,7 +215,8 @@ def source_key_of(rows):
         said. Disagreement means two runs' logs were concatenated, and no fit
         should treat that as one archive.
     """
-    keys = {row["source_key"] for row in _scoped(rows, "worker") if "source_key" in row}
+    keys = {row["source_key"] for row in _scoped(rows, "worker")
+            if "source_key" in row}
     return keys.pop() if len(keys) == 1 else None
 
 
@@ -226,11 +231,12 @@ def measure_source(rows):
         measured.
     """
     workers = _scoped(rows, "worker")
-    fetched = _ratio(_total(workers, "fetch_seconds"), _total(workers, "fetched_bytes"))
-    decode_fit = _fit_two(_entry_samples(length_buckets(workers)))
-    return SourceAxes(fetched_byte=fetched,
-                      decode_call=decode_fit[0] if decode_fit else None,
-                      decoded_byte=decode_fit[1] if decode_fit else None)
+    fetched = _ratio(_total(workers, "fetch_seconds"),
+                     _total(workers, "fetched_bytes"))
+    decode_samples = _entry_samples(length_buckets(workers))
+    decode_call, decoded_byte = _fit_two(decode_samples) or (None, None)
+    return SourceAxes(fetched_byte=fetched, decode_call=decode_call,
+                      decoded_byte=decoded_byte)
 
 
 def measure_transform_parallelism(rows):
@@ -254,9 +260,13 @@ def measure_transform_parallelism(rows):
         measurement, not an error.
     """
     workers, profiles = _scoped(rows, "worker"), _scoped(rows, "profile")
-    pooled = _total(workers, "decode_seconds") + _total(profiles, "transform_seconds")
-    # It divides every pooled second, so a run that pooled none has measured nothing.
-    return _ratio(pooled, _total(workers, "transform_seconds")) if pooled else None
+    pooled = (_total(workers, "decode_seconds")
+              + _total(profiles, "transform_seconds"))
+    # It divides every pooled second, so a run that pooled none has measured
+    # nothing.
+    if not pooled:
+        return None
+    return _ratio(pooled, _total(workers, "transform_seconds"))
 
 
 def measure_shared(rows, runner_overhead_seconds=None):
@@ -273,15 +283,19 @@ def measure_shared(rows, runner_overhead_seconds=None):
         measured.
     """
     workers, profiles = _scoped(rows, "worker"), _scoped(rows, "profile")
-    setup_fit = _fit_two([(1.0, float(row.get("real_entries", 0)) + float(
-        row.get("gap_entries", 0)), float(row["setup_seconds"]))
-        for row in workers if "setup_seconds" in row])
-    # The in-process residual only: a log cannot see runner boot, artifact download or pip.
-    in_process_setup = setup_fit[0] if setup_fit else None
+    setup_samples = [
+        (1.0,
+         float(row.get("real_entries", 0)) + float(row.get("gap_entries", 0)),
+         float(row["setup_seconds"]))
+        for row in workers if "setup_seconds" in row]
+    # The in-process residual only: a log cannot see runner boot, artifact
+    # download or pip.
+    in_process_setup, manifest_record = _fit_two(setup_samples) or (None, None)
     # Payload bytes, real and gap alike: both were written, and both took time.
-    written_bytes = _total(profiles, "output_bytes") + _total(profiles, "gap_bytes")
+    written_bytes = (_total(profiles, "output_bytes")
+                     + _total(profiles, "gap_bytes"))
     return SharedAxes(
-        manifest_record=setup_fit[1] if setup_fit else None,
+        manifest_record=manifest_record,
         written_byte=_ratio(_total(workers, "write_seconds"), written_bytes),
         worker_setup_seconds=(None if in_process_setup is None
                               or runner_overhead_seconds is None
@@ -310,12 +324,13 @@ def measure_run(rows, runner_overhead_seconds=None):
     notes = []
     key = source_key_of(rows)
     if key is None:
-        notes.append("source_key: the workers do not agree on one archive, so the archive's "
-                     "own coefficients cannot be filed")
+        notes.append("source_key: the workers do not agree on one archive, so "
+                     "the archive's own coefficients cannot be filed")
     if runner_overhead_seconds is None:
-        notes.append("worker_setup_seconds: a worker's log cannot see runner boot, artifact "
-                     "download or pip install, so this needs the runner overhead, which "
-                     "merge-axes reads off the run's job timings given `actions: read`")
+        notes.append("worker_setup_seconds: a worker's log cannot see "
+                     "runner boot, artifact download or pip install, so this "
+                     "needs the runner overhead, which merge-axes reads off "
+                     "the run's job timings given `actions: read`")
     diagnostics = {
         "workers": len(workers),
         "profile_rows": len(profiles),
@@ -342,7 +357,8 @@ def adopt_group(measured, reviewed, notes, prefix=""):
         A group of the same type, every field usable.
     """
     return type(reviewed)(**{
-        name: _adopted(prefix + name, getattr(measured, name), getattr(reviewed, name), notes)
+        name: _adopted(prefix + name, getattr(measured, name),
+                       getattr(reviewed, name), notes)
         for name in reviewed._fields})
 
 
@@ -380,13 +396,15 @@ def axis_seconds_from_json(data):
     axis = data["axis_seconds"] if "axis_seconds" in data else data
     missing = [name for name in AxisSeconds._fields if name not in axis]
     if missing:
-        raise ValueError(f"no {', '.join(missing)} in the calibration; it must carry all "
-                         f"{len(AxisSeconds._fields)} coefficients")
-    return AxisSeconds(**{name: float(axis[name]) for name in AxisSeconds._fields})
+        raise ValueError(f"no {', '.join(missing)} in the calibration; it "
+                         f"must carry all {len(AxisSeconds._fields)} "
+                         f"coefficients")
+    return AxisSeconds(**{name: float(axis[name])
+                          for name in AxisSeconds._fields})
 
 
 def load_calibration_file(path):
-    """Read a flat calibration file, as `tilealchemist-calibrate --out` writes it.
+    """Read a flat calibration file, as `tilealchemist-calibrate` writes it.
 
     Args:
         path: The file to read.
@@ -432,10 +450,11 @@ def proposal_lines(measurement):
         The lines to print, header first.
     """
     lines = [f"{'coefficient':<26}{'reviewed':>14}{'measured':>14}"]
-    lines.extend(_group_lines(f"source {measurement.source_key}", measurement.source,
-                              REVIEWED_SOURCE))
+    lines.extend(_group_lines(f"source {measurement.source_key}",
+                              measurement.source, REVIEWED_SOURCE))
     lines.extend(_group_lines("shared", measurement.shared, REVIEWED_SHARED))
     share = measurement.diagnostics.get("decode_share")
     if share is not None:
-        lines.append(f"decode is {share:.1%} of per-entry CPU, the profiles {1 - share:.1%}")
+        lines.append(f"decode is {share:.1%} of per-entry CPU, the profiles "
+                     f"{1 - share:.1%}")
     return lines

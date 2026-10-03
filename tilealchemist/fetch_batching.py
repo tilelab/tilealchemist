@@ -7,7 +7,8 @@ from collections import namedtuple
 
 from tilealchemist.ranged_fetch import DownloadProgress, fetch_range
 
-# 8 MB: below this, skipping unread bytes on an open connection beats another round trip.
+# 8 MB: below this, skipping unread bytes on an open connection beats another
+# round trip.
 DEFAULT_MAX_FETCH_GAP = 8 * 1024 * 1024
 
 # One range request's worth of entries; see docs/ARCHITECTURE.md "Fetching".
@@ -16,11 +17,12 @@ Batch = namedtuple("Batch", "offset length entries")
 
 def plan_fetch_batches(real_entries, max_fetch_gap):
     """Entries as one Batch per range request."""
-    return [_batch(entries) for entries in _split_on_wide_holes(real_entries, max_fetch_gap)]
+    return [_batch(entries)
+            for entries in _split_on_wide_holes(real_entries, max_fetch_gap)]
 
 
 def peak_batch_bytes(entries, max_fetch_gap=DEFAULT_MAX_FETCH_GAP):
-    """The largest single range request these entries will need, by plan_fetch_batches' rule.
+    """The largest range request these entries need under plan_fetch_batches.
 
     Measured rather than planned: the planner asks this of whole blocks it
     has not batched and will not fetch, so it walks the entries by the same
@@ -59,7 +61,8 @@ def _split_on_wide_holes(real_entries, max_fetch_gap):
     """
     entries, reach = [], 0
     for entry in real_entries:
-        # A running end, not the previous entry's: a long entry can reach past a later one.
+        # A running end, not the previous entry's: a long entry can reach past a
+        # later one.
         if entries and entry.offset - reach > max_fetch_gap:
             yield entries
             entries, reach = [], 0
@@ -79,13 +82,14 @@ def _batch(batch_entries):
         A Batch whose length reaches the furthest end any entry in the run has.
     """
     batch_offset = batch_entries[0].offset
-    batch_length = max(entry.offset + entry.length for entry in batch_entries) - batch_offset
+    batch_end = max(entry.offset + entry.length for entry in batch_entries)
+    batch_length = batch_end - batch_offset
     return Batch(batch_offset, batch_length, batch_entries)
 
 
 @contextlib.contextmanager
-def fetch_batch_blob(session, batch, batch_label, worker_index, source, report_interval,
-                     spool_dir, phases):
+def fetch_batch_blob(session, batch, batch_label, worker_index, source,
+                     report_interval, spool_dir, phases):
     """Fetch one batch's bytes, once, for every profile in the run to share.
 
     The body is streamed to a file and handed back as a read-only mapping, so
@@ -109,21 +113,26 @@ def fetch_batch_blob(session, batch, batch_label, worker_index, source, report_i
     Yields:
         The batch's bytes, as a read-only mmap.
     """
-    progress = DownloadProgress(batch.length, report_interval, f"tile data{batch_label}")
+    progress = DownloadProgress(batch.length, report_interval,
+                                f"tile data{batch_label}")
 
-    print(f"starting download{batch_label} ({batch.length} bytes, {len(batch.entries)} entries "
-          f"in a single range request)", file=sys.stderr)
+    print(f"starting download{batch_label} ({batch.length} bytes, "
+          f"{len(batch.entries)} entries in a single range request)",
+          file=sys.stderr)
     spool_path = os.path.join(spool_dir, f"batch-{worker_index}.blob")
     try:
         with phases.phase("fetch"):
             fetch_range(
-                session, source.url, source.tile_data_offset + batch.offset, batch.length,
+                session, source.url, source.tile_data_offset + batch.offset,
+                batch.length,
                 retry_label=f"worker {worker_index}", on_chunk=progress.update,
                 dest_path=spool_path)
         with open(spool_path, "rb") as spooled:
-            with mmap.mmap(spooled.fileno(), 0, access=mmap.ACCESS_READ) as blob:
+            with mmap.mmap(spooled.fileno(), 0,
+                           access=mmap.ACCESS_READ) as blob:
                 yield blob
     finally:
-        # Before the next batch: two batches' bytes at once is what the budget forbids.
+        # Before the next batch: two batches' bytes at once is what the budget
+        # forbids.
         with contextlib.suppress(FileNotFoundError):
             os.remove(spool_path)

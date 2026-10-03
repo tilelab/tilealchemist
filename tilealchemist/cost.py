@@ -1,19 +1,26 @@
-"""What one manifest record costs a worker, in seconds; see docs/ARCHITECTURE.md "Parallelism"."""
+"""What one manifest record costs a worker, in seconds.
+
+See docs/ARCHITECTURE.md "Parallelism".
+"""
 from collections import namedtuple
 
 from tilealchemist.tile_blocks import tile_block
 
-# The 39s floor across a planet run's 128 workers: runner boot, artifact download, pip install.
+# The 39s floor across a planet run's 128 workers: runner boot, artifact
+# download, pip install.
 WORKER_SETUP_SECONDS = 39.0
 
 AxisSeconds = namedtuple(
-    "AxisSeconds", "manifest_record decode_call fetched_byte decoded_byte written_byte")
+    "AxisSeconds",
+    "manifest_record decode_call fetched_byte decoded_byte written_byte")
 
 # What one profile costs a run, as the caller that assembled it settled it.
 ProfileCost = namedtuple(
-    "ProfileCost", "name seconds_per_tile bytes_per_output_tile gap_bytes written_share")
+    "ProfileCost",
+    "name seconds_per_tile bytes_per_output_tile gap_bytes written_share")
 
-# Every per-byte axis charges length itself; docs/ARCHITECTURE.md has the retired decode exponent.
+# Every per-byte axis charges length itself; docs/ARCHITECTURE.md has the
+# retired decode exponent.
 AXIS_SECONDS = AxisSeconds(
     manifest_record=1e-6,
     decode_call=2.5e-4,
@@ -22,21 +29,26 @@ AXIS_SECONDS = AxisSeconds(
     written_byte=1.96e-9,
 )
 
-# What one output tile weighs where no profile says; the 4.9e-7s per tile this replaces.
+# What one output tile weighs where no profile says; the 4.9e-7s per tile this
+# replaces.
 DEFAULT_BYTES_PER_OUTPUT_TILE = 250.0
 
 # Pessimistic default: an undeclared profile is costed as passing tiles through.
 DEFAULT_SECONDS_PER_TILE = 1e-3
 
-# Pessimistic default again: every tile a profile is handed comes back with bytes in it.
+# Pessimistic default again: every tile a profile is handed comes back with
+# bytes in it.
 DEFAULT_WRITTEN_SHARE = 1.0
 
-# Seconds of in-pool work one second of a worker's wall clock buys; 1.0 is a worker with no pool.
+# Seconds of in-pool work one second of a worker's wall clock buys; 1.0 is a
+# worker with no pool.
 DEFAULT_TRANSFORM_PARALLELISM = 1.0
 
-# Everything a prediction is made from, so that no two callers can price a run differently.
+# Everything a prediction is made from, so that no two callers can price a run
+# differently.
 CostModel = namedtuple(
-    "CostModel", "axis profiles transform_parallelism block_seconds block_bytes")
+    "CostModel",
+    "axis profiles transform_parallelism block_seconds block_bytes")
 
 
 def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None,
@@ -111,7 +123,8 @@ def _record_costs(model, records):
         The predicted seconds for each record, in the same order.
     """
     axis = model.axis
-    pooled_per_tile = profile_seconds(model.profiles) / model.transform_parallelism
+    pooled_per_tile = (profile_seconds(model.profiles)
+                       / model.transform_parallelism)
     write_seconds = axis.written_byte * written_bytes_per_tile(model.profiles)
     gap_write_seconds = axis.written_byte * gap_bytes_per_tile(model.profiles)
     measured_seconds, measured_bytes = model.block_seconds, model.block_bytes
@@ -124,18 +137,21 @@ def _record_costs(model, records):
         entry = 0.0
         key = (record.offset, record.length)
         if key != previous_key:
-            # Inlined home_blocks(): this is the hot loop of every partition pass.
+            # Inlined home_blocks(): this is the hot loop of every partition
+            # pass.
             home = tile_block(record.tile_id)
             if home not in charged_blocks:
                 charged_blocks.add(home)
-                entry += (measured_seconds.get(home, 0.0) / model.transform_parallelism
+                entry += (measured_seconds.get(home, 0.0)
+                          / model.transform_parallelism
                           + axis.written_byte * measured_bytes.get(home, 0.0))
             entry += (axis.fetched_byte * record.length
                       + (axis.decode_call + axis.decoded_byte * record.length)
                       / model.transform_parallelism
                       + (0.0 if home in measured_seconds else pooled_per_tile))
             previous_key = key
-        write = 0.0 if home in measured_bytes else write_seconds * record.run_length
+        write = (0.0 if home in measured_bytes
+                 else write_seconds * record.run_length)
         yield axis.manifest_record + entry + write
 
 
@@ -149,7 +165,9 @@ def profile_seconds(profile_costs):
     Returns:
         The summed seconds, zero when no profiles are given.
     """
-    return sum(cost.seconds_per_tile for cost in profile_costs) if profile_costs else 0.0
+    if not profile_costs:
+        return 0.0
+    return sum(cost.seconds_per_tile for cost in profile_costs)
 
 
 def written_bytes_per_tile(profile_costs):
@@ -173,7 +191,8 @@ def written_bytes_per_tile(profile_costs):
     """
     if not profile_costs:
         return DEFAULT_BYTES_PER_OUTPUT_TILE
-    return sum(cost.bytes_per_output_tile * cost.written_share for cost in profile_costs)
+    return sum(cost.bytes_per_output_tile * cost.written_share
+               for cost in profile_costs)
 
 
 def gap_bytes_per_tile(profile_costs):

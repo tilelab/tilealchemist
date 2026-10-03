@@ -6,7 +6,11 @@ entries back and names the tile id ranges nothing in the index covers.
 import operator
 import sys
 
-from pmtiles.tile import deserialize_directory, deserialize_header, zxy_to_tileid
+from pmtiles.tile import (
+    deserialize_directory,
+    deserialize_header,
+    zxy_to_tileid,
+)
 
 from tilealchemist.manifest import Entry
 from tilealchemist.ranged_fetch import DownloadProgress, fetch_range
@@ -17,7 +21,8 @@ PMTILES_HEADER_LENGTH = 127
 # PMTiles v3 section 4 requires header plus root inside the first 16,384 bytes.
 HEADER_AND_ROOT_PREFIX_LENGTH = 16 * 1024
 
-# Caps one gap record, so a single unbroken gap cannot land wholly on one worker.
+# Caps one gap record, so a single unbroken gap cannot land wholly on one
+# worker.
 GAP_CHUNK_SIZE = 200_000
 
 LOG_INTERVAL = 1.0
@@ -111,12 +116,14 @@ class LeafWindow:
         offset = entry.offset - self.start
         if offset < 0 or offset + entry.length > len(self.blob):
             raise RuntimeError(
-                f"directory at leaf-section offset {entry.offset} (+{entry.length} bytes) "
-                f"lies outside the {len(self.blob)} bytes fetched from {self.start}. "
-                f"`leaf_window_for()` spans what the root points at, in the file order "
-                f"PMTiles v3 section 4 asks for -- leaf order SHOULD ascend by TileID, and "
-                f"more than one level of leaf directories is discouraged. This archive "
-                f"breaks one of the two; reading it needs the whole leaf section.")
+                f"directory at leaf-section offset {entry.offset} "
+                f"(+{entry.length} bytes) lies outside the {len(self.blob)} "
+                f"bytes fetched from {self.start}. `leaf_window_for()` spans "
+                f"what the root points at, in the file order PMTiles v3 "
+                f"section 4 asks for -- leaf order SHOULD ascend by TileID, "
+                f"and more than one level of leaf directories is discouraged. "
+                f"This archive breaks one of the two; reading it needs the "
+                f"whole leaf section.")
         return self.blob[offset:offset + entry.length]
 
 
@@ -141,14 +148,29 @@ def leaf_window_for(root_directory, tile_id_start, tile_id_limit):
             break
         if entry.run_length != 0:
             continue
-        next_tile_id = (root_directory[index + 1].tile_id
-                        if index + 1 < len(root_directory) else tile_id_limit)
-        if next_tile_id <= tile_id_start:
+        if _next_tile_id(root_directory, index, tile_id_limit) <= tile_id_start:
             continue
         if start is None:
             start = entry.offset
         end = entry.offset + entry.length
     return (0, 0) if start is None else (start, end - start)
+
+
+def _next_tile_id(directory, index, tile_id_limit):
+    """Find where the tile ids under one directory entry end.
+
+    Args:
+        directory: A deserialized directory.
+        index: The position of the entry in it.
+        tile_id_limit: One past the last tile id in range, which stands in for
+            the end of the last entry.
+
+    Returns:
+        The tile id of the entry after it, or `tile_id_limit` for the last.
+    """
+    if index + 1 < len(directory):
+        return directory[index + 1].tile_id
+    return tile_id_limit
 
 
 def tile_id_bounds(min_zoom, max_zoom):
@@ -180,7 +202,8 @@ def compute_gaps(entries, min_zoom, max_zoom):
     tile_id_start, tile_id_limit = tile_id_bounds(min_zoom, max_zoom)
     gaps = []
     expected = tile_id_start
-    # Entries never overlap, so sorted by tile_id their ends are non-decreasing too.
+    # Entries never overlap, so sorted by tile_id their ends are non-decreasing
+    # too.
     for entry in sorted(entries, key=operator.attrgetter("tile_id")):
         if entry.tile_id > expected:
             gaps.extend(_chunk_gap(expected, entry.tile_id))
@@ -206,7 +229,8 @@ def _chunk_gap(start, end):
             for chunk_start in range(start, end, GAP_CHUNK_SIZE)]
 
 
-def walk_directory_tree(root_directory, leaf_window, tile_id_start, tile_id_limit):
+def walk_directory_tree(root_directory, leaf_window, tile_id_start,
+                        tile_id_limit):
     """Collect every entry in range, walking the tree from memory.
 
     Args:
@@ -230,8 +254,7 @@ def walk_directory_tree(root_directory, leaf_window, tile_id_start, tile_id_limi
             if entry.tile_id >= tile_id_limit:
                 break
             if entry.run_length == 0:
-                next_tile_id = (directory[index + 1].tile_id if index + 1 < len(directory)
-                                 else tile_id_limit)
+                next_tile_id = _next_tile_id(directory, index, tile_id_limit)
                 if next_tile_id > tile_id_start:
                     node_bytes = leaf_window.node_bytes(entry)
                     frontier.append(deserialize_directory(node_bytes))
@@ -260,11 +283,15 @@ def collect_entries(session, url, min_zoom, max_zoom):
     header, root_directory = _fetch_header_and_root(session, url)
     tile_id_start, tile_id_limit = tile_id_bounds(min_zoom, max_zoom)
     leaf_window = _fetch_leaf_window(
-        session, url, header, *leaf_window_for(root_directory, tile_id_start, tile_id_limit))
+        session, url, header,
+        *leaf_window_for(root_directory, tile_id_start, tile_id_limit))
 
-    print(f"starting decode ({header['tile_entries_count']} entries expected)", file=sys.stderr)
-    entries = walk_directory_tree(root_directory, leaf_window, tile_id_start, tile_id_limit)
-    # Lowest tile id first within a shared offset: that record is the run's home; see home_blocks().
+    print(f"starting decode ({header['tile_entries_count']} entries "
+          f"expected)", file=sys.stderr)
+    entries = walk_directory_tree(root_directory, leaf_window, tile_id_start,
+                                  tile_id_limit)
+    # Lowest tile id first within a shared offset: that record is the run's
+    # home; see home_blocks().
     entries.sort(key=lambda entry: (entry.offset, entry.tile_id))
     return header, entries
 
@@ -291,9 +318,11 @@ def _fetch_header_and_root(session, url):
     if root_start + root_length > len(prefix):
         raise RuntimeError(
             f"root directory runs to byte {root_start + root_length}, past the "
-            f"{len(prefix)} fetched: PMTiles v3 section 4 requires header plus root "
-            f"inside the first {HEADER_AND_ROOT_PREFIX_LENGTH} bytes")
-    return header, deserialize_directory(prefix[root_start:root_start + root_length])
+            f"{len(prefix)} fetched: PMTiles v3 section 4 requires header "
+            f"plus root inside the first {HEADER_AND_ROOT_PREFIX_LENGTH} "
+            f"bytes")
+    root_end = root_start + root_length
+    return header, deserialize_directory(prefix[root_start:root_end])
 
 
 def _fetch_leaf_window(session, url, header, window_start, window_length):
@@ -313,9 +342,11 @@ def _fetch_leaf_window(session, url, header, window_start, window_length):
         return LeafWindow(b"", 0)
 
     print(f"starting download ({window_length} bytes of leaf directories, "
-          f"{header['tile_entries_count']} entries in the archive)", file=sys.stderr)
+          f"{header['tile_entries_count']} entries in the archive)",
+          file=sys.stderr)
     blob = fetch_range(
-        session, url, header["leaf_directory_offset"] + window_start, window_length,
-        retry_label=RETRY_LABEL,
-        on_chunk=DownloadProgress(window_length, LOG_INTERVAL, "directory index").update)
+        session, url, header["leaf_directory_offset"] + window_start,
+        window_length, retry_label=RETRY_LABEL,
+        on_chunk=DownloadProgress(window_length, LOG_INTERVAL,
+                                  "directory index").update)
     return LeafWindow(blob, window_start)

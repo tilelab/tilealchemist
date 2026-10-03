@@ -7,7 +7,8 @@ import requests
 from tilealchemist.backoff import backoff_delay
 from tilealchemist.throttle import UpdateLineThrottle
 
-# Covers the transient CDN failures of a cold-cache stampede; see docs/ARCHITECTURE.md.
+# Covers the transient CDN failures of a cold-cache stampede; see
+# docs/ARCHITECTURE.md.
 MAX_RANGE_ATTEMPTS = 6
 RANGE_RETRY_BASE_DELAY = 2.0
 RETRYABLE_STATUS_CODES = {429, 500, 502, 503, 504}
@@ -59,7 +60,8 @@ class DownloadProgress:
         """
         if not self.throttle.due():
             return
-        percent = (100 * downloaded / self.total_bytes) if self.total_bytes else 100.0
+        percent = ((100 * downloaded / self.total_bytes)
+                   if self.total_bytes else 100.0)
         print(f"update: downloading {self.label}: "
               f"{downloaded}/{self.total_bytes} bytes ({percent:.1f}%)",
               file=sys.stderr)
@@ -88,7 +90,8 @@ class _RetryableFailure(Exception):
         self.final = final
 
 
-def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size, dest=None):
+def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size,
+                         dest=None):
     """Make one ranged request and read its body.
 
     Args:
@@ -108,7 +111,8 @@ def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size, dest=
             206, or if the connection drops part-way through the body.
         requests.HTTPError: On a status not worth retrying.
     """
-    # Leaving the `with` on a raise returns the connection before the caller's backoff sleeps.
+    # Leaving the `with` on a raise returns the connection before the caller's
+    # backoff sleeps.
     with session.get(url, headers={"Range": range_header}, timeout=READ_TIMEOUT,
                      stream=True) as response:
         status = response.status_code
@@ -116,18 +120,20 @@ def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size, dest=
         if status in RETRYABLE_STATUS_CODES:
             raise _RetryableFailure(
                 f"got HTTP {status} for range {range_header}", response,
-                requests.HTTPError(f"HTTP {status} ({response.reason}) for range "
-                                   f"{range_header} of {url}", response=response))
+                requests.HTTPError(f"HTTP {status} ({response.reason}) for "
+                                   f"range {range_header} of {url}",
+                                   response=response))
 
         response.raise_for_status()
         if status != 206:
             raise _RetryableFailure(
-                f"got HTTP {status} instead of 206 for range {range_header}", response,
+                f"got HTTP {status} instead of 206 for range {range_header}",
+                response,
                 RuntimeError(
-                    f"expected HTTP 206 Partial Content for ranged request ({range_header}) "
-                    f"after {MAX_RANGE_ATTEMPTS} attempts, got {status}: server ignored the "
-                    f"Range header and would send the entire "
-                    f"archive instead of just this range"))
+                    f"expected HTTP 206 Partial Content for ranged request "
+                    f"({range_header}) after {MAX_RANGE_ATTEMPTS} attempts, "
+                    f"got {status}: server ignored the Range header and would "
+                    f"send the entire archive instead of just this range"))
 
         # A bytearray, not a list to join: a join holds the body twice.
         body = bytearray() if dest is None else None
@@ -146,7 +152,8 @@ def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size, dest=
             return downloaded if dest is not None else bytes(body)
         except (requests.exceptions.ChunkedEncodingError,
                 requests.exceptions.ConnectionError) as error:
-            # No response left to read a Retry-After from, so the backoff runs on jitter alone.
+            # No response left to read a Retry-After from, so the backoff runs
+            # on jitter alone.
             raise _RetryableFailure(
                 f"connection dropped after {downloaded} bytes "
                 f"({error.__class__.__name__})", None, error) from error
@@ -195,13 +202,15 @@ def fetch_range(session, url, offset, length, retry_label,
     range_header = f"bytes={offset}-{offset + length - 1}"
     if dest_path is not None:
         with open(dest_path, "wb") as dest:
-            return _fetch_range_attempts(session, url, range_header, on_chunk, chunk_size,
-                                          retry_label, dest)
-    return _fetch_range_attempts(session, url, range_header, on_chunk, chunk_size,
-                                  retry_label, None)
+            return _fetch_range_attempts(session, url, range_header,
+                                         on_chunk, chunk_size, retry_label,
+                                         dest)
+    return _fetch_range_attempts(session, url, range_header, on_chunk,
+                                 chunk_size, retry_label, None)
 
 
-def _fetch_range_attempts(session, url, range_header, on_chunk, chunk_size, retry_label, dest):
+def _fetch_range_attempts(session, url, range_header, on_chunk, chunk_size,
+                          retry_label, dest):
     """Run one range's attempts until one succeeds or they run out.
 
     Args:
@@ -227,10 +236,12 @@ def _fetch_range_attempts(session, url, range_header, on_chunk, chunk_size, retr
                 # Every attempt asks from byte zero, so a partial write must go.
                 dest.seek(0)
                 dest.truncate(0)
-            return _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size, dest)
+            return _attempt_fetch_range(session, url, range_header,
+                                        on_chunk, chunk_size, dest)
         except _RetryableFailure as failure:
             if attempt == MAX_RANGE_ATTEMPTS:
                 raise failure.final from failure
-            delay = backoff_delay(attempt, failure.response, RANGE_RETRY_BASE_DELAY)
+            delay = backoff_delay(attempt, failure.response,
+                                  RANGE_RETRY_BASE_DELAY)
             _warn_retry(retry_label, failure.detail, attempt, delay)
             time.sleep(delay)

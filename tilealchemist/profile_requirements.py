@@ -20,14 +20,17 @@ the block is read without importing the profile.
 """
 
 # PEP 723's own reference regex for a script-metadata block, verbatim.
-BLOCK_PATTERN = r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s(?P<content>(^#(| .*)$\s)+)^# ///$"
+BLOCK_PATTERN = (r"(?m)^# /// (?P<type>[a-zA-Z0-9-]+)$\s"
+                 r"(?P<content>(^#(| .*)$\s)+)^# ///$")
 
 BLOCK_TYPE = "script"
 
-# Counted separately: the reference regex swallows a butted-up second block into the first.
+# Counted separately: the reference regex swallows a butted-up second block into
+# the first.
 OPENER_PATTERN = rf"(?m)^# /// {BLOCK_TYPE}$"
 
-# Matched separately: the reference regex needs a content line, so an empty block matches none.
+# Matched separately: the reference regex needs a content line, so an empty
+# block matches none.
 EMPTY_BLOCK_PATTERN = rf"(?m)^# /// {BLOCK_TYPE}$\s^# ///$"
 
 
@@ -46,16 +49,19 @@ def read_metadata(source):
     """
     openers = len(re.findall(OPENER_PATTERN, source))
     if openers > 1:
-        raise ValueError(f"{openers} `# /// {BLOCK_TYPE}` blocks found; PEP 723 allows one")
+        raise ValueError(f"{openers} `# /// {BLOCK_TYPE}` blocks found; "
+                         f"PEP 723 allows one")
     block = next((match for match in re.finditer(BLOCK_PATTERN, source)
                   if match.group("type") == BLOCK_TYPE), None)
     if block is None:
         if openers and not re.search(EMPTY_BLOCK_PATTERN, source):
-            raise ValueError(f"`# /// {BLOCK_TYPE}` block has no closing `# ///`")
+            raise ValueError(
+                f"`# /// {BLOCK_TYPE}` block has no closing `# ///`")
         return {}
     # "# " on a line with content, bare "#" on a blank one, before TOML sees it.
+    lines = block.group("content").splitlines(keepends=True)
     content = "".join(line[2:] if line.startswith("# ") else line[1:]
-                      for line in block.group("content").splitlines(keepends=True))
+                      for line in lines)
     return tomllib.loads(content)
 
 
@@ -78,12 +84,13 @@ def profile_requirements(path):
     requirements = metadata.get("dependencies", [])
     if not isinstance(requirements, list) or not all(
             isinstance(requirement, str) for requirement in requirements):
-        raise ValueError("`dependencies` must be an array of requirement strings")
+        raise ValueError(
+            "`dependencies` must be an array of requirement strings")
     return requirements
 
 
 def main():
-    """Print one requirement per line for the profile named on the command line."""
+    """Print one requirement per line for the profile named on the CLI."""
     parser = argparse.ArgumentParser(
         description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("profile", help="path to the profile's .py file")

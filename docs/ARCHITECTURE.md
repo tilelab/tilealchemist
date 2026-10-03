@@ -1584,8 +1584,8 @@ listing required.
 ## Module invariants
 
 Facts that reach across modules, which no single docstring is the right
-home for (see [`DOC_STYLE.md`](DOC_STYLE.md)). Each is a constraint an edit
-could break silently, so change the code and this section together.
+home for. Each is a constraint an edit could break silently, so change the
+code and this section together.
 
 ### Phase maps
 

@@ -5,7 +5,8 @@ from collections import namedtuple
 from tilealchemist.cost import DEFAULT_COST_MODEL, cost_weights
 from tilealchemist.tile_blocks import home_blocks
 
-# Every home tile block in a run, what each is predicted to cost, and each record's block.
+# Every home tile block in a run, what each is predicted to cost, and each
+# record's block.
 TileBlockGroups = namedtuple("TileBlockGroups", "blocks seconds of_record")
 
 
@@ -24,7 +25,14 @@ def count_output_tiles(entries):
 
 
 def count_gap_tiles(entries):
-    """Count the output tiles these records write from gaps rather than from the archive."""
+    """Count the output tiles these records write from gaps, not the archive.
+
+    Args:
+        entries: The records to count, real entries and gaps alike.
+
+    Returns:
+        The `run_length` sum of the gap records among them.
+    """
     return sum(entry.run_length for entry in entries if entry.length == 0)
 
 
@@ -72,9 +80,11 @@ def partition_by_cost(records, worker_count, model=DEFAULT_COST_MODEL):
     for record, weight in zip(records, weights):
         blocks[worker_index].append(record)
         assigned_weight += weight
-        # A record heavier than a share would span several, and every one it covered must be skipped.
+        # A record heavier than a share would span several, and every one it
+        # covered must be skipped.
         while (worker_index < worker_count - 1
-               and assigned_weight >= _share_end_weight(total_weight, worker_index, worker_count)):
+               and assigned_weight >= _share_end_weight(
+                   total_weight, worker_index, worker_count)):
             worker_index += 1
     return blocks
 
@@ -107,7 +117,7 @@ def tile_block_groups(records, model=DEFAULT_COST_MODEL):
     """
     group_of_block, blocks, seconds = {}, [], []
     of_record = array("I")
-    weights, _total = cost_weights(records, model)
+    weights, unused_total = cost_weights(records, model)
     for block, weight in zip(home_blocks(records), weights):
         group = group_of_block.get(block)
         if group is None:
@@ -128,9 +138,10 @@ def partition_by_tile_block(records, groups, worker_count):
     whatever order the archive wrote its tiles in. Tile id order only came to
     the same thing for an archive clustered by tile id. A worker's share ends
     at a fixed point of the run's cumulative cost,
-    `total * (i + 1) / worker_count`, rather than at a per-worker budget, so that what one worker leaves short is the next one's
-    to take instead of piling up on the last. A block bigger than a whole
-    share still goes to a worker of its own rather than being split.
+    `total * (i + 1) / worker_count`, rather than at a per-worker budget, so
+    that what one worker leaves short is the next one's to take instead of
+    piling up on the last. A block bigger than a whole share still goes to a
+    worker of its own rather than being split.
 
     Args:
         records: The records the groups index into, in offset order.
@@ -144,8 +155,7 @@ def partition_by_tile_block(records, groups, worker_count):
     total_weight = sum(groups.seconds)
     worker_of_group = [0] * len(groups.blocks)
     worker_index, held, assigned_weight = 0, 0, 0.0
-    for group in range(len(groups.blocks)):
-        weight = groups.seconds[group]
+    for group, weight in enumerate(groups.seconds):
         if (worker_index < worker_count - 1 and held
                 and assigned_weight + weight
                 > _share_end_weight(total_weight, worker_index, worker_count)):
@@ -159,8 +169,8 @@ def partition_by_tile_block(records, groups, worker_count):
     return blocks
 
 
-def partition_into_worker_blocks(entries, gaps, worker_count, model=DEFAULT_COST_MODEL,
-                                 groups=None):
+def partition_into_worker_blocks(entries, gaps, worker_count,
+                                 model=DEFAULT_COST_MODEL, groups=None):
     """Build each worker's block from both the real entries and the gaps.
 
     The two are spread separately, so that gap work, which needs no fetch at

@@ -1,22 +1,26 @@
-"""The measured seconds and bytes per tile block a run keeps for the next one; see docs/ARCHITECTURE.md "Measured tile blocks"."""
-import json
-import os
+"""The measured seconds and bytes per tile block a run keeps for the next.
+
+See docs/ARCHITECTURE.md "Measured tile blocks".
+"""
 import statistics
 from collections import namedtuple
 
-from tilealchemist.axis_state import HISTORY_LENGTH
+from tilealchemist.axis_state import HISTORY_LENGTH, read_state_file
 from tilealchemist.tile_blocks import parse_block_values
 
-# 2 keys a block by the blob's home rather than the tile's own block, and adds the written bytes.
+# 2 keys a block by the blob's home rather than the tile's own block, and adds
+# the written bytes.
 VERSION = 2
 
-# The state branch keeps one file per archive and profile set under this directory.
+# The state branch keeps one file per archive and profile set under this
+# directory.
 DEFAULT_BLOCK_STATE_DIR = "state/blocks"
 
-BlockMeasurement = namedtuple("BlockMeasurement",
-                              "source_key profiles seconds written_bytes workers")
+BlockMeasurement = namedtuple(
+    "BlockMeasurement", "source_key profiles seconds written_bytes workers")
 
-# What the recorded runs say each block costs: the profiles' pooled seconds, and the bytes written.
+# What the recorded runs say each block costs: the profiles' pooled seconds, and
+# the bytes written.
 BlockCosts = namedtuple("BlockCosts", "seconds written_bytes")
 
 NO_BLOCK_COSTS = BlockCosts(seconds={}, written_bytes={})
@@ -80,7 +84,8 @@ def measure_blocks(rows):
         return None
     keys = {(row.get("source_key"), row.get("profiles")) for row in block_rows}
     if len(keys) != 1:
-        raise ValueError(f"block rows name {len(keys)} archive/profile pairs: {sorted(keys)}")
+        raise ValueError(f"block rows name {len(keys)} archive/profile "
+                         f"pairs: {sorted(keys)}")
     (source_key, profiles), = keys
     return BlockMeasurement(source_key=source_key, profiles=profiles,
                             seconds=_summed(block_rows, "seconds") or {},
@@ -112,7 +117,8 @@ def _append(histories, measured, digits):
     """
     for block, value in measured.items():
         history = histories.get(str(block), [])
-        histories[str(block)] = (history + [round(value, digits)])[-HISTORY_LENGTH:]
+        recorded = history + [round(value, digits)]
+        histories[str(block)] = recorded[-HISTORY_LENGTH:]
 
 
 def record_blocks(document, measurement, build=None):
@@ -134,19 +140,24 @@ def record_blocks(document, measurement, build=None):
     """
     if document.get("version") != VERSION:
         document.clear()
-        document.update(empty_document(measurement.source_key, measurement.profiles))
+        document.update(empty_document(measurement.source_key,
+                                       measurement.profiles))
     seconds = document.setdefault("seconds", {})
     # Milliseconds: what a block costs is never balanced finer than that.
     _append(seconds, measurement.seconds, 3)
     if measurement.written_bytes is not None:
-        _append(document.setdefault("written_bytes", {}), measurement.written_bytes, None)
+        _append(document.setdefault("written_bytes", {}),
+                measurement.written_bytes, None)
     if build:
         document["build"] = build
-    recorded_bytes = ("and their written bytes" if measurement.written_bytes is not None
-                      else "but no written bytes, which not every worker reported")
-    return (f"blocks {measurement.source_key}/{measurement.profiles}: recorded "
-            f"{len(measurement.seconds)} blocks' seconds {recorded_bytes}, from "
-            f"{measurement.workers} workers, {len(seconds)} on file")
+    if measurement.written_bytes is not None:
+        recorded_bytes = "and their written bytes"
+    else:
+        recorded_bytes = "but no written bytes, which not every worker reported"
+    return (f"blocks {measurement.source_key}/{measurement.profiles}: "
+            f"recorded {len(measurement.seconds)} blocks' seconds "
+            f"{recorded_bytes}, from {measurement.workers} workers, "
+            f"{len(seconds)} on file")
 
 
 def _medians(histories):
@@ -161,8 +172,10 @@ def _medians(histories):
     """
     medians = {}
     for block, history in histories.items():
-        values = [float(value) for value in history if isinstance(value, (int, float))
-                  and value >= 0] if isinstance(history, list) else []
+        if not isinstance(history, list):
+            continue
+        values = [float(value) for value in history
+                  if isinstance(value, (int, float)) and value >= 0]
         if values:
             medians[int(block)] = statistics.median(values)
     return medians
@@ -201,11 +214,7 @@ def read_block_costs(root, source_key, profiles):
     """
     if not root:
         return NO_BLOCK_COSTS
-    path = block_state_path(root, source_key, profiles)
-    if not os.path.exists(path):
+    document = read_state_file(block_state_path(root, source_key, profiles))
+    if document is None:
         return NO_BLOCK_COSTS
-    with open(path, encoding="utf-8") as handle:
-        document = json.load(handle)
-    if not isinstance(document, dict):
-        raise ValueError(f"{path} holds {type(document).__name__}, not a JSON object")
     return block_costs(document)

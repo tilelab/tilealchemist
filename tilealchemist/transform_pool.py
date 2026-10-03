@@ -1,4 +1,7 @@
-"""Chunking a batch and running it across processes; see docs/ARCHITECTURE.md "Parallelism"."""
+"""Chunking a batch and running it across processes.
+
+See docs/ARCHITECTURE.md "Parallelism".
+"""
 import collections
 import concurrent.futures
 import sys
@@ -6,10 +9,14 @@ import sys
 from tilealchemist.partition import partition_by_cost
 from tilealchemist.profiles import load_profile
 from tilealchemist.schemas import SCHEMAS
-from tilealchemist.transform import TransformProgress, transform_batch_blob_multi
+from tilealchemist.transform import (
+    TransformProgress,
+    transform_batch_blob_multi,
+)
 from tilealchemist.usage import TransformUsage
 
-# Spare chunks per process, so one finishing early pulls the next instead of idling.
+# Spare chunks per process, so one finishing early pulls the next instead of
+# idling.
 TRANSFORM_CHUNKS_PER_WORKER = 8
 
 SUBMIT_LEAD = 2
@@ -38,7 +45,8 @@ def _chunk_entries(real_entries, transform_workers):
     """
     if transform_workers <= 1 or len(real_entries) <= 1:
         return [real_entries]
-    chunk_count = min(len(real_entries), transform_workers * TRANSFORM_CHUNKS_PER_WORKER)
+    chunk_count = min(len(real_entries),
+                      transform_workers * TRANSFORM_CHUNKS_PER_WORKER)
     chunks = partition_by_cost(real_entries, chunk_count)
     return [chunk for chunk in chunks if chunk]
 
@@ -55,17 +63,20 @@ def _blob_slice_for_chunk(blob, batch_offset, chunk_entries):
         That chunk's bytes, and the archive offset they start at.
     """
     chunk_offset = chunk_entries[0].offset
-    chunk_length = max(entry.offset + entry.length for entry in chunk_entries) - chunk_offset
+    chunk_end = max(entry.offset + entry.length for entry in chunk_entries)
+    chunk_length = chunk_end - chunk_offset
     start = chunk_offset - batch_offset
     return blob[start:start + chunk_length], chunk_offset
 
 
-# One picklable value; `args` cannot serve, carrying profile classes a worker cannot unpickle.
+# One picklable value; `args` cannot serve, carrying profile classes a worker
+# cannot unpickle.
 ChunkJob = collections.namedtuple(
     "ChunkJob", "profile_paths schema_name min_zoom max_zoom report_interval")
 
 
-def _transform_chunk(job, blob_slice, blob_slice_offset, chunk_entries, chunk_index):
+def _transform_chunk(job, blob_slice, blob_slice_offset, chunk_entries,
+                     chunk_index):
     """Transform one chunk, inside a pool process.
 
     Args:
@@ -85,8 +96,9 @@ def _transform_chunk(job, blob_slice, blob_slice_offset, chunk_entries, chunk_in
     progress = TransformProgress(len(chunk_entries), job.report_interval,
                                   label=f"transforming chunk {chunk_index + 1}")
     usage = TransformUsage(len(profiles))
-    results = transform_batch_blob_multi(blob_slice, batch, job.min_zoom, job.max_zoom, progress,
-                                          profiles, SCHEMAS[job.schema_name], usage)
+    results = transform_batch_blob_multi(
+        blob_slice, batch, job.min_zoom, job.max_zoom, progress, profiles,
+        SCHEMAS[job.schema_name], usage)
     return results, usage
 
 
@@ -110,15 +122,17 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
     """
     in_flight = max_workers + SUBMIT_LEAD
     waiting = iter(list(enumerate(chunks)))
-    with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with concurrent.futures.ProcessPoolExecutor(
+            max_workers=max_workers) as executor:
         pending = {}
 
         def top_up():
             """Submit chunks until `in_flight` are queued, or none are left."""
             for index, chunk in waiting:
-                blob_slice, blob_slice_offset = _blob_slice_for_chunk(blob, batch_offset, chunk)
-                future = executor.submit(_transform_chunk, job, blob_slice, blob_slice_offset,
-                                          chunk, index)
+                blob_slice, blob_slice_offset = _blob_slice_for_chunk(
+                    blob, batch_offset, chunk)
+                future = executor.submit(_transform_chunk, job, blob_slice,
+                                         blob_slice_offset, chunk, index)
                 pending[future] = (index, len(chunk), len(blob_slice))
                 if len(pending) >= in_flight:
                     return
@@ -129,7 +143,8 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
                 pending, return_when=concurrent.futures.FIRST_COMPLETED).done
             future = min(ready, key=pending.__getitem__)
             ready = None
-            # pop, not index: a live Future pins its chunk's output for the whole phase.
+            # pop, not index: a live Future pins its chunk's output for the
+            # whole phase.
             index, entry_count, byte_count = pending.pop(future)
             chunk_results, chunk_usage = future.result()
             future = None
@@ -138,7 +153,8 @@ def _pooled_chunk_results(blob, batch_offset, chunks, job, max_workers):
             yield index, entry_count, byte_count, chunk_results, chunk_usage
 
 
-def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args, usage):
+def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args,
+                  usage):
     """Transform one fetched batch, in this process or across a pool.
 
     Args:
@@ -157,25 +173,31 @@ def run_transform(blob, batch, min_zoom, max_zoom, profiles, schema, args, usage
         One list of per-profile results per chunk, in the order the chunks
         finish, so that a caller can write each away and let it go.
     """
-    batch_offset, _batch_length, real_entries = batch
+    batch_offset, unused_batch_length, real_entries = batch
     chunks = _chunk_entries(real_entries, args.transform_workers)
 
-    fanout = (f", {len(chunks)} chunks across up to {args.transform_workers} processes"
+    fanout = (f", {len(chunks)} chunks across up to "
+              f"{args.transform_workers} processes"
               if len(chunks) > 1 else "")
     print(f"starting transform for profiles "
           f"{', '.join(repr(profile.name) for profile in profiles)} "
           f"({len(real_entries)} entries{fanout})", file=sys.stderr)
 
     if len(chunks) <= 1:
-        transform_progress = TransformProgress(len(real_entries), args.report_interval)
-        # Straight into the worker's own totals: with no pool there is nothing to merge back.
-        results = transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progress,
-                                             profiles, schema, usage)
+        transform_progress = TransformProgress(len(real_entries),
+                                               args.report_interval)
+        # Straight into the worker's own totals: with no pool there is nothing
+        # to merge back.
+        results = transform_batch_blob_multi(
+            blob, batch, min_zoom, max_zoom, transform_progress, profiles,
+            schema, usage)
         yield results
         return
 
-    job = ChunkJob(args.profile, schema.name, min_zoom, max_zoom, args.report_interval)
-    completed = _pooled_chunk_results(blob, batch_offset, chunks, job, args.transform_workers)
+    job = ChunkJob(args.profile, schema.name, min_zoom, max_zoom,
+                   args.report_interval)
+    completed = _pooled_chunk_results(blob, batch_offset, chunks, job,
+                                      args.transform_workers)
     for done, (index, entry_count, byte_count, chunk_results,
                 chunk_usage) in enumerate(completed, start=1):
         usage.merge(chunk_usage)

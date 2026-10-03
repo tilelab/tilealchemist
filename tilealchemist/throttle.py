@@ -33,12 +33,14 @@ class UpdateLineThrottle:
         """Claim the right to emit a line now.
 
         Returns:
-            True if at least `interval` has passed since the last claim, in which
-            case this call is recorded as the new last one; False otherwise.
+            True if at least `interval` has passed since the last claim, in
+            which case this call is recorded as the new last one; False
+            otherwise.
         """
         with self.lock:
             now = time.monotonic()
-            if self.last_fired_at is None or now - self.last_fired_at >= self.interval:
+            if (self.last_fired_at is None
+                    or now - self.last_fired_at >= self.interval):
                 self.last_fired_at = now
                 return True
             return False

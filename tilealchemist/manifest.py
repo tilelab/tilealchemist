@@ -10,7 +10,8 @@ from urllib.parse import urlparse
 from tilealchemist.schemas import SchemaName
 from tilealchemist.zoom import ZoomLevel
 
-RECORD = struct.Struct("<QQII")  # tile_id, offset, length, run_length; no framing needed.
+# tile_id, offset, length, run_length; no framing needed.
+RECORD = struct.Struct("<QQII")
 
 Entry = namedtuple("Entry", ["tile_id", "offset", "length", "run_length"])
 
@@ -24,7 +25,8 @@ def write_manifest(path, entries):
     """
     with open(path, "wb") as file:
         for entry in entries:
-            file.write(RECORD.pack(entry.tile_id, entry.offset, entry.length, entry.run_length))
+            file.write(RECORD.pack(entry.tile_id, entry.offset, entry.length,
+                                   entry.run_length))
 
 
 def read_manifest(path):
@@ -50,7 +52,8 @@ def write_worker_manifests(out_dir, blocks):
             still gets its file, so worker N always has one to read.
     """
     for worker_index, block in enumerate(blocks):
-        write_manifest(os.path.join(out_dir, f"worker-{worker_index:03d}.bin"), block)
+        path = os.path.join(out_dir, f"worker-{worker_index:03d}.bin")
+        write_manifest(path, block)
 
 
 def axis_key_for(url, schema):
@@ -83,7 +86,8 @@ def _slug(value):
     Returns:
         The label with every run of other characters turned into a single dash.
     """
-    return re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-").lower() or "unknown"
+    slug = re.sub(r"[^A-Za-z0-9._-]+", "-", value).strip("-").lower()
+    return slug or "unknown"
 
 
 @dataclass(frozen=True)
@@ -119,7 +123,7 @@ class SourceMetadata:
         return axis_key_for(self.url, self.schema)
 
     def as_json(self):
-        """Plain strings and numbers, exactly what the matching CLI flags take."""
+        """Plain strings and numbers, exactly what the matching flags take."""
         return {
             "url": self.url,
             "build": self.build,
@@ -131,7 +135,10 @@ class SourceMetadata:
 
     @classmethod
     def from_json(cls, document):
-        """Back to members, so a hand-edited source.json fails here and not inside a worker."""
+        """Read the plain values back into members.
+
+        A hand-edited source.json then fails here rather than inside a worker.
+        """
         return cls(
             url=document["url"],
             build=document["build"],
@@ -142,7 +149,8 @@ class SourceMetadata:
         )
 
 
-def write_source_metadata(out_dir, resolved_source, min_zoom, max_zoom, tile_data_offset):
+def write_source_metadata(out_dir, resolved_source, min_zoom, max_zoom,
+                          tile_data_offset):
     """Write the `source.json` the workers read.
 
     Args:
@@ -160,7 +168,8 @@ def write_source_metadata(out_dir, resolved_source, min_zoom, max_zoom, tile_dat
         max_zoom=ZoomLevel(max_zoom),
         tile_data_offset=tile_data_offset,
     )
-    with open(os.path.join(out_dir, "source.json"), "w") as source_file:
+    path = os.path.join(out_dir, "source.json")
+    with open(path, "w", encoding="utf-8") as source_file:
         json.dump(metadata.as_json(), source_file)
 
 
@@ -178,5 +187,5 @@ def read_source_metadata(path):
         ValueError: If its schema name or a zoom level is not one this build
             knows.
     """
-    with open(path) as source_file:
+    with open(path, encoding="utf-8") as source_file:
         return SourceMetadata.from_json(json.load(source_file))

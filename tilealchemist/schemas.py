@@ -132,8 +132,8 @@ class TileSchema(ABC):
             The bound method that answers it.
 
         Raises:
-            KeyError: If this schema answers no such feature set, naming the ones
-                it does answer.
+            KeyError: If this schema answers no such feature set, naming the
+                ones it does answer.
         """
         try:
             name = self.provides[feature_set]
@@ -161,7 +161,8 @@ class OpenMapTilesSchema(TileSchema):
             layers: The decoded layers, in decode_tile()'s shape.
 
         Returns:
-            The `water` layer's features, less the ones running through a tunnel.
+            The `water` layer's features, less the ones running through a
+            tunnel.
         """
         return [
             polygon
@@ -172,7 +173,7 @@ class OpenMapTilesSchema(TileSchema):
     @feature(WATERWAYS, fields={"class": "String", "name": "String",
                                 "brunnel": "String", "intermittent": "Boolean"})
     def waterways(self, layers):
-        """The waterway lines, with the schema's own properties left as they are.
+        """The waterway lines, with the schema's own properties as they are.
 
         Args:
             layers: The decoded layers, in decode_tile()'s shape.
@@ -218,14 +219,14 @@ class ProtomapsSchema(TileSchema):
                                 "layer": "Number", "min_zoom": "Number",
                                 "sort_rank": "Number"})
     def waterways(self, layers):
-        """The waterway lines, with the schema's own properties left as they are.
+        """The waterway lines, with the schema's own properties as they are.
 
         Args:
             layers: The decoded layers, in decode_tile()'s shape.
 
         Returns:
-            The lines in the `water` layer, which also holds the polygons and the
-            label points.
+            The lines in the `water` layer, which also holds the polygons
+            and the label points.
         """
         return [line for line in _layer_features(layers, "water")
                 if line["geometry"]["type"] in LINE_TYPES]

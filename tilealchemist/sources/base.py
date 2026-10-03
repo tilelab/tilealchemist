@@ -17,7 +17,7 @@ class ResolvedSource:
     """
 
     url: str
-    build: str  # Human-readable label for logs and source.json; "n/a" where there is none.
+    build: str
     schema: TileSchema
 
 

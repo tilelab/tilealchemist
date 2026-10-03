@@ -31,9 +31,9 @@ class ProtomapsSource(Source):
         if not builds:
             raise RuntimeError(f"no .pmtiles build listed in {BUILDS_URL}")
 
-        # Build date in the key, not list position: older basemap versions linger here.
+        # Build date in the key, not list position: older basemap versions
+        # linger here.
         latest = max(builds, key=lambda build: build["key"])
         version = latest.get("version", "unknown")
-        return ResolvedSource(BASE_URL + latest["key"],
-                              f"{latest['key'].removesuffix('.pmtiles')} (basemap {version})",
-                              self.schema)
+        build = f"{latest['key'].removesuffix('.pmtiles')} (basemap {version})"
+        return ResolvedSource(BASE_URL + latest["key"], build, self.schema)

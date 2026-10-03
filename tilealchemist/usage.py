@@ -1,4 +1,7 @@
-"""What a run actually cost, measured rather than predicted; see docs/ARCHITECTURE.md."""
+"""What a run actually cost, measured rather than predicted.
+
+See docs/ARCHITECTURE.md.
+"""
 import collections
 import contextlib
 import sys
@@ -35,7 +38,8 @@ def report(scope, *, echo=True, **fields):
         The line as printed, so that a caller can also keep it for the job that
         collects every worker's measurements.
     """
-    formatted = " ".join(f"{name}={_format(value)}" for name, value in fields.items())
+    formatted = " ".join(f"{name}={_format(value)}"
+                         for name, value in fields.items())
     line = f"usage: scope={scope} {formatted}"
     if echo:
         print(line, file=sys.stderr)
@@ -43,7 +47,7 @@ def report(scope, *, echo=True, **fields):
 
 
 class PhaseSeconds:
-    """Wall-clock seconds per phase, exclusive: a nested phase's time is not its parent's."""
+    """Wall-clock seconds per phase, exclusive of any nested phase's time."""
 
     def __init__(self):
         """Start with no phases recorded."""
@@ -88,11 +92,12 @@ class PhaseSeconds:
         Returns:
             A mapping of field name to seconds, in phase-name order.
         """
-        return {name + suffix: value for name, value in sorted(self.seconds.items())}
+        return {name + suffix: value
+                for name, value in sorted(self.seconds.items())}
 
 
 class TransformUsage:
-    """What a transform cost, measured as it ran, for one chunk or a whole worker.
+    """What a transform cost, measured as it ran, for a chunk or a worker.
 
     A chunk's measurements are taken in the process that ran it and merged into
     the worker's own on the way back, so that a worker reports once rather than

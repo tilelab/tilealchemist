@@ -1,7 +1,14 @@
-"""Choosing worker_count against the run's hard limits; see docs/ARCHITECTURE.md "Sizing"."""
+"""Choosing worker_count against the run's hard limits.
+
+See docs/ARCHITECTURE.md "Sizing".
+"""
 from collections import namedtuple
 
-from tilealchemist.cost import DEFAULT_COST_MODEL, WORKER_SETUP_SECONDS, cost_weights
+from tilealchemist.cost import (
+    DEFAULT_COST_MODEL,
+    WORKER_SETUP_SECONDS,
+    cost_weights,
+)
 from tilealchemist.fetch_batching import peak_batch_bytes
 from tilealchemist.partition import (
     count_output_tiles,
@@ -9,27 +16,34 @@ from tilealchemist.partition import (
     tile_block_groups,
 )
 
-# GitHub queues past ~20 concurrently running jobs on a public repo, so a run goes in waves.
+# GitHub queues past ~20 concurrently running jobs on a public repo, so a run
+# goes in waves.
 DEFAULT_CONCURRENCY = 20
 
 MATRIX_CELL_LIMIT = 256
 DEFAULT_JOB_SECONDS = 6 * 3600
 
-# A budget is spent at this rate, for the tail the model cannot see; see "Sizing a run".
+# A budget is spent at this rate, for the tail the model cannot see; see "Sizing
+# a run".
 TAIL_SAFETY_FACTOR = 2.0
 
-# Workers per concurrency lane, so a lane on a fast runner takes more of them; see "Sizing a run".
+# Workers per concurrency lane, so a lane on a fast runner takes more of them;
+# see "Sizing a run".
 WORKER_SCALE_FACTOR = 3
 
-Limits = namedtuple("Limits", "job_seconds concurrency tail_factor worker_scale")
+Limits = namedtuple("Limits",
+                    "job_seconds concurrency tail_factor worker_scale")
 
 BlockLoad = namedtuple("BlockLoad", "seconds tiles records batch_bytes")
 
-DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS, concurrency=DEFAULT_CONCURRENCY,
-                        tail_factor=TAIL_SAFETY_FACTOR, worker_scale=WORKER_SCALE_FACTOR)
+DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS,
+                        concurrency=DEFAULT_CONCURRENCY,
+                        tail_factor=TAIL_SAFETY_FACTOR,
+                        worker_scale=WORKER_SCALE_FACTOR)
 
 
-def block_load(block, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECONDS):
+def block_load(block, model=DEFAULT_COST_MODEL,
+               setup_seconds=WORKER_SETUP_SECONDS):
     """Predict what one worker's block will cost it.
 
     Args:
@@ -48,7 +62,8 @@ def block_load(block, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECON
         batch_bytes=peak_batch_bytes(block))
 
 
-def block_loads(blocks, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECONDS):
+def block_loads(blocks, model=DEFAULT_COST_MODEL,
+                setup_seconds=WORKER_SETUP_SECONDS):
     """Predict what every worker's block will cost it, in worker order.
 
     A caller that reports per-worker predictions and then judges the run as a
@@ -82,7 +97,8 @@ def worst_of(loads):
                        for field in BlockLoad._fields))
 
 
-def worst_load(blocks, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECONDS):
+def worst_load(blocks, model=DEFAULT_COST_MODEL,
+               setup_seconds=WORKER_SETUP_SECONDS):
     """Take the worst value of each axis across every block.
 
     Args:
@@ -97,7 +113,15 @@ def worst_load(blocks, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECO
 
 
 def breaches(load, limits):
-    """Which limits this worker would break; empty means every one of them holds."""
+    """List the limits a worker's load would break.
+
+    Args:
+        load: One worker's BlockLoad, or the envelope `worst_of()` gives.
+        limits: The run's hard limits.
+
+    Returns:
+        The names of the limits broken; empty means every one of them holds.
+    """
     broken = []
     if load.seconds * limits.tail_factor > limits.job_seconds:
         broken.append("time")
@@ -133,8 +157,8 @@ def candidate_worker_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
     return counts + [cell_limit]
 
 
-def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL, limits=DEFAULT_LIMITS,
-                        cell_limit=MATRIX_CELL_LIMIT,
+def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL,
+                        limits=DEFAULT_LIMITS, cell_limit=MATRIX_CELL_LIMIT,
                         setup_seconds=WORKER_SETUP_SECONDS, groups=None):
     """Pick the first worker count whose worst worker stays inside the limits.
 
@@ -165,11 +189,13 @@ def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL, limits=DEFAULT_
     if groups is None:
         groups = tile_block_groups(entries, model)
     for worker_count in candidate_worker_counts(limits, cell_limit):
-        blocks = partition_into_worker_blocks(entries, gaps, worker_count, model, groups)
+        blocks = partition_into_worker_blocks(entries, gaps, worker_count,
+                                              model, groups)
         load = worst_load(blocks, model, setup_seconds)
         broken = breaches(load, limits)
         attempts.append((worker_count, load, broken))
         if not broken:
             break
-    # Whether the loop broke out or ran dry, the last partition is the one to keep.
+    # Whether the loop broke out or ran dry, the last partition is the one to
+    # keep.
     return worker_count, blocks, load, attempts

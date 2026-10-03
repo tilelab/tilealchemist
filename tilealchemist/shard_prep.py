@@ -3,13 +3,29 @@ import os
 import sys
 
 from tilealchemist import axis_state, block_state
-from tilealchemist.attribution import compose_attribution, fetch_declared_attribution
+from tilealchemist.attribution import (
+    compose_attribution,
+    fetch_declared_attribution,
+)
 from tilealchemist.cost import WORKER_SETUP_SECONDS, ProfileCost, cost_model
-from tilealchemist.manifest import axis_key_for, write_source_metadata, write_worker_manifests
-from tilealchemist.partition import count_gap_tiles, count_output_tiles, tile_block_groups
-from tilealchemist.sizing import block_loads, breaches, choose_worker_count, worst_of
+from tilealchemist.manifest import (
+    axis_key_for,
+    write_source_metadata,
+    write_worker_manifests,
+)
+from tilealchemist.partition import (
+    count_gap_tiles,
+    count_output_tiles,
+    tile_block_groups,
+)
 from tilealchemist.pmtiles_index import collect_entries, compute_gaps
 from tilealchemist.ranged_fetch import make_session
+from tilealchemist.sizing import (
+    block_loads,
+    breaches,
+    choose_worker_count,
+    worst_of,
+)
 from tilealchemist.sources import resolve_source
 from tilealchemist.tile_blocks import TILE_BLOCK_BITS, profile_combo_key
 
@@ -31,7 +47,8 @@ def run_prepare(args):
     """
     os.makedirs(args.out_dir, exist_ok=True)
 
-    resolved_source = resolve_source(args.source, args.source_url, args.schema).resolve()
+    resolved_source = resolve_source(args.source, args.source_url,
+                                     args.schema).resolve()
     print(f"source={resolved_source.url} (build {resolved_source.build}, "
           f"schema {resolved_source.schema.name})", file=sys.stderr)
 
@@ -41,7 +58,8 @@ def run_prepare(args):
     header, entries = collect_entries(session, resolved_source.url,
                                        args.min_zoom, args.max_zoom)
     print(f"directory walk found {len(entries)} distinct tile entries "
-          f"(min_zoom={args.min_zoom}, max_zoom={args.max_zoom})", file=sys.stderr)
+          f"(min_zoom={args.min_zoom}, max_zoom={args.max_zoom})",
+          file=sys.stderr)
 
     declared = fetch_declared_attribution(session, resolved_source.url, header)
     print(f"source attribution: {declared or 'none declared by the archive'}",
@@ -51,44 +69,50 @@ def run_prepare(args):
 
     gaps = compute_gaps(entries, args.min_zoom, args.max_zoom)
     gap_tile_count = sum(gap.run_length for gap in gaps)
-    print(f"{len(gaps)} gap ranges covering {gap_tile_count} tiles with no archive "
-          f"entry at all", file=sys.stderr)
+    print(f"{len(gaps)} gap ranges covering {gap_tile_count} tiles with no "
+          f"archive entry at all", file=sys.stderr)
 
     groups = tile_block_groups(entries, model)
-    measured_count = sum(1 for block in groups.blocks if block in model.block_seconds)
+    measured_count = sum(1 for block in groups.blocks
+                         if block in model.block_seconds)
     largest = max(groups.seconds, default=0.0)
-    print(f"{len(groups.blocks)} tile blocks of up to {2 ** TILE_BLOCK_BITS} tiles, "
-          f"{measured_count} of them costed from their measured profile seconds and bytes and "
-          f"the rest from the profiles' declared figures; "
-          f"the costliest is {largest / 60:.1f}m, which no worker's share can go below",
-          file=sys.stderr)
+    print(f"{len(groups.blocks)} tile blocks of up to {2 ** TILE_BLOCK_BITS} "
+          f"tiles, {measured_count} of them costed from their measured "
+          f"profile seconds and bytes and the rest from the profiles' "
+          f"declared figures; the costliest is {largest / 60:.1f}m, which no "
+          f"worker's share can go below", file=sys.stderr)
 
-    worker_count, blocks = _size_run(args, entries, gaps, model, setup_seconds, groups)
+    worker_count, blocks = _size_run(args, entries, gaps, model, setup_seconds,
+                                     groups)
     write_worker_manifests(args.out_dir, blocks)
-    write_source_metadata(args.out_dir, resolved_source, args.min_zoom, args.max_zoom,
-                          header["tile_data_offset"])
+    write_source_metadata(args.out_dir, resolved_source, args.min_zoom,
+                          args.max_zoom, header["tile_data_offset"])
 
     non_empty_count = sum(1 for block in blocks if block)
     print(f"wrote {len(blocks)} manifests to {args.out_dir} "
           f"({non_empty_count} non-empty)", file=sys.stderr)
-    print(f"largest block holds {max(len(block) for block in blocks)} records", file=sys.stderr)
+    print(f"largest block holds {max(len(block) for block in blocks)} "
+          f"records", file=sys.stderr)
     print(_tiles_line(blocks), file=sys.stderr)
     loads = block_loads(blocks, model, setup_seconds)
     _print_worker_predictions(loads, args.limits)
     load = worst_of(loads)
     broken = breaches(load, args.limits)
-    print(f"worst worker: {load.seconds / 60:.0f}m predicted, {load.tiles} output tiles, "
-          f"largest batch {load.batch_bytes / 2 ** 30:.2f} GiB", file=sys.stderr)
+    print(f"worst worker: {load.seconds / 60:.0f}m predicted, {load.tiles} "
+          f"output tiles, largest batch {load.batch_bytes / 2 ** 30:.2f} GiB",
+          file=sys.stderr)
     if broken:
-        print(f"::warning title=worker budget::the worst worker is over budget on "
-              f"{', '.join(broken)} at {worker_count} workers", file=sys.stderr)
+        print(f"::warning title=worker budget::the worst worker is over budget "
+              f"on {', '.join(broken)} at {worker_count} workers",
+              file=sys.stderr)
     worker_seconds = [worker_load.seconds for worker_load in loads]
     even_minutes = sum(worker_seconds) / len(blocks) / 60
-    print(f"cost model predicts {sum(worker_seconds) / 3600:.1f} core-hours including "
-          f"{setup_seconds:.0f}s setup per worker, slowest worker "
-          f"{max(worker_seconds) / 60:.0f}m against an even {even_minutes:.0f}m",
-          file=sys.stderr)
-    # stdout carries the attribution alone, for _pipeline.yml to hand to tile-join.
+    print(f"cost model predicts {sum(worker_seconds) / 3600:.1f} core-hours "
+          f"including {setup_seconds:.0f}s setup per worker, slowest worker "
+          f"{max(worker_seconds) / 60:.0f}m against an even "
+          f"{even_minutes:.0f}m", file=sys.stderr)
+    # stdout carries the attribution alone, for _pipeline.yml to hand to
+    # tile-join.
     print(attribution)
 
 
@@ -112,10 +136,12 @@ def _print_worker_predictions(loads, limits):
         limits: The run's hard limits, for what share of its budget each
             prediction spends.
     """
-    print(f"::group::predicted per worker ({len(loads)} manifests)", file=sys.stderr)
+    print(f"::group::predicted per worker ({len(loads)} manifests)",
+          file=sys.stderr)
     for worker_index, load in enumerate(loads):
         budget_share = load.seconds * limits.tail_factor / limits.job_seconds
-        print(f"worker-{worker_index:03d}: {load.seconds / 60:6.1f}m predicted, "
+        print(f"worker-{worker_index:03d}: {load.seconds / 60:6.1f}m "
+              f"predicted, "
               f"{load.tiles} output tiles, {load.records} records, "
               f"{budget_share:.0%} of budget", file=sys.stderr)
     print("::endgroup::", file=sys.stderr)
@@ -139,9 +165,6 @@ def _settle_costs(args, resolved_source):
     partitioning and sizing used to be handed the axes and the profile costs
     separately, and partitioning quietly went without the second.
 
-    The profiles' seconds per tile block are settled here too, from the
-    block state for this archive and profile set, where there is any.
-
     Args:
         args: The parsed command line, read for its profiles, its state
             document, its block state and any `--axis-seconds` override.
@@ -151,38 +174,44 @@ def _settle_costs(args, resolved_source):
         The CostModel this run is priced by, and the per-worker setup seconds.
     """
     document = args.axis_state_document
+    source_key = axis_key_for(resolved_source.url, resolved_source.schema.name)
     notes = []
-    axis, setup_seconds, parallelism = args.axis_seconds, WORKER_SETUP_SECONDS, None
+    axis, setup_seconds = args.axis_seconds, WORKER_SETUP_SECONDS
+    parallelism = None
     if document is not None:
-        source_key = axis_key_for(resolved_source.url, resolved_source.schema.name)
         axis, shared = axis_state.axis_seconds(document, source_key, notes)
         setup_seconds = shared.worker_setup_seconds
         parallelism = shared.transform_parallelism
         print(f"axis state: {source_key} costed from "
               f"{axis_state.history_depth(document)} recorded run(s) of "
-              f"{axis_state.HISTORY_LENGTH}, each coefficient the median of its own",
-              file=sys.stderr)
-    profile_costs = _declared_profile_costs(args.profiles, resolved_source.schema)
+              f"{axis_state.HISTORY_LENGTH}, each coefficient the median of "
+              f"its own", file=sys.stderr)
+    profile_costs = _declared_profile_costs(args.profiles,
+                                            resolved_source.schema)
     for note in notes:
         print(f"::warning title=axis state::{note}", file=sys.stderr)
     blocks = block_state.NO_BLOCK_COSTS
     if args.block_state and args.profiles:
-        source_key = axis_key_for(resolved_source.url, resolved_source.schema.name)
-        profiles_key = profile_combo_key(profile.name for profile in args.profiles)
-        blocks = block_state.read_block_costs(args.block_state, source_key, profiles_key)
+        profiles_key = profile_combo_key(profile.name
+                                         for profile in args.profiles)
+        blocks = block_state.read_block_costs(args.block_state, source_key,
+                                              profiles_key)
         print(f"block state: {len(blocks.seconds)} tile blocks' seconds and "
               f"{len(blocks.written_bytes)} blocks' written bytes measured for "
               f"{source_key}/{profiles_key}, each the median of up to "
               f"{axis_state.HISTORY_LENGTH} runs", file=sys.stderr)
-    model = cost_model(axis=axis, profiles=profile_costs, transform_parallelism=parallelism,
-                       block_seconds=blocks.seconds, block_bytes=blocks.written_bytes)
-    print(f"costing: one worker's pool buys {model.transform_parallelism:.2f}s of decode and "
-          f"profile work per second of its wall clock", file=sys.stderr)
+    model = cost_model(axis=axis, profiles=profile_costs,
+                       transform_parallelism=parallelism,
+                       block_seconds=blocks.seconds,
+                       block_bytes=blocks.written_bytes)
+    print(f"costing: one worker's pool buys "
+          f"{model.transform_parallelism:.2f}s of decode and profile work per "
+          f"second of its wall clock", file=sys.stderr)
     return model, setup_seconds
 
 
 def _declared_profile_costs(profiles, schema):
-    """What each profile says it costs, for every tile block nothing measured yet.
+    """What each profile says it costs, for every tile block not yet measured.
 
     Only a gap tile's weight is measured here, by asking the profile once --
     there is nothing to estimate. Everything else is the profile's own
@@ -192,22 +221,27 @@ def _declared_profile_costs(profiles, schema):
 
     Args:
         profiles: The profile instances the run will build, or None.
-        schema: The schema the output is written against, for the gap question.
+        schema: The schema the output is written against, for the gap
+            question.
 
     Returns:
         One ProfileCost per profile, in the same order.
     """
     costs = []
     for profile in profiles or []:
-        costs.append(ProfileCost(name=profile.name,
-                                 seconds_per_tile=profile.seconds_per_tile,
-                                 bytes_per_output_tile=profile.bytes_per_output_tile,
-                                 gap_bytes=profile.gap_bytes(schema),
-                                 written_share=profile.written_share))
-        print(f"costing: profile {profile.name}: {profile.seconds_per_tile:.3g}s and "
+        costs.append(ProfileCost(
+            name=profile.name,
+            seconds_per_tile=profile.seconds_per_tile,
+            bytes_per_output_tile=profile.bytes_per_output_tile,
+            gap_bytes=profile.gap_bytes(schema),
+            written_share=profile.written_share))
+        print(f"costing: profile {profile.name}: "
+              f"{profile.seconds_per_tile:.3g}s and "
               f"{profile.bytes_per_output_tile:.0f}B per real tile, written on "
-              f"{profile.written_share:.1%} of the tiles it is handed (declared, for unmeasured "
-              f"blocks), {costs[-1].gap_bytes:.0f}B per gap tile (measured)", file=sys.stderr)
+              f"{profile.written_share:.1%} of the tiles it is handed "
+              f"(declared, for unmeasured blocks), "
+              f"{costs[-1].gap_bytes:.0f}B per gap tile (measured)",
+              file=sys.stderr)
     return costs
 
 
@@ -241,10 +275,12 @@ def _size_run(args, entries, gaps, model, setup_seconds, groups):
         The chosen worker count and its blocks. Every count tried is logged,
         so the log says which limit pushed the run to the count it landed on.
     """
-    worker_count, blocks, _load, attempts = choose_worker_count(
-        entries, gaps, model, args.limits, setup_seconds=setup_seconds, groups=groups)
+    worker_count, blocks, unused_load, attempts = choose_worker_count(
+        entries, gaps, model, args.limits, setup_seconds=setup_seconds,
+        groups=groups)
     for tried, load, broken in attempts:
         verdict = f"{', '.join(broken)} over budget" if broken else "fits"
-        print(f"sizing: {tried} workers, worst worker {load.seconds / 60:.0f}m predicted, "
-              f"{load.tiles} output tiles -- {verdict}", file=sys.stderr)
+        print(f"sizing: {tried} workers, worst worker "
+              f"{load.seconds / 60:.0f}m predicted, {load.tiles} output tiles "
+              f"-- {verdict}", file=sys.stderr)
     return worker_count, blocks

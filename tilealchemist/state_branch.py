@@ -14,12 +14,14 @@ BASE_DELAY_SECONDS = 2.0
 
 MAX_ATTEMPTS = 8
 
-# A git constant: the content hash of zero tree entries, the same in every repository.
+# A git constant: the content hash of zero tree entries, the same in every
+# repository.
 EMPTY_TREE_SHA = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"
 
 DEFAULT_BRANCH = "state"
 
-# Past 1 MB the contents API answers only these media types, with the content left out.
+# Past 1 MB the contents API answers only these media types, with the content
+# left out.
 OBJECT_MEDIA_TYPE = "application/vnd.github.object+json"
 
 
@@ -53,7 +55,8 @@ def _retryable(response):
         return True
     if response.status_code != 403:
         return False
-    return "rate limit" in response.text.lower() or "abuse" in response.text.lower()
+    text = response.text.lower()
+    return "rate limit" in text or "abuse" in text
 
 
 def request(method, path, token, accept=None, **kwargs):
@@ -77,8 +80,8 @@ def request(method, path, token, accept=None, **kwargs):
         if not _retryable(response) or attempt == MAX_ATTEMPTS:
             return response
         delay = backoff_delay(attempt, response, BASE_DELAY_SECONDS)
-        print(f"{method} {path}: {response.status_code}, retrying in {delay:.1f}s",
-              file=sys.stderr)
+        print(f"{method} {path}: {response.status_code}, retrying in "
+              f"{delay:.1f}s", file=sys.stderr)
         time.sleep(delay)
     return response
 
@@ -120,8 +123,8 @@ def ensure_branch(repo, token, branch=DEFAULT_BRANCH):
     if sha is not None:
         return sha
     response = request("POST", f"/repos/{repo}/git/commits", token,
-                        json={"message": f"init {branch} branch", "tree": EMPTY_TREE_SHA,
-                              "parents": []})
+                        json={"message": f"init {branch} branch",
+                              "tree": EMPTY_TREE_SHA, "parents": []})
     response.raise_for_status()
     commit_sha = response.json()["sha"]
     created = request("POST", f"/repos/{repo}/git/refs", token,
@@ -162,13 +165,15 @@ def read_json(repo, token, branch, path):
     document = response.json()
     content = document.get("content")
     if document.get("encoding") == "none":
-        blob = request("GET", f"/repos/{repo}/git/blobs/{document['sha']}", token)
+        blob = request("GET", f"/repos/{repo}/git/blobs/{document['sha']}",
+                       token)
         blob.raise_for_status()
         content = blob.json()["content"]
     try:
         return json.loads(base64.b64decode(content)), document["sha"]
     except json.JSONDecodeError as error:
-        raise ValueError(f"{path} on {branch} is not valid JSON: {error}") from error
+        raise ValueError(
+            f"{path} on {branch} is not valid JSON: {error}") from error
 
 
 def write_json(repo, token, branch, path, content, sha, message, compact=False):
@@ -189,13 +194,16 @@ def write_json(repo, token, branch, path, content, sha, message, compact=False):
         True where the write landed, and False where the file moved underneath
         it, which the caller answers by reading again and reapplying.
     """
-    text = (json.dumps(content, separators=(",", ":"), sort_keys=True) if compact
-            else json.dumps(content, indent=2, sort_keys=True))
+    if compact:
+        text = json.dumps(content, separators=(",", ":"), sort_keys=True)
+    else:
+        text = json.dumps(content, indent=2, sort_keys=True)
     body = {"message": message, "branch": branch,
             "content": base64.b64encode(text.encode()).decode()}
     if sha:
         body["sha"] = sha
-    response = request("PUT", f"/repos/{repo}/contents/{path}", token, json=body)
+    response = request("PUT", f"/repos/{repo}/contents/{path}", token,
+                       json=body)
     if response.status_code in (200, 201):
         return True
     if response.status_code in (409, 422):
@@ -204,8 +212,8 @@ def write_json(repo, token, branch, path, content, sha, message, compact=False):
     return False
 
 
-def update_json(repo, token, branch, path, mutate, message, max_attempts=MAX_ATTEMPTS,
-                compact=False):
+def update_json(repo, token, branch, path, mutate, message,
+                max_attempts=MAX_ATTEMPTS, compact=False):
     """Apply a change to one JSON file, retrying if it moved underneath us.
 
     Read, change, write against the sha that was read: the write is refused
@@ -231,7 +239,10 @@ def update_json(repo, token, branch, path, mutate, message, max_attempts=MAX_ATT
     for attempt in range(1, max_attempts + 1):
         document, sha = read_json(repo, token, branch, path)
         updated = mutate(document)
-        if write_json(repo, token, branch, path, updated, sha, message, compact=compact):
+        if write_json(repo, token, branch, path, updated, sha, message,
+                      compact=compact):
             return updated
-        print(f"{path} moved underneath attempt {attempt}, reapplying", file=sys.stderr)
-    raise RuntimeError(f"{path} on {branch} kept moving; gave up after {max_attempts} attempts")
+        print(f"{path} moved underneath attempt {attempt}, reapplying",
+              file=sys.stderr)
+    raise RuntimeError(f"{path} on {branch} kept moving; gave up after "
+                       f"{max_attempts} attempts")

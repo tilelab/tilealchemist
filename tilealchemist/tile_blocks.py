@@ -1,10 +1,14 @@
-"""Fixed tile-id blocks, the unit the profiles' measured seconds and bytes are kept under; see docs/ARCHITECTURE.md "Measured tile blocks"."""
+"""Fixed tile-id blocks, the unit measured profile costs are kept under.
+
+See docs/ARCHITECTURE.md "Measured tile blocks".
+"""
 import bisect
 
 # 4**6 = 4096 tiles: one z8 cell at z14, and a whole zoom level up to z6.
 TILE_BLOCK_BITS = 12
 
-# Where each zoom level's tile ids start: PMTiles numbers z0 first, then z1, and so on.
+# Where each zoom level's tile ids start: PMTiles numbers z0 first, then z1, and
+# so on.
 ZOOM_BASES = [(4 ** zoom - 1) // 3 for zoom in range(32)]
 
 
@@ -24,7 +28,8 @@ def tile_block(tile_id):
         The first tile id of its block, which is the block's key.
     """
     zoom_base = ZOOM_BASES[bisect.bisect_right(ZOOM_BASES, tile_id) - 1]
-    return zoom_base + ((tile_id - zoom_base) >> TILE_BLOCK_BITS << TILE_BLOCK_BITS)
+    offset = (tile_id - zoom_base) >> TILE_BLOCK_BITS << TILE_BLOCK_BITS
+    return zoom_base + offset
 
 
 def home_blocks(records):
@@ -71,7 +76,7 @@ def profile_combo_key(names):
 
 
 def format_block_values(block_values):
-    """Render one figure per block -- seconds, or bytes -- as one usage-line field value.
+    """Render one figure per block -- seconds, or bytes -- as one field value.
 
     Args:
         block_values: A mapping of block key to its figure.
@@ -80,8 +85,20 @@ def format_block_values(block_values):
         `block:value` per block in key order, separated by `|`, or `-` where
         there are none. A byte count stays whole; seconds keep six digits.
     """
-    return "|".join(f"{block}:{value if isinstance(value, int) else format(value, '.6g')}"
+    return "|".join(f"{block}:{_format_block_value(value)}"
                     for block, value in sorted(block_values.items())) or "-"
+
+
+def _format_block_value(value):
+    """Format one block's figure: a byte count whole, seconds to six digits.
+
+    Args:
+        value: The figure, an int for bytes or a float for seconds.
+
+    Returns:
+        The figure as text.
+    """
+    return str(value) if isinstance(value, int) else format(value, ".6g")
 
 
 def parse_block_values(value):

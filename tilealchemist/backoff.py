@@ -53,4 +53,5 @@ def backoff_delay(attempt, response, base_delay):
     Returns:
         The delay to wait, in seconds.
     """
-    return _server_requested_delay(response) or _jittered_backoff(attempt, base_delay)
+    return (_server_requested_delay(response)
+            or _jittered_backoff(attempt, base_delay))

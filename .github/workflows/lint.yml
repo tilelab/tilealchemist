@@ -5,7 +5,9 @@ on:
   pull_request:
 
 jobs:
-  doc-style:
+  # Google Python Style Guide, via its own pylintrc vendored as .pylintrc
+  # (https://google.github.io/styleguide/pyguide.html).
+  pylint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -14,5 +16,10 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Check documentation style
-        run: python3 lint/doc_style.py tilealchemist lint
+      # The package itself, so pylint resolves its imports rather than
+      # reporting every third-party one as missing. pylint is pinned: a new
+      # release adding a check should not fail an unrelated push.
+      - run: pip install . pylint==4.1.2
+
+      - name: Check Google Python style
+        run: pylint tilealchemist

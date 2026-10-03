@@ -1,11 +1,17 @@
-"""Profile contract: one source tile -> one output tile; see docs/PROFILES.md."""
+"""Profile contract: one source tile -> one output tile.
+
+See docs/PROFILES.md.
+"""
 from abc import ABC, abstractmethod
 
 from shapely.geometry.base import BaseGeometry
 
 from tilealchemist import mvt
-from tilealchemist.cost import (DEFAULT_BYTES_PER_OUTPUT_TILE, DEFAULT_SECONDS_PER_TILE,
-                                DEFAULT_WRITTEN_SHARE)
+from tilealchemist.cost import (
+    DEFAULT_BYTES_PER_OUTPUT_TILE,
+    DEFAULT_SECONDS_PER_TILE,
+    DEFAULT_WRITTEN_SHARE,
+)
 from tilealchemist.features import Feature
 from tilealchemist.tile import Tile
 
@@ -81,10 +87,11 @@ class Profile(ABC):
         Returns:
             A mapping of property name to MVT type, empty by default.
         """
+        del schema  # Unused by default.
         return {}
 
     def vector_layers_json(self, schema):
-        """This profile's entry in the output archive's `vector_layers` metadata.
+        """This profile's entry in the output's `vector_layers` metadata.
 
         Args:
             schema: The schema the source tiles are in.

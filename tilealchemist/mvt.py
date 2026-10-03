@@ -33,7 +33,8 @@ def snap_to_output_grid(geometry):
     Returns:
         The snapped geometry, which is empty if it collapsed.
     """
-    return shapely.set_precision(geometry, OUTPUT_GRID_SIZE, mode="valid_output")
+    return shapely.set_precision(geometry, OUTPUT_GRID_SIZE,
+                                 mode="valid_output")
 
 
 def encode_tile(layer_name, features, extent):
@@ -49,7 +50,8 @@ def encode_tile(layer_name, features, extent):
         The gzipped tile bytes, or None if every geometry collapsed to empty
         when snapped onto the output grid.
     """
-    # Must precede encoding; docs/PROFILES.md "The output grid" says what breaks otherwise.
+    # Must precede encoding; docs/PROFILES.md "The output grid" says what breaks
+    # otherwise.
     snapped = []
     for feature in features:
         geometry = snap_to_output_grid(feature["geometry"])
@@ -60,7 +62,9 @@ def encode_tile(layer_name, features, extent):
         return None
     encoded = mapbox_vector_tile.encode(
         {"name": layer_name, "features": snapped},
-        default_options={"extents": extent, "on_invalid_geometry": on_invalid_geometry_raise},
+        default_options={"extents": extent,
+                         "on_invalid_geometry": on_invalid_geometry_raise},
     )
-    # mtime=0 keeps identical tiles byte-identical across workers, for PMTiles dedup.
+    # mtime=0 keeps identical tiles byte-identical across workers, for PMTiles
+    # dedup.
     return gzip.compress(encoded, mtime=0)

@@ -1,4 +1,9 @@
-"""The measured axes a run keeps for the next one; see docs/ARCHITECTURE.md "Measuring a run"."""
+"""The measured axes a run keeps for the next one.
+
+See docs/ARCHITECTURE.md "Measuring a run".
+"""
+import json
+import os
 import statistics
 
 from tilealchemist.calibration import (
@@ -10,7 +15,8 @@ from tilealchemist.calibration import (
     axis_seconds_of,
 )
 
-# How many runs one coefficient keeps. Five is enough for a median to ignore one bad runner.
+# How many runs one coefficient keeps. Five is enough for a median to ignore one
+# bad runner.
 HISTORY_LENGTH = 5
 
 VERSION = 1
@@ -24,6 +30,44 @@ def empty_document():
         yet" and therefore falls back to the reviewed coefficients on.
     """
     return {"version": VERSION, "sources": {}, "shared": {}}
+
+
+def read_state_file(path):
+    """Read a state document out of a checkout of the state branch.
+
+    Args:
+        path: The file to read, or None where the run was given none.
+
+    Returns:
+        The parsed document, or None where there is no path or no file. A
+        missing file is not a mistake: the first run of a new repository has
+        no state branch yet, and the first run of anything has nothing
+        measured.
+
+    Raises:
+        ValueError: If the file exists but does not hold a JSON object, which
+            would otherwise silently cost the run its calibration.
+    """
+    if not path or not os.path.exists(path):
+        return None
+    with open(path, encoding="utf-8") as handle:
+        document = json.load(handle)
+    if not isinstance(document, dict):
+        kind = type(document).__name__
+        raise ValueError(f"{path} holds {kind}, not a JSON object")
+    return document
+
+
+def _is_observation(value):
+    """Whether a value can join a coefficient's history.
+
+    Args:
+        value: The candidate, as measured or as read from the file.
+
+    Returns:
+        True for a non-negative number that is not NaN, zero included.
+    """
+    return isinstance(value, (int, float)) and value >= 0 and value == value
 
 
 def _observations(entry, name):
@@ -43,8 +87,7 @@ def _observations(entry, name):
     raw = entry.get(name) if isinstance(entry, dict) else None
     if not isinstance(raw, list):
         return []
-    return [float(value) for value in raw
-            if isinstance(value, (int, float)) and value >= 0 and value == value]
+    return [float(value) for value in raw if _is_observation(value)]
 
 
 def _summarize(entry, name):
@@ -66,6 +109,20 @@ def _summarize(entry, name):
     return statistics.median(values) if values else None
 
 
+def _summarize_group(group_type, entry):
+    """What the recorded runs say every coefficient of one group is.
+
+    Args:
+        group_type: The group's namedtuple type, SourceAxes or SharedAxes.
+        entry: The document section holding the group's coefficients.
+
+    Returns:
+        A group of that type, any field None where nothing was recorded.
+    """
+    return group_type(**{name: _summarize(entry, name)
+                         for name in group_type._fields})
+
+
 def _record_group(entry, measured):
     """Append one run's measurements to a document section.
 
@@ -81,9 +138,10 @@ def _record_group(entry, measured):
     recorded = []
     for name in measured._fields:
         value = getattr(measured, name)
-        if value is None or value < 0 or value != value:
+        if not _is_observation(value):
             continue
-        entry[name] = (_observations(entry, name) + [float(value)])[-HISTORY_LENGTH:]
+        recorded = _observations(entry, name) + [float(value)]
+        entry[name] = recorded[-HISTORY_LENGTH:]
         recorded.append(name)
     return recorded
 
@@ -103,16 +161,20 @@ def record_run(document, measurement, build=None):
         A line per section saying what was recorded, for the job log.
     """
     document.setdefault("version", VERSION)
-    # A profile's cost is the block state's to keep, per archive and profile set; see block_state.py.
+    # A profile's cost is the block state's to keep, per archive and profile
+    # set; see block_state.py.
     document.pop("profiles", None)
     lines = []
     if measurement.source_key:
-        entry = document.setdefault("sources", {}).setdefault(measurement.source_key, {})
+        entry = document.setdefault("sources", {}).setdefault(
+            measurement.source_key, {})
         if build:
             entry["build"] = build
         recorded = _record_group(entry, measurement.source)
-        lines.append(f"source {measurement.source_key}: recorded {', '.join(recorded) or 'nothing'}")
-    recorded = _record_group(document.setdefault("shared", {}), measurement.shared)
+        lines.append(f"source {measurement.source_key}: recorded "
+                     f"{', '.join(recorded) or 'nothing'}")
+    recorded = _record_group(document.setdefault("shared", {}),
+                             measurement.shared)
     lines.append(f"shared: recorded {', '.join(recorded) or 'nothing'}")
     return lines
 
@@ -129,8 +191,9 @@ def source_axes(document, source_key, notes):
         The SourceAxes to charge, every field usable.
     """
     entry = document.get("sources", {}).get(source_key, {})
-    measured = SourceAxes(**{name: _summarize(entry, name) for name in SourceAxes._fields})
-    return adopt_group(measured, REVIEWED_SOURCE, notes, prefix=f"{source_key}.")
+    measured = _summarize_group(SourceAxes, entry)
+    return adopt_group(measured, REVIEWED_SOURCE, notes,
+                       prefix=f"{source_key}.")
 
 
 def shared_axes(document, notes):
@@ -143,8 +206,7 @@ def shared_axes(document, notes):
     Returns:
         The SharedAxes to charge, every field usable.
     """
-    entry = document.get("shared", {})
-    measured = SharedAxes(**{name: _summarize(entry, name) for name in SharedAxes._fields})
+    measured = _summarize_group(SharedAxes, document.get("shared", {}))
     return adopt_group(measured, REVIEWED_SHARED, notes)
 
 
@@ -161,7 +223,8 @@ def axis_seconds(document, source_key, notes):
         that a caller also has the setup seconds.
     """
     shared = shared_axes(document, notes)
-    return axis_seconds_of(source_axes(document, source_key, notes), shared), shared
+    source = source_axes(document, source_key, notes)
+    return axis_seconds_of(source, shared), shared
 
 
 def history_depth(document):
@@ -179,9 +242,9 @@ def history_depth(document):
     """
     depths = []
     for entry in document.get("sources", {}).values():
-        depths.extend(len(_observations(entry, name)) for name in SourceAxes._fields
-                      if name in entry)
+        depths.extend(len(_observations(entry, name))
+                      for name in SourceAxes._fields if name in entry)
     shared = document.get("shared", {})
-    depths.extend(len(_observations(shared, name)) for name in SharedAxes._fields
-                  if name in shared)
+    depths.extend(len(_observations(shared, name))
+                  for name in SharedAxes._fields if name in shared)
     return min(depths) if depths else 0
