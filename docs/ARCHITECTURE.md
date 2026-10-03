@@ -247,9 +247,10 @@ each job far from GitHub Actions' 6-hour per-job runtime limit, plus
 smaller, failure-isolated jobs and fewer, smaller range requests. GitHub
 also queues anything past ~20 concurrently *running* jobs on a public repo,
 so a higher `worker_count` doesn't add parallelism at any one moment, just
-keeps each job smaller: that's why the sizing starts *at* that concurrency
-and only ever considers multiples of it rather than reaching for a large
-count outright (see "Sizing a run"). Each worker writes its own small mbtiles
+keeps each job smaller -- and lets a lane on a fast runner take over more of
+them: that's why the sizing starts at a small multiple of that concurrency,
+`--worker-scale` times it, and only ever considers multiples of it rather
+than reaching for a large count outright (see "Sizing a run"). Each worker writes its own small mbtiles
 shard; a final job merges all shards
 with `tile-join` into one `.pmtiles` file.
 
@@ -1243,7 +1244,8 @@ possible one.
 Partitioning is one pass over the records, so the search needs no closed
 form:
 
-    for N = C, 2C, 4C, 8C, ..., 256:        # C = --concurrency, in practice 20
+    for N = SC, 2SC, 4SC, ..., 256:     # C = --concurrency, in practice 20
+                                         # S = --worker-scale, 3 by default
         blocks = partition_into_worker_blocks(entries, gaps, N)
         if every budget holds for the worst block: take N
 
@@ -1256,8 +1258,8 @@ is every run small enough for the concurrency to hold it -- still pays exactly
 one, the same as before. Every candidate stays a multiple of the concurrency,
 because doubling a multiple of `C` is a multiple of `C`.
 
-What it gives up is granularity: the search can only land on 20, 40, 80, 160
-or 256, so a run that would have fitted 60 workers takes 80. That is the right
+What it gives up is granularity: at the defaults the search can only land on
+60, 120, 240 or 256, so a run that would have fitted 90 workers takes 120. That is the right
 trade in this direction. Overshooting the worker count costs
 `WORKER_SETUP_SECONDS` per extra worker (~39s of runner boot, artifact
 download and pip install) against blocks that are correspondingly smaller,
@@ -1299,10 +1301,9 @@ whole ones:
 
 | workers | waves | last wave |
 | --- | --- | --- |
-| 20 | 1 | 20/20 |
-| 40 | 2 | 20/20 |
-| 80 | 4 | 20/20 |
-| 160 | 8 | 20/20 |
+| 60 | 3 | 20/20 |
+| 120 | 6 | 20/20 |
+| 240 | 12 | 20/20 |
 | 256 (the ceiling) | 13 | 16/20 |
 
 Only the ceiling leaves a lane idle, and it is GitHub's number rather than a
@@ -1311,36 +1312,63 @@ seven waves with 8/20 in the last, the same seven waves 140 buys. It is an
 idealization, since GitHub starts greedily as a lane frees rather than in
 strict waves, but it is measurable and it is the cheapest saving available.
 
+**Even a run that fits one wave is split into `--worker-scale` of them.** The
+runners are not one machine. GitHub's hosted `ubuntu-latest` pool spans
+several CPU generations -- EPYC 7763, 9V74 and 9V45, Xeon Platinum 8573C and
+Xeon 6973P-C have all been reported -- and pins the image, not the CPU. A
+protomaps planet run at 20 workers, one wave, showed it plainly: decoding
+the same blob sizes ran at 0.61-0.70 of the pooled rate on four runners and
+up to 1.30 on the rest. Those four were the run's four fastest shards, at
+0.48-0.67 of their predictions, while the slowest ran 1.30 over. The model
+was right on average -- 41.3m actual against 42m predicted across all 20 --
+and the run still ended at 57m, because one block per lane leaves nothing
+for a fast lane to take over.
+
+Which runner a worker lands on cannot be known when the manifests are
+written, so no static partition can correct for it. What corrects for it is
+having more workers than lanes: GitHub starts the next queued worker the
+moment a lane frees, so a lane that drew a fast runner works through more of
+them, and the run ends near the average plus at most about one worker's
+share rather than on its slowest runner. Every queued worker draws a fresh
+runner, which averages the speeds further. At the default of 3, a run that
+fits 20 workers is cut into 60 of a third the size; the price is
+`WORKER_SETUP_SECONDS` and roughly half a minute of artifact upload per extra
+worker, a few percent of a planet run, and more shard files for `merge`. The
+costliest tile block is the floor on a worker's share, so a scale past the
+point where shares reach it buys nothing. Doubling more *concurrent* lanes
+would not do the same: it shortens every lane alike and leaves the spread
+between fast and slow runners exactly as wide, relatively.
+
 The **256** ceiling is GitHub's own: `_pipeline.yml` expands the worker count
 straight into the `build-shards` matrix, and GitHub refuses more than that
 many cells. `candidate_worker_counts()` therefore ends on 256 whether or not the
 doubling lands on it, and `gen-workers` checks the manifest count against it
 before the matrix is built rather than after the archive walk has already run.
 
-The time budget is charged at `TAIL_SAFETY_FACTOR` (4x), not at face value,
-and that is the honest way to use a model that under-predicts its slow tail
-by 2-4x -- the reference run's worst worker was predicted at 8m and ran
-34m12s. Sizing against a *hard* 6h limit with such a model would otherwise
-mean either a blind guess or a silent overrun.
+The time budget is charged at `TAIL_SAFETY_FACTOR` (2x), not at face value,
+because the model still under-predicts its slowest workers. It was 4x when
+the model under-predicted its slow tail by 2-4x -- the reference run's worst
+worker was predicted at 8m and ran 34m12s. Against measured block costs the
+20-worker protomaps run above came in at 0.48-1.30x of prediction per
+worker, the spread being runner speed rather than content, so 2x covers the
+slowest runner with room left. Sizing against a *hard* 6h limit with no
+margin would otherwise mean a silent overrun.
 
-**The factor has not been re-derived since the units bugs above were fixed,
-and it should be.** It was set against a model that over-predicted a whole run
-by 3.8x while still under-predicting that run's slowest worker, so 4x of stated
-margin was about 1x of real margin, and the two errors cancelling is why
-nothing looked wrong. Against the corrected model the same planet run scores
-1.06x on the total, 1.27x on a median worker and 0.40x on its worst, so 4x now
-means roughly what it says. That changes what this search returns, in the
-direction of *fewer* workers: those same 160 blocks price at a 16m worst worker
-now against 58m before, which clears 4x of the 6h cap with room to spare and
-would have stopped the doubling several steps earlier. Fewer workers is not
-free -- with `--concurrency` waves, it trades runner setup for wall-clock -- and
-the search has no term for wall-clock at all, so this is a decision to make
-deliberately rather than to inherit from a coefficient nobody re-read. Which is also why this comes
-last: it needs measured coefficients to mean anything. For scale, that run's
-slowest worker sat a factor of **10.5** under the cap and the whole run used
-15.7 of 120 available lane-hours. So time is not the binding limit today
-either -- it is simply the only one that has ever been worth enforcing, and
-the only one a measured run has never quietly broken.
+**Why it was 4x, and why lowering it took measured coefficients.** It was
+set against a model that over-predicted a whole run by 3.8x while still
+under-predicting that run's slowest worker, so 4x of stated margin was about
+1x of real margin, and the two errors cancelling is why nothing looked wrong.
+Against the corrected model the same planet run scores 1.06x on the total,
+1.27x on a median worker and 0.40x on its worst, so the margin now means
+roughly what it says, and the measured per-worker spread above is what 2x is
+read from. A lower factor moves this search towards *fewer* workers, but the
+search has no term for wall-clock, and wall-clock is what `--worker-scale`
+keeps: the run still starts at three workers per lane however much budget is
+left. For scale, that planet run's slowest worker sat a factor of **10.5**
+under the cap and the whole run used 15.7 of 120 available lane-hours. So
+time is not the binding limit today either -- it is simply the only one that
+has ever been worth enforcing, and the only one a measured run has never
+quietly broken.
 
 `calibrate` still fits a `runner` block from `usage:`'s shard bytes per
 output tile, and writes it to `calibration.json`. Sizing reads none of it. It is there to be read by a

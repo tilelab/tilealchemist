@@ -16,14 +16,17 @@ MATRIX_CELL_LIMIT = 256
 DEFAULT_JOB_SECONDS = 6 * 3600
 
 # A budget is spent at this rate, for the tail the model cannot see; see "Sizing a run".
-TAIL_SAFETY_FACTOR = 4.0
+TAIL_SAFETY_FACTOR = 2.0
 
-Limits = namedtuple("Limits", "job_seconds concurrency tail_factor")
+# Workers per concurrency lane, so a lane on a fast runner takes more of them; see "Sizing a run".
+WORKER_SCALE_FACTOR = 3
+
+Limits = namedtuple("Limits", "job_seconds concurrency tail_factor worker_scale")
 
 BlockLoad = namedtuple("BlockLoad", "seconds tiles records batch_bytes")
 
 DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS, concurrency=DEFAULT_CONCURRENCY,
-                        tail_factor=TAIL_SAFETY_FACTOR)
+                        tail_factor=TAIL_SAFETY_FACTOR, worker_scale=WORKER_SCALE_FACTOR)
 
 
 def block_load(block, model=DEFAULT_COST_MODEL, setup_seconds=WORKER_SETUP_SECONDS):
@@ -104,21 +107,26 @@ def breaches(load, limits):
 def candidate_worker_counts(limits, cell_limit=MATRIX_CELL_LIMIT):
     """The worker counts worth trying, smallest first.
 
-    Starts at the concurrency limit, because a run goes in waves of that many
-    and a count part-way into a wave costs what the whole wave costs, and
-    doubles from there: every candidate stays a multiple of the concurrency,
-    and a run that needs many workers reaches them in a handful of partitions
-    rather than one per wave. The cell limit is the last candidate whether or
-    not the doubling lands on it.
+    Starts at the concurrency limit times the worker scale, because a run goes
+    in waves of that many and a count part-way into a wave costs what the
+    whole wave costs, and doubles from there: every candidate stays a multiple
+    of the concurrency, and a run that needs many workers reaches them in a
+    handful of partitions rather than one per wave. The scale is what keeps
+    even a run that fits one wave in several: GitHub starts the next queued
+    worker as soon as a lane frees, so a lane that drew a fast runner works
+    through more of them and the run ends near the average rather than on its
+    slowest runner. The cell limit is the last candidate whether or not the
+    doubling lands on it.
 
     Args:
-        limits: The run's hard limits, read here for its concurrency.
+        limits: The run's hard limits, read here for its concurrency and
+            worker scale.
         cell_limit: The most matrix cells a run may have.
 
     Returns:
         The worker counts to try, in increasing order.
     """
-    counts, count = [], max(limits.concurrency, 1)
+    counts, count = [], max(limits.concurrency, 1) * max(limits.worker_scale, 1)
     while count < cell_limit:
         counts.append(count)
         count *= 2
@@ -130,10 +138,11 @@ def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL, limits=DEFAULT_
                         setup_seconds=WORKER_SETUP_SECONDS, groups=None):
     """Pick the first worker count whose worst worker stays inside the limits.
 
-    Partitions at the concurrency limit and doubles until every limit holds,
-    so a run that fits the first try pays one partition pass and the worst
-    case pays a handful. Every limit falls as the count rises, so the first
-    count that fits is also the cheapest one that does.
+    Partitions at the concurrency limit times the worker scale and doubles
+    until every limit holds, so a run that fits the first try pays one
+    partition pass and the worst case pays a handful. Every limit falls as the
+    count rises, so the first count that fits is also the cheapest one that
+    does.
 
     Args:
         entries: The archive entries this run will walk.

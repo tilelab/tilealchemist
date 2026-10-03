@@ -61,10 +61,15 @@ on:
         type: string
         default: "14"
       concurrency:
-        description: "How many shard-building jobs GitHub will actually run at once, which is also the worker count prepare-shards tries first: it doubles from here until its worst worker fits every limit, stopping at 256, GitHub's matrix limit. The worker count itself is never an input -- the manifests prepare-shards writes are the only truth about how many there are. GitHub queues more than ~20 concurrently running jobs on a public repo, so the default matches that; lower it to keep a small run from fanning out into mostly-empty cells (see docs/ARCHITECTURE.md \"Parallelism\" and \"Sizing a run\")."
+        description: "How many shard-building jobs GitHub will actually run at once. Times worker_scale, it is the worker count prepare-shards tries first: it doubles from there until its worst worker fits every limit, stopping at 256, GitHub's matrix limit. The worker count itself is never an input -- the manifests prepare-shards writes are the only truth about how many there are. GitHub queues more than ~20 concurrently running jobs on a public repo, so the default matches that; lower it to keep a small run from fanning out into mostly-empty cells (see docs/ARCHITECTURE.md \"Parallelism\" and \"Sizing a run\")."
         required: false
         type: string
         default: "20"
+      worker_scale:
+        description: "How many workers each concurrency lane gets at least. GitHub starts a queued worker as soon as a lane frees, so a lane that drew a fast runner works through more of them, and runner speed -- which varies by up to ~2x across GitHub's hosted CPUs -- evens out across the run instead of the slowest runner setting its end. Each extra worker costs its setup, ~1 minute. Set to \"1\" for one worker per lane (see docs/ARCHITECTURE.md \"Sizing a run\")."
+        required: false
+        type: string
+        default: "3"
       output_basename:
         description: "Base name for each profile's output .pmtiles file and artifact: one value, or a comma-separated list matched 1:1 with profile, e.g. \"land\" or \"land,cropped-waterways\"."
         required: true
@@ -198,10 +203,11 @@ jobs:
           SOURCE_URL: ${{ inputs.source_url }}
           SCHEMA: ${{ inputs.schema }}
           CONCURRENCY: ${{ inputs.concurrency }}
+          WORKER_SCALE: ${{ inputs.worker_scale }}
           ATTRIBUTION: ${{ inputs.attribution }}
           PROFILE: ${{ inputs.profile }}
         run: |
-          ARGS=(--concurrency "$CONCURRENCY" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests --profile "$PROFILE")
+          ARGS=(--concurrency "$CONCURRENCY" --worker-scale "$WORKER_SCALE" --min-zoom "$MIN_ZOOM" --max-zoom "$MAX_ZOOM" --source "$SOURCE" --out-dir manifests --profile "$PROFILE")
           # Absent on the first ever run, which prepare-shards treats as "nothing measured yet".
           if [ -f .axis-state/state/axes.json ]; then
             ARGS+=(--axis-state .axis-state/state/axes.json)

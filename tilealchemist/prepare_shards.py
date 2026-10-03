@@ -13,6 +13,7 @@ from tilealchemist.sizing import (
     MATRIX_CELL_LIMIT,
     Limits,
     TAIL_SAFETY_FACTOR,
+    WORKER_SCALE_FACTOR,
 )
 from tilealchemist.schemas import SchemaName
 from tilealchemist.shard_prep import run_prepare
@@ -26,8 +27,9 @@ resulting entries, plus computed gaps, into contiguous manifests, one per
 worker. docs/ARCHITECTURE.md ("Fetching") says why it is structured this
 way.
 
-The worker count is never an input: the run partitions at --concurrency and
-doubles until its worst worker fits every limit (see "Sizing a run"). The
+The worker count is never an input: the run partitions at --concurrency times
+--worker-scale and doubles until its worst worker fits every limit (see
+"Sizing a run"). The
 manifests it writes are the only truth about how many workers there are.
 
 Prints the layer's attribution on stdout; every log line goes to stderr.
@@ -89,11 +91,17 @@ def parse_args():
         description=HELP, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--concurrency", type=int, default=DEFAULT_CONCURRENCY,
                          help="how many workers actually run at once (default "
-                              f"{DEFAULT_CONCURRENCY}), and so the worker count the run tries "
-                              "first: it doubles from here until its worst worker fits every "
-                              f"limit, stopping at {MATRIX_CELL_LIMIT}, the most cells GitHub "
-                              "Actions will expand a matrix to. Every count tried is a multiple "
-                              "of this, so the last wave is not mostly empty")
+                              f"{DEFAULT_CONCURRENCY}). Times --worker-scale, it is the worker "
+                              "count the run tries first: it doubles from there until its worst "
+                              f"worker fits every limit, stopping at {MATRIX_CELL_LIMIT}, the most "
+                              "cells GitHub Actions will expand a matrix to. Every count tried is "
+                              "a multiple of this, so the last wave is not mostly empty")
+    parser.add_argument("--worker-scale", type=int, default=WORKER_SCALE_FACTOR,
+                         help="how many workers each concurrency lane gets at least (default "
+                              f"{WORKER_SCALE_FACTOR}). GitHub starts a queued worker as soon as "
+                              "a lane frees, so a lane that drew a fast runner works through more "
+                              "of them and runner speed evens out across the run instead of the "
+                              "slowest runner setting its end. 1 gives one worker per lane")
     parser.add_argument("--job-seconds", type=float, default=DEFAULT_JOB_SECONDS,
                          help=f"a worker job's runtime limit (default {DEFAULT_JOB_SECONDS}); "
                               f"predicted seconds are charged against it at "
@@ -151,9 +159,11 @@ def parse_args():
     except (OSError, ValueError) as error:
         parser.error(f"--axis-state: {error}")
     args.limits = Limits(job_seconds=args.job_seconds, concurrency=args.concurrency,
-                          tail_factor=TAIL_SAFETY_FACTOR)
+                          tail_factor=TAIL_SAFETY_FACTOR, worker_scale=args.worker_scale)
     if args.concurrency < 1:
         parser.error("--concurrency must be at least 1")
+    if args.worker_scale < 1:
+        parser.error("--worker-scale must be at least 1")
     try:
         args.profiles = ([load_profile(path)() for path in args.profile.split(",")]
                          if args.profile else None)

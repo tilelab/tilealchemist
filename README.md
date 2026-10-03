@@ -87,7 +87,7 @@ else.
 | `tilealchemist/attribution.py` | What a built layer credits: reads the attribution the source archive declares for itself, and fills the caller's `{source}` template in with it. |
 | `tilealchemist/pmtiles_index.py` | The source archive's directory index: header + root, then only the leaf directories the zoom range needs, in two range requests, walked and zoom-pruned in memory into directory entries -- and the gaps those entries leave, the tile id ranges the archive holds nothing for. |
 | `tilealchemist/partition.py` | Those entries and gaps into one balanced, contiguous block of work per worker. No network, no files. |
-| `tilealchemist/sizing.py` | Picks `worker_count` itself, always: partitions at `--concurrency` and doubles until the worst worker fits the job's time limit, stopping at GitHub's 256-cell matrix limit. |
+| `tilealchemist/sizing.py` | Picks `worker_count` itself, always: partitions at `--concurrency` times `--worker-scale` and doubles until the worst worker fits the job's time limit, stopping at GitHub's 256-cell matrix limit. |
 | `tilealchemist/calibration.py` | Fits the next run's cost coefficients from the last run's `usage:` lines, split into what belongs to the archive, to a profile, and to neither, with the guards that stop a bad fit being adopted. |
 | `tilealchemist/axis_state.py` | Those coefficients across runs: a ring buffer of the last 5 observations per coefficient, summarised by median so one bad runner cannot move the model. |
 | `tilealchemist/state_branch.py` | Reading and writing that state on its own orphan branch through the GitHub contents API, read-modify-write against the blob sha so concurrent runs cannot lose each other's observations. |

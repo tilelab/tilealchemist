@@ -6,14 +6,15 @@ name: Test
 #
 # It runs against real OpenFreeMap data on purpose. Real OSM geometry turns
 # up the GEOS edge cases a water profile has to survive; hand-built polygons
-# do not. concurrency 1 and a low max_zoom keep that to one shard and about
-# a minute instead of a multi-hour production run, and prepare-shards
-# downloads only the part of the archive's directory index the zoom range
-# needs (see pmtiles_index.py) -- tens of kilobytes, not the archive's full
-# ~96 MB. The worker count is not an input any more: prepare-shards starts at
-# the concurrency and doubles until its worst worker fits every limit, so a
-# run this small stops at the first try. At the default 20 it would fan a
-# 341-tile world out into 20 cells, 19 of them nearly empty.
+# do not. concurrency 1, worker_scale 1 and a low max_zoom keep that to one
+# shard and about a minute instead of a multi-hour production run, and
+# prepare-shards downloads only the part of the archive's directory index the
+# zoom range needs (see pmtiles_index.py) -- tens of kilobytes, not the
+# archive's full ~96 MB. The worker count is not an input any more:
+# prepare-shards starts at the concurrency times worker_scale and doubles
+# until its worst worker fits every limit, so a run this small stops at the
+# first try. At the defaults, 20 and 3, it would fan a 341-tile world out into
+# 60 cells, 59 of them nearly empty.
 #
 # It runs twice, once per source/schema pair the repository ships, because
 # the two differ in more than a URL: a Protomaps build lays its directory
@@ -61,6 +62,7 @@ jobs:
       # expensive.
       max_zoom: "4"
       concurrency: "1"
+      worker_scale: "1"
       # No state branch from CI. These runs stop at z4 on one worker, and a
       # coefficient fitted on ~6 MB of tile data has no business setting the
       # median a planet run is then partitioned by. Calibration is exercised by
@@ -92,6 +94,7 @@ jobs:
       min_zoom: "0"
       max_zoom: "4"
       concurrency: "1"
+      worker_scale: "1"
       # Both calls land in the same workflow run, and the pipeline names the
       # artifacts it hands between its own jobs per pipeline, not per call.
       # Namespacing this one is enough: the other's `shards-*` does not reach
