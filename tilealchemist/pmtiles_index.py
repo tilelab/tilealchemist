@@ -264,7 +264,8 @@ def collect_entries(session, url, min_zoom, max_zoom):
 
     print(f"starting decode ({header['tile_entries_count']} entries expected)", file=sys.stderr)
     entries = walk_directory_tree(root_directory, leaf_window, tile_id_start, tile_id_limit)
-    entries.sort(key=lambda entry: entry.offset)
+    # Lowest tile id first within a shared offset: that record is the run's home; see home_blocks().
+    entries.sort(key=lambda entry: (entry.offset, entry.tile_id))
     return header, entries
 
 

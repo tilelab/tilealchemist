@@ -115,9 +115,13 @@ class TransformUsage:
             the same tiles.
         buckets: Per-bucket `[calls, bytes, decode]`, bucketed by the bit length
             of the tile, which is the shape the decode axes are fitted against.
-        block_seconds: Seconds every profile spent together, per tile block.
-            A block whose entries were all deduplicated against an earlier
-            decode is recorded at zero, which is a measurement, not a hole.
+        block_seconds: Seconds every profile spent together, per home tile
+            block -- the block of the record that decoded the blob, as
+            `home_blocks()` defines it.
+        block_bytes: Output payload bytes every profile wrote together, per
+            home tile block, a deduplicated tile's included under the blob's
+            home rather than its own. A block that wrote nothing is recorded
+            at zero, which is a measurement, not a hole.
     """
 
     def __init__(self, profile_count=0):
@@ -136,15 +140,25 @@ class TransformUsage:
         self.profile_output_bytes = [0] * profile_count
         self.buckets = [[0, 0, 0.0] for _ in range(LENGTH_BUCKET_COUNT)]
         self.block_seconds = {}
+        self.block_bytes = {}
 
     def add_block(self, block, seconds):
         """Charge profile seconds to one tile block.
 
         Args:
-            block: The block's key, as `tile_block()` gives it.
-            seconds: The seconds to add, zero to record the block as walked.
+            block: The block's key, as `home_blocks()` gives it.
+            seconds: The seconds to add.
         """
         self.block_seconds[block] = self.block_seconds.get(block, 0.0) + seconds
+
+    def add_block_bytes(self, block, byte_count):
+        """Charge written output bytes to one tile block.
+
+        Args:
+            block: The block's key, as `home_blocks()` gives it.
+            byte_count: The bytes to add, zero to record the block as walked.
+        """
+        self.block_bytes[block] = self.block_bytes.get(block, 0) + byte_count
 
     def add_decode(self, length, decode_seconds, profile_seconds, block):
         """Record one tile's decode, and what each profile spent on it.
@@ -191,6 +205,8 @@ class TransformUsage:
             bucket[2] += addend[2]
         for block, seconds in other.block_seconds.items():
             self.add_block(block, seconds)
+        for block, byte_count in other.block_bytes.items():
+            self.add_block_bytes(block, byte_count)
 
     def transform_seconds(self):
         """What every profile spent together.
@@ -217,7 +233,8 @@ class TransformUsage:
 
         The per-profile seconds are left out: they belong on the `scope=profile`
         line, which is already keyed by the profile they were measured on. So
-        are the per-block seconds, which have a `scope=blocks` line of their own.
+        are the per-block seconds and bytes, which have a `scope=blocks` line
+        of their own.
 
         Returns:
             A mapping of field name to value.

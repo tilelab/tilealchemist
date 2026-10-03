@@ -30,11 +30,11 @@ HELP = """Merges every worker's `usage:` lines into the shared axis state.
 
 One writer for the whole run, the way tiledistillery's record-timings job is
 (see docs/ARCHITECTURE.md "Measuring a run"). It fits what the run measured,
-splits it by what each coefficient belongs to -- the archive, a profile, or
-neither -- and appends each to its own history on the state branch, where the
-next run reads the median of the last few. The profiles' seconds per tile
-block go the same way, into a file of their own per archive and profile set
-(see "Measured tile blocks").
+splits it by what each coefficient belongs to -- the archive, or neither --
+and appends each to its own history on the state branch, where the next run
+reads the median of the last few. What the profiles cost -- their seconds and
+their written bytes per tile block -- goes the same way, into a file of its
+own per archive and profile set (see "Measured tile blocks").
 
 It pushes nothing unless every worker reported: a partial run is a biased
 sample, because the workers that failed are the expensive ones.
@@ -89,7 +89,8 @@ def parse_args():
     parser.add_argument("--state-path", default=DEFAULT_STATE_PATH,
                          help=f"the state file's path on that branch (default {DEFAULT_STATE_PATH})")
     parser.add_argument("--block-state-dir", default=block_state.DEFAULT_BLOCK_STATE_DIR,
-                         help="directory on that branch holding the per-tile-block seconds, one "
+                         help="directory on that branch holding the per-tile-block seconds and "
+                              "written bytes, one "
                               "file per archive and profile set (default "
                               f"{block_state.DEFAULT_BLOCK_STATE_DIR})")
     parser.add_argument("--out", default=None,
@@ -239,7 +240,7 @@ def main():
         return document
 
     def mutate_blocks(document):
-        """Append this run's per-block seconds to whatever the branch already held.
+        """Append this run's per-block seconds and bytes to whatever the branch already held.
 
         Args:
             document: The block document as read.
@@ -284,7 +285,7 @@ def main():
 
 
 def _measure_blocks(rows, workers):
-    """The run's per-block seconds, where every worker reported them.
+    """The run's per-block seconds and bytes, where every worker reported them.
 
     Args:
         rows: Parsed usage rows for the whole run.

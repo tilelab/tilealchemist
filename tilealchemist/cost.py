@@ -35,11 +35,12 @@ DEFAULT_WRITTEN_SHARE = 1.0
 DEFAULT_TRANSFORM_PARALLELISM = 1.0
 
 # Everything a prediction is made from, so that no two callers can price a run differently.
-CostModel = namedtuple("CostModel", "axis profiles transform_parallelism block_seconds")
+CostModel = namedtuple(
+    "CostModel", "axis profiles transform_parallelism block_seconds block_bytes")
 
 
 def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None,
-               block_seconds=None):
+               block_seconds=None, block_bytes=None):
     """Assemble what a run is priced by.
 
     These travel together because splitting them is how they drift apart:
@@ -53,10 +54,13 @@ def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None,
             prices tilealchemist's own work alone.
         transform_parallelism: Seconds of in-pool work one second of a
             worker's wall clock buys, or None for a worker with no pool.
-        block_seconds: The pooled profile seconds measured per tile block for
-            this run's archive and profile set, or None where nothing was
-            measured. A measured block's figure replaces the profiles'
-            per-tile seconds for every record in it.
+        block_seconds: The pooled profile seconds measured per home tile
+            block for this run's archive and profile set, or None where
+            nothing was measured. A measured block's figure replaces the
+            profiles' per-tile seconds for every record homed in it.
+        block_bytes: The output bytes measured per home tile block, the same
+            way. A measured block's figure replaces the profiles' declared
+            weight and written share for every record homed in it.
 
     Returns:
         The CostModel to price with.
@@ -65,7 +69,8 @@ def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None,
                      transform_parallelism=(DEFAULT_TRANSFORM_PARALLELISM
                                             if transform_parallelism is None
                                             else transform_parallelism),
-                     block_seconds=block_seconds or {})
+                     block_seconds=block_seconds or {},
+                     block_bytes=block_bytes or {})
 
 
 DEFAULT_COST_MODEL = cost_model()
@@ -89,12 +94,14 @@ def _record_costs(model, records):
     while `fetch_batch_blob()` and `ShardWriter.write()` run in the worker
     itself, one batch at a time.
 
-    Where the model carries a measurement for a record's tile block, the
-    profiles' share is that measurement instead, charged once on the block's
-    first record and nothing on the rest: the block is what was measured, and
-    a partition that keeps blocks whole never needs it spread any finer.
-    Records arrive in offset order, where one block's records are interleaved
-    with others', so "first" means the first seen, not the first in a run.
+    Where the model carries a measurement for a record's home tile block --
+    the block of the record that decodes its blob, as `home_blocks()` defines
+    it -- the profiles' seconds and the write are that measurement instead,
+    each charged once on the block's first decoding record and nothing on the
+    rest: the block is what was measured, and a partition that keeps blocks
+    whole never needs it spread any finer. Records arrive in offset order,
+    where one block's records are interleaved with others', so "first" means
+    the first seen, not the first in a run.
 
     Args:
         model: The CostModel to price with.
@@ -107,29 +114,29 @@ def _record_costs(model, records):
     pooled_per_tile = profile_seconds(model.profiles) / model.transform_parallelism
     write_seconds = axis.written_byte * written_bytes_per_tile(model.profiles)
     gap_write_seconds = axis.written_byte * gap_bytes_per_tile(model.profiles)
-    measured = model.block_seconds
+    measured_seconds, measured_bytes = model.block_seconds, model.block_bytes
     charged_blocks = set()
-    previous_key = None
+    previous_key = home = None
     for record in records:
         if not record.length:
             yield axis.manifest_record + gap_write_seconds * record.run_length
             continue
         entry = 0.0
-        block_measured = False
-        if measured:
-            block = tile_block(record.tile_id)
-            block_measured = block in measured
-            if block_measured and block not in charged_blocks:
-                entry += measured[block] / model.transform_parallelism
-                charged_blocks.add(block)
         key = (record.offset, record.length)
         if key != previous_key:
+            # Inlined home_blocks(): this is the hot loop of every partition pass.
+            home = tile_block(record.tile_id)
+            if home not in charged_blocks:
+                charged_blocks.add(home)
+                entry += (measured_seconds.get(home, 0.0) / model.transform_parallelism
+                          + axis.written_byte * measured_bytes.get(home, 0.0))
             entry += (axis.fetched_byte * record.length
                       + (axis.decode_call + axis.decoded_byte * record.length)
                       / model.transform_parallelism
-                      + (0.0 if block_measured else pooled_per_tile))
+                      + (0.0 if home in measured_seconds else pooled_per_tile))
             previous_key = key
-        yield axis.manifest_record + entry + write_seconds * record.run_length
+        write = 0.0 if home in measured_bytes else write_seconds * record.run_length
+        yield axis.manifest_record + entry + write
 
 
 def profile_seconds(profile_costs):

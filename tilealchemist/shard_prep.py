@@ -4,7 +4,7 @@ import sys
 
 from tilealchemist import axis_state, block_state
 from tilealchemist.attribution import compose_attribution, fetch_declared_attribution
-from tilealchemist.cost import WORKER_SETUP_SECONDS, cost_model
+from tilealchemist.cost import WORKER_SETUP_SECONDS, ProfileCost, cost_model
 from tilealchemist.manifest import axis_key_for, write_source_metadata, write_worker_manifests
 from tilealchemist.partition import count_gap_tiles, count_output_tiles, tile_block_groups
 from tilealchemist.sizing import block_loads, breaches, choose_worker_count, worst_of
@@ -58,8 +58,8 @@ def run_prepare(args):
     measured_count = sum(1 for block in groups.blocks if block in model.block_seconds)
     largest = max(groups.seconds, default=0.0)
     print(f"{len(groups.blocks)} tile blocks of up to {2 ** TILE_BLOCK_BITS} tiles, "
-          f"{measured_count} of them costed from their measured profile seconds and the rest "
-          f"from the model; "
+          f"{measured_count} of them costed from their measured profile seconds and bytes and "
+          f"the rest from the profiles' declared figures; "
           f"the costliest is {largest / 60:.1f}m, which no worker's share can go below",
           file=sys.stderr)
 
@@ -125,11 +125,12 @@ def _settle_costs(args, resolved_source):
     """Work out what this run will be charged, and keep it here.
 
     Everything is settled together because it is one decision: the five
-    per-axis seconds, what each profile costs, what one worker's process pool
-    buys, and what a worker costs before it starts. Where the state branch has
-    recorded runs, each figure is the median of them, which one odd run cannot
-    move far on its own. Where it has none, the reviewed constants and the
-    profiles' own declared estimates stand.
+    per-axis seconds, what each tile block costs the profiles, what one
+    worker's process pool buys, and what a worker costs before it starts.
+    Where the state branch has recorded runs, each figure is the median of
+    them, which one odd run cannot move far on its own. Where it has none, the
+    reviewed constants stand, and a block nothing measured is charged the
+    profiles' own declared estimates.
 
     A gap tile's weight is settled by measurement either way, by asking each
     profile once before any network work happens.
@@ -161,27 +162,53 @@ def _settle_costs(args, resolved_source):
               f"{axis_state.history_depth(document)} recorded run(s) of "
               f"{axis_state.HISTORY_LENGTH}, each coefficient the median of its own",
               file=sys.stderr)
-    profile_costs, lines = axis_state.settle_profile_costs(
-        document if document is not None else axis_state.empty_document(),
-        args.profiles, resolved_source.schema, notes)
-    for line in lines:
-        print(f"costing: {line}", file=sys.stderr)
+    profile_costs = _declared_profile_costs(args.profiles, resolved_source.schema)
     for note in notes:
         print(f"::warning title=axis state::{note}", file=sys.stderr)
-    block_seconds = {}
+    blocks = block_state.NO_BLOCK_COSTS
     if args.block_state and args.profiles:
         source_key = axis_key_for(resolved_source.url, resolved_source.schema.name)
         profiles_key = profile_combo_key(profile.name for profile in args.profiles)
-        block_seconds = block_state.read_block_medians(args.block_state, source_key,
-                                                       profiles_key)
-        print(f"block state: {len(block_seconds)} tile blocks measured for "
+        blocks = block_state.read_block_costs(args.block_state, source_key, profiles_key)
+        print(f"block state: {len(blocks.seconds)} tile blocks' seconds and "
+              f"{len(blocks.written_bytes)} blocks' written bytes measured for "
               f"{source_key}/{profiles_key}, each the median of up to "
               f"{axis_state.HISTORY_LENGTH} runs", file=sys.stderr)
     model = cost_model(axis=axis, profiles=profile_costs, transform_parallelism=parallelism,
-                       block_seconds=block_seconds)
+                       block_seconds=blocks.seconds, block_bytes=blocks.written_bytes)
     print(f"costing: one worker's pool buys {model.transform_parallelism:.2f}s of decode and "
           f"profile work per second of its wall clock", file=sys.stderr)
     return model, setup_seconds
+
+
+def _declared_profile_costs(profiles, schema):
+    """What each profile says it costs, for every tile block nothing measured yet.
+
+    Only a gap tile's weight is measured here, by asking the profile once --
+    there is nothing to estimate. Everything else is the profile's own
+    declaration: what a profile measurably costs is kept per tile block, for
+    one archive and one profile set, and a block that has it is charged that
+    instead (see docs/ARCHITECTURE.md "Measured tile blocks").
+
+    Args:
+        profiles: The profile instances the run will build, or None.
+        schema: The schema the output is written against, for the gap question.
+
+    Returns:
+        One ProfileCost per profile, in the same order.
+    """
+    costs = []
+    for profile in profiles or []:
+        costs.append(ProfileCost(name=profile.name,
+                                 seconds_per_tile=profile.seconds_per_tile,
+                                 bytes_per_output_tile=profile.bytes_per_output_tile,
+                                 gap_bytes=profile.gap_bytes(schema),
+                                 written_share=profile.written_share))
+        print(f"costing: profile {profile.name}: {profile.seconds_per_tile:.3g}s and "
+              f"{profile.bytes_per_output_tile:.0f}B per real tile, written on "
+              f"{profile.written_share:.1%} of the tiles it is handed (declared, for unmeasured "
+              f"blocks), {costs[-1].gap_bytes:.0f}B per gap tile (measured)", file=sys.stderr)
+    return costs
 
 
 def _tiles_line(blocks):

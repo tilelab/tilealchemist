@@ -1,12 +1,9 @@
 """The measured axes a run keeps for the next one; see docs/ARCHITECTURE.md "Measuring a run"."""
 import statistics
 
-from tilealchemist.cost import ProfileCost
 from tilealchemist.calibration import (
-    REVIEWED_PROFILE,
     REVIEWED_SHARED,
     REVIEWED_SOURCE,
-    ProfileAxes,
     SharedAxes,
     SourceAxes,
     adopt_group,
@@ -26,7 +23,7 @@ def empty_document():
         The document, which every reader below treats as "nothing measured
         yet" and therefore falls back to the reviewed coefficients on.
     """
-    return {"version": VERSION, "sources": {}, "profiles": {}, "shared": {}}
+    return {"version": VERSION, "sources": {}, "shared": {}}
 
 
 def _observations(entry, name):
@@ -106,6 +103,8 @@ def record_run(document, measurement, build=None):
         A line per section saying what was recorded, for the job log.
     """
     document.setdefault("version", VERSION)
+    # A profile's cost is the block state's to keep, per archive and profile set; see block_state.py.
+    document.pop("profiles", None)
     lines = []
     if measurement.source_key:
         entry = document.setdefault("sources", {}).setdefault(measurement.source_key, {})
@@ -113,10 +112,6 @@ def record_run(document, measurement, build=None):
             entry["build"] = build
         recorded = _record_group(entry, measurement.source)
         lines.append(f"source {measurement.source_key}: recorded {', '.join(recorded) or 'nothing'}")
-    for name, measured in sorted(measurement.profiles.items()):
-        entry = document.setdefault("profiles", {}).setdefault(name, {})
-        recorded = _record_group(entry, measured)
-        lines.append(f"profile {name}: recorded {', '.join(recorded) or 'nothing'}")
     recorded = _record_group(document.setdefault("shared", {}), measurement.shared)
     lines.append(f"shared: recorded {', '.join(recorded) or 'nothing'}")
     return lines
@@ -136,22 +131,6 @@ def source_axes(document, source_key, notes):
     entry = document.get("sources", {}).get(source_key, {})
     measured = SourceAxes(**{name: _summarize(entry, name) for name in SourceAxes._fields})
     return adopt_group(measured, REVIEWED_SOURCE, notes, prefix=f"{source_key}.")
-
-
-def profile_axes(document, profile_name, notes):
-    """What one profile's recorded runs say it costs.
-
-    Args:
-        document: The state document.
-        profile_name: The profile's name, as it reports itself.
-        notes: The list any fallback explanation is appended to.
-
-    Returns:
-        The ProfileAxes to charge, every field usable.
-    """
-    entry = document.get("profiles", {}).get(profile_name, {})
-    measured = ProfileAxes(**{name: _summarize(entry, name) for name in ProfileAxes._fields})
-    return adopt_group(measured, REVIEWED_PROFILE, notes, prefix=f"{profile_name}.")
 
 
 def shared_axes(document, notes):
@@ -185,52 +164,6 @@ def axis_seconds(document, source_key, notes):
     return axis_seconds_of(source_axes(document, source_key, notes), shared), shared
 
 
-def settle_profile_costs(document, profiles, schema, notes):
-    """Work out what each profile will actually be charged for this run.
-
-    Three sources, in order of authority. A gap tile's weight is *measured*,
-    by asking the profile once -- there is nothing to estimate. A real tile's
-    weight, the share of tiles written at all, and the profile's seconds come
-    from the recorded runs where there are any, as the median of them. Failing
-    that they fall back to what the profile declared.
-
-    The result is returned rather than written back onto the profiles: the
-    caller owns what it decided to charge, and a profile object stays the
-    behaviour it is instead of also being a mutable ledger.
-
-    Args:
-        document: The state document.
-        profiles: The profile instances the run will build, or None.
-        schema: The schema the output is written against, for the gap question.
-        notes: The list any fallback explanation is appended to.
-
-    Returns:
-        One ProfileCost per profile in the same order, and a line per profile
-        saying what it came to.
-    """
-    costs, lines = [], []
-    for profile in profiles or []:
-        recorded = document.get("profiles", {}).get(profile.name)
-        # Only asked where something was recorded: its notes would name the wrong fallback.
-        if recorded:
-            measured = profile_axes(document, profile.name, notes)
-        else:
-            measured = ProfileAxes(seconds_per_tile=profile.seconds_per_tile,
-                                   bytes_per_output_tile=profile.bytes_per_output_tile,
-                                   written_share=profile.written_share)
-        costs.append(ProfileCost(name=profile.name,
-                                 seconds_per_tile=measured.seconds_per_tile,
-                                 bytes_per_output_tile=measured.bytes_per_output_tile,
-                                 gap_bytes=profile.gap_bytes(schema),
-                                 written_share=measured.written_share))
-        origin = "measured" if recorded else "declared, nothing measured yet"
-        lines.append(f"profile {profile.name}: {measured.seconds_per_tile:.3g}s and "
-                     f"{measured.bytes_per_output_tile:.0f}B per real tile ({origin}), "
-                     f"written on {measured.written_share:.1%} of the tiles it is handed, "
-                     f"{costs[-1].gap_bytes:.0f}B per gap tile (measured)")
-    return costs, lines
-
-
 def history_depth(document):
     """How many runs the shallowest recorded coefficient rests on.
 
@@ -245,11 +178,9 @@ def history_depth(document):
         and zero where nothing is recorded at all.
     """
     depths = []
-    for section, fields in (("sources", SourceAxes._fields),
-                             ("profiles", ProfileAxes._fields)):
-        for entry in document.get(section, {}).values():
-            depths.extend(len(_observations(entry, name)) for name in fields
-                          if name in entry)
+    for entry in document.get("sources", {}).values():
+        depths.extend(len(_observations(entry, name)) for name in SourceAxes._fields
+                      if name in entry)
     shared = document.get("shared", {})
     depths.extend(len(_observations(shared, name)) for name in SharedAxes._fields
                   if name in shared)

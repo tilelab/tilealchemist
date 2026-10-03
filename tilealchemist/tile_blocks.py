@@ -1,4 +1,4 @@
-"""Fixed tile-id blocks, the unit a profile's measured seconds are kept under; see docs/ARCHITECTURE.md "Measured tile blocks"."""
+"""Fixed tile-id blocks, the unit the profiles' measured seconds and bytes are kept under; see docs/ARCHITECTURE.md "Measured tile blocks"."""
 import bisect
 
 # 4**6 = 4096 tiles: one z8 cell at z14, and a whole zoom level up to z6.
@@ -27,6 +27,33 @@ def tile_block(tile_id):
     return zoom_base + ((tile_id - zoom_base) >> TILE_BLOCK_BITS << TILE_BLOCK_BITS)
 
 
+def home_blocks(records):
+    """The block each record is measured, priced and partitioned under.
+
+    That is the block of the record that decodes its blob -- the first of its
+    `(offset, length)` run in offset order, which is the lowest tile id
+    pointing there -- and not the record's own. A deduplicated tile points
+    back at the blob its first copy wrote, so keyed by its own block it would
+    drag that far-away offset into whichever worker holds its tile, and every
+    such worker paid a range request per stretch of them: 84 on worker 2 of
+    standardprofiles run 37037515494, against 1 on worker 0, which nothing
+    pointed back before. Keyed by its home, a run of consecutive blocks is
+    one stretch of the archive's bytes.
+
+    Args:
+        records: Real manifest records, in offset order.
+
+    Yields:
+        The home block of each record, in the same order.
+    """
+    previous_key = home = None
+    for record in records:
+        key = (record.offset, record.length)
+        if key != previous_key:
+            home, previous_key = tile_block(record.tile_id), key
+        yield home
+
+
 def profile_combo_key(names):
     """What a set of profiles' measured block seconds are filed under.
 
@@ -43,30 +70,30 @@ def profile_combo_key(names):
     return "+".join(sorted(names))
 
 
-def format_block_seconds(block_seconds):
-    """Render per-block seconds as one usage-line field value.
+def format_block_values(block_values):
+    """Render one figure per block -- seconds, or bytes -- as one usage-line field value.
 
     Args:
-        block_seconds: A mapping of block key to seconds.
+        block_values: A mapping of block key to its figure.
 
     Returns:
-        `block:seconds` per block in key order, separated by `|`, or `-` where
-        there are none.
+        `block:value` per block in key order, separated by `|`, or `-` where
+        there are none. A byte count stays whole; seconds keep six digits.
     """
-    return "|".join(f"{block}:{seconds:.6g}"
-                    for block, seconds in sorted(block_seconds.items())) or "-"
+    return "|".join(f"{block}:{value if isinstance(value, int) else format(value, '.6g')}"
+                    for block, value in sorted(block_values.items())) or "-"
 
 
-def parse_block_seconds(value):
-    """Read per-block seconds back from a usage-line field value.
+def parse_block_values(value):
+    """Read one figure per block back from a usage-line field value.
 
     Args:
-        value: The field as `format_block_seconds()` wrote it.
+        value: The field as `format_block_values()` wrote it.
 
     Returns:
-        A mapping of block key to seconds.
+        A mapping of block key to its figure.
     """
     if not value or value == "-":
         return {}
     pairs = (item.split(":") for item in value.split("|"))
-    return {int(block): float(seconds) for block, seconds in pairs}
+    return {int(block): float(figure) for block, figure in pairs}

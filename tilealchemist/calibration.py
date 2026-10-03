@@ -3,16 +3,11 @@ import json
 import math
 from collections import namedtuple
 
-from tilealchemist.cost import (AXIS_SECONDS, DEFAULT_BYTES_PER_OUTPUT_TILE,
-                                DEFAULT_SECONDS_PER_TILE, DEFAULT_TRANSFORM_PARALLELISM,
-                                DEFAULT_WRITTEN_SHARE, WORKER_SETUP_SECONDS, AxisSeconds)
+from tilealchemist.cost import (AXIS_SECONDS, DEFAULT_TRANSFORM_PARALLELISM,
+                                WORKER_SETUP_SECONDS, AxisSeconds)
 
 # What the archive costs: its fetch rate, and what its tiles cost to decode.
 SourceAxes = namedtuple("SourceAxes", "fetched_byte decode_call decoded_byte")
-
-# What a profile costs: its own shapely, how heavy its tiles are, and how many it writes at all.
-ProfileAxes = namedtuple(
-    "ProfileAxes", "seconds_per_tile bytes_per_output_tile written_share")
 
 # What belongs to neither: tilealchemist's own bookkeeping, the runner's disk, and its cores.
 SharedAxes = namedtuple(
@@ -22,17 +17,13 @@ REVIEWED_SOURCE = SourceAxes(fetched_byte=AXIS_SECONDS.fetched_byte,
                              decode_call=AXIS_SECONDS.decode_call,
                              decoded_byte=AXIS_SECONDS.decoded_byte)
 
-REVIEWED_PROFILE = ProfileAxes(seconds_per_tile=DEFAULT_SECONDS_PER_TILE,
-                               bytes_per_output_tile=DEFAULT_BYTES_PER_OUTPUT_TILE,
-                               written_share=DEFAULT_WRITTEN_SHARE)
-
 REVIEWED_SHARED = SharedAxes(manifest_record=AXIS_SECONDS.manifest_record,
                              written_byte=AXIS_SECONDS.written_byte,
                              worker_setup_seconds=WORKER_SETUP_SECONDS,
                              transform_parallelism=DEFAULT_TRANSFORM_PARALLELISM)
 
 RunMeasurement = namedtuple(
-    "RunMeasurement", "source_key source profiles shared diagnostics notes")
+    "RunMeasurement", "source_key source shared diagnostics notes")
 
 
 def parse_usage_lines(lines):
@@ -242,49 +233,6 @@ def measure_source(rows):
                       decoded_byte=decode_fit[1] if decode_fit else None)
 
 
-def measure_profiles(rows):
-    """Fit what each profile costs, from its own usage rows.
-
-    A profile's seconds are charged per *distinct* entry, because
-    `_entry_outputs()` runs it once per decode rather than once per record, so
-    the run's decode count is the denominator its rate belongs over. They stay
-    the CPU seconds they were measured as, summed across the pool processes
-    that spent them: what a profile's shapely costs belongs to the profile,
-    and how many of those seconds fit into one worker's wall clock belongs to
-    the runner, where `transform_parallelism` keeps it.
-
-    `bytes_per_output_tile` counts real tiles only. Gap tiles are excluded from
-    both sides of it: they are a different size, their share of a run swings
-    from 0% to 94%, and their size is known exactly anyway -- `prepare-shards`
-    asks `transform_gap()` rather than fitting it. Averaging the two
-    populations would let the mix set the figure instead of either one.
-
-    `written_share` is what reconciles that denominator with the cost model's
-    numerator. A profile is handed every tile in the run and writes only the
-    ones it has something to say about, so a figure measured per *written*
-    tile must be scaled by the share written before it can be charged on every
-    tile in a record.
-
-    Args:
-        rows: Parsed usage rows for the whole run.
-
-    Returns:
-        A mapping of profile name to its measured ProfileAxes, any field None
-        where nothing usable was measured.
-    """
-    decode_calls = _total(_scoped(rows, "worker"), "decode_calls")
-    measured = {}
-    for name in sorted({row["profile"] for row in _scoped(rows, "profile") if "profile" in row}):
-        owned = [row for row in _scoped(rows, "profile") if row.get("profile") == name]
-        real_written = _total(owned, "written") - _total(owned, "gap_tiles")
-        real_skipped = _total(owned, "skipped") - _total(owned, "gap_skipped")
-        measured[name] = ProfileAxes(
-            seconds_per_tile=_ratio(_total(owned, "transform_seconds"), decode_calls),
-            bytes_per_output_tile=_ratio(_total(owned, "output_bytes"), real_written),
-            written_share=_ratio(real_written, real_written + real_skipped))
-    return measured
-
-
 def measure_transform_parallelism(rows):
     """Fit how many seconds of in-pool work one second of wall clock buys.
 
@@ -376,7 +324,6 @@ def measure_run(rows, runner_overhead_seconds=None):
         "transform_seconds": transform_total,
     }
     return RunMeasurement(source_key=key, source=measure_source(rows),
-                          profiles=measure_profiles(rows),
                           shared=measure_shared(rows, runner_overhead_seconds),
                           diagnostics=diagnostics, notes=notes)
 
@@ -389,7 +336,7 @@ def adopt_group(measured, reviewed, notes, prefix=""):
         reviewed: The reviewed group of the same type.
         notes: The list any explanation is appended to.
         prefix: Prepended to each coefficient's name in a note, so that a note
-            says which profile or archive it is about.
+            says which archive it is about.
 
     Returns:
         A group of the same type, every field usable.
@@ -407,8 +354,8 @@ def axis_seconds_of(source, shared):
         shared: The coefficients belonging to neither archive nor profile.
 
     Returns:
-        The AxisSeconds the cost model charges. A profile's own two
-        coefficients are not here: they travel on the profile.
+        The AxisSeconds the cost model charges. A profile's own cost is not
+        here: the block state measures it per tile block.
     """
     return AxisSeconds(manifest_record=shared.manifest_record,
                        decode_call=source.decode_call,
@@ -487,8 +434,6 @@ def proposal_lines(measurement):
     lines = [f"{'coefficient':<26}{'reviewed':>14}{'measured':>14}"]
     lines.extend(_group_lines(f"source {measurement.source_key}", measurement.source,
                               REVIEWED_SOURCE))
-    for name, measured in sorted(measurement.profiles.items()):
-        lines.extend(_group_lines(f"profile {name}", measured, REVIEWED_PROFILE))
     lines.extend(_group_lines("shared", measurement.shared, REVIEWED_SHARED))
     share = measurement.diagnostics.get("decode_share")
     if share is not None:

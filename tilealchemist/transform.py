@@ -78,7 +78,7 @@ def _entry_outputs(tile_data, entry, profiles, schema, usage, block):
         profiles: The profiles to run, in output order.
         schema: The schema the tile is encoded in.
         usage: The accounting to charge the decode and the transform to.
-        block: The tile block the profiles' seconds are charged to.
+        block: The home tile block the profiles' seconds are charged to.
 
     Returns:
         One output per profile, in the same order, None where a profile
@@ -132,18 +132,17 @@ def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progre
     tile_id_start, tile_id_limit = tile_id_bounds(min_zoom, max_zoom)
     results = [[] for _ in profiles]
     previous_key = None
-    outputs = None
+    outputs = block = None
     for entry in batch_entries:
         # Offset order puts duplicate bytes adjacent, so one check dedupes for every profile.
         key = (entry.offset, entry.length)
-        block = tile_block(entry.tile_id)
         if key != previous_key:
+            # The decoding record's block is the whole run's home; see home_blocks().
+            block = tile_block(entry.tile_id)
             start = entry.offset - batch_offset
             outputs = _entry_outputs(blob[start:start + entry.length], entry, profiles, schema,
                                       usage, block)
             previous_key = key
-        else:
-            usage.add_block(block, 0.0)
         usage.entries += 1
         transform_progress.tick(tileid_to_zxy(entry.tile_id))
         run_start = max(entry.tile_id, tile_id_start)
@@ -151,8 +150,11 @@ def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom, transform_progre
         if run_length <= 0:
             continue
         usage.output_tiles += run_length
+        written = 0
         for index, (profile_results, output_data) in enumerate(zip(results, outputs)):
             profile_results.append((run_start, run_length, output_data))
             if output_data:
                 usage.profile_output_bytes[index] += len(output_data) * run_length
+                written += len(output_data) * run_length
+        usage.add_block_bytes(block, written)
     return results

@@ -18,7 +18,7 @@ HELP = """Proposes the next run's cost coefficients from the last run's logs.
 Reads the `usage:` lines a run's workers printed (see docs/ARCHITECTURE.md
 "Measuring a run"), aggregates them as ratios rather than as means of
 per-unit rates, and prints what it would change, grouped by what each
-coefficient belongs to: the archive, a profile, or neither. It never edits
+coefficient belongs to: the archive, or neither. It never edits
 cost.py and it never writes the state branch -- that is
 `tilealchemist-merge-axes`, which a pipeline runs by itself. This is the
 by-hand tool: --out writes a flat calibration.json for a caller to keep, and a
@@ -117,8 +117,6 @@ def main():
     if args.out:
         payload = {"axis_seconds": proposed._asdict(),
                    "worker_setup_seconds": shared.worker_setup_seconds,
-                   "profiles": {name: measured._asdict()
-                                for name, measured in sorted(measurement.profiles.items())},
                    "source_key": measurement.source_key,
                    "diagnostics": measurement.diagnostics,
                    "notes": measurement.notes + notes}

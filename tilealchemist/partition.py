@@ -3,9 +3,9 @@ from array import array
 from collections import namedtuple
 
 from tilealchemist.cost import DEFAULT_COST_MODEL, cost_weights
-from tilealchemist.tile_blocks import tile_block
+from tilealchemist.tile_blocks import home_blocks
 
-# Every tile block in a run, what each is predicted to cost, and which block each record is in.
+# Every home tile block in a run, what each is predicted to cost, and each record's block.
 TileBlockGroups = namedtuple("TileBlockGroups", "blocks seconds of_record")
 
 
@@ -80,13 +80,17 @@ def partition_by_cost(records, worker_count, model=DEFAULT_COST_MODEL):
 
 
 def tile_block_groups(records, model=DEFAULT_COST_MODEL):
-    """Group records by tile block, each block priced as a whole.
+    """Group records by home tile block, each block priced as a whole.
 
+    A record goes with the block of the record that decodes its blob, not its
+    own (see `home_blocks()`), so that a deduplicated tile travels with the
+    bytes it points at instead of pulling them into another worker's fetch.
     The records arrive in offset order, which is what a worker fetches by,
-    and in that order one block's records are interleaved with other blocks':
-    a deduplicated tile points back at the blob its first copy wrote, however
-    far away that copy is. So a block is not a run of records but a set of
-    them, kept as one group index per record.
+    and the groups are numbered in that order too, each where its first byte
+    falls -- the order `partition_by_tile_block()` hands them out in. One
+    block's records can still be interleaved with other blocks', so a block is
+    not a run of records but a set of them, kept as one group index per
+    record.
 
     Done once per run rather than once per worker count tried: grouping is a
     pass over every record and the tile-block arithmetic on each, and both are
@@ -98,13 +102,13 @@ def tile_block_groups(records, model=DEFAULT_COST_MODEL):
 
     Returns:
         A TileBlockGroups: each group's block key and predicted seconds, in
-        order of first appearance, and the group index of every record.
+        byte offset order of their first records, and the group index of
+        every record.
     """
     group_of_block, blocks, seconds = {}, [], []
     of_record = array("I")
     weights, _total = cost_weights(records, model)
-    for record, weight in zip(records, weights):
-        block = tile_block(record.tile_id)
+    for block, weight in zip(home_blocks(records), weights):
         group = group_of_block.get(block)
         if group is None:
             group = group_of_block[block] = len(blocks)
@@ -118,11 +122,13 @@ def tile_block_groups(records, model=DEFAULT_COST_MODEL):
 def partition_by_tile_block(records, groups, worker_count):
     """Fill each worker with whole tile blocks until the next one does not fit.
 
-    Blocks are handed out in tile id order, so a worker holds one stretch of
-    the map and, the archive being written in roughly that order, one stretch
-    of its bytes. A worker's share ends at a fixed point of the run's
-    cumulative cost, `total * (i + 1) / worker_count`, rather than at a
-    per-worker budget, so that what one worker leaves short is the next one's
+    Blocks are handed out in byte offset order -- the order `groups` already
+    holds them in, each where its first record falls -- so a worker holds one
+    stretch of the archive's bytes and fetches it in one range request,
+    whatever order the archive wrote its tiles in. Tile id order only came to
+    the same thing for an archive clustered by tile id. A worker's share ends
+    at a fixed point of the run's cumulative cost,
+    `total * (i + 1) / worker_count`, rather than at a per-worker budget, so that what one worker leaves short is the next one's
     to take instead of piling up on the last. A block bigger than a whole
     share still goes to a worker of its own rather than being split.
 
@@ -138,7 +144,7 @@ def partition_by_tile_block(records, groups, worker_count):
     total_weight = sum(groups.seconds)
     worker_of_group = [0] * len(groups.blocks)
     worker_index, held, assigned_weight = 0, 0, 0.0
-    for group in sorted(range(len(groups.blocks)), key=groups.blocks.__getitem__):
+    for group in range(len(groups.blocks)):
         weight = groups.seconds[group]
         if (worker_index < worker_count - 1 and held
                 and assigned_weight + weight

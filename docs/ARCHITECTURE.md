@@ -312,11 +312,13 @@ the one the worker itself makes: `run_transform()` fans a batch out across
 a time. Charging a summed figure to a wall clock overstates it by whatever the
 pool bought.
 
-**The write is charged on `bytes_per_output_tile × written_share`.** A profile
-is handed every tile in the run and writes only the ones it has something to
-say about; `bytes_per_output_tile` is measured over the tiles it *wrote*, so
-charging it on every tile in a record bills an ocean for a coastline that is
-not in it.
+**The write is charged on bytes.** Where the record's tile block has been
+measured, on the bytes that block wrote last time (see "Measured tile
+blocks"). Where it has not, on the profile's declared `bytes_per_output_tile ×
+written_share`: a profile is handed every tile in the run and writes only the
+ones it has something to say about, and `bytes_per_output_tile` is the weight
+of a tile it *wrote*, so charging it on every tile in a record bills an ocean
+for a coastline that is not in it.
 
 `cost_weights()` therefore returns a predicted *duration* rather than a
 share of something: `partition_by_cost()` splits on that number, and
@@ -506,16 +508,19 @@ Two scopes in the log, and a third in the usage file alone:
   number that decides whether the deduplicated shard layout pays for itself
   (see "Shard layout"). The gap figures are reported apart from the real
   tiles' so a fit can keep two populations of very different size from
-  averaging each other out. This row is where a profile's own coefficients
-  come from, and it is already keyed by the profile they belong to.
+  averaging each other out. No per-profile coefficient comes from this row
+  any more -- a profile's cost is kept per tile block -- but its seconds and
+  bytes are what `transform_parallelism` and `written_byte` are fitted
+  against.
 - **`scope=worker`**, one per worker: the archive key it read, wall-clock
   seconds split by phase (`fetch`, `transform`, `write`, `close`), bytes
   fetched, entry counts, and the decode totals including `length_hist`.
   `PhaseSeconds` nests exclusively, so the `write` time spent inside the
   transform loop is not also counted as `transform`.
 - **`scope=blocks`**, one per worker, written to `--usage-out` and never
-  printed: the profiles' seconds summed per tile block, as
-  `block:seconds|...`. It is hundreds of blocks per worker, which is a file's
+  printed: the profiles' seconds and written bytes summed per home tile
+  block, as `seconds=block:seconds|...` and `written_bytes=block:bytes|...`.
+  It is hundreds of blocks per worker, which is a file's
   business and not a log's; see "Measured tile blocks".
 
 **There used to be a third, `scope=chunk`, one line per transform chunk, and
@@ -591,11 +596,11 @@ The whole loop, in the order it runs:
    and passes `state/axes.json` as `--axis-state`. A missing file is not an
    error; it means nothing has been measured yet. For the archive this run
    reads it takes the median of each recorded coefficient, falling back to the
-   reviewed one only where nothing was measured, and hands each profile its own
-   measured `seconds_per_tile` and `bytes_per_output_tile` in place of what the
-   profile declared. That is what the run is then partitioned and sized by.
-   Where `state/blocks/` exists it also passes that as `--block-state`, for the
-   profiles' measured seconds per tile block.
+   reviewed one only where nothing was measured. That is what the run is then
+   partitioned and sized by. Nothing in that file is about a profile: where
+   `state/blocks/` exists it also passes that as `--block-state`, for the
+   profiles' measured seconds and written bytes per tile block, and a block
+   nothing measured is charged what the profiles declared.
 2. **Each worker** writes its two-or-more `usage:` lines to `--usage-out` as
    well as to its log, and uploads that file. A file, not a log scrape: the job
    that fits these has artifacts, not log access.
@@ -961,15 +966,20 @@ Each coefficient comes from the measurement that isolates it:
 | `decode_call`, `decoded_byte` | two-parameter least squares over the `length_hist` buckets, against `(count, bytes)` |
 | `manifest_record` | the slope of `setup_seconds` against a worker's record count |
 | `transform_parallelism` | `sum(decode_seconds) + sum(transform_seconds)` over the profile rows, `/ sum(transform_seconds)` over the workers |
-| `seconds_per_tile`, per profile | `sum(transform_seconds)` for that profile `/ sum(decode_calls)` |
-| `bytes_per_output_tile`, per profile | `sum(output_bytes) / sum(written - gap_tiles)` for that profile |
-| `written_share`, per profile | `sum(written - gap_tiles) / sum(written - gap_tiles + skipped - gap_skipped)` |
+
+No coefficient is per profile. A profile's own cost -- its shapely and the
+bytes it writes -- depends on which archive it reads and which profiles run
+beside it, so it is measured per tile block, under that archive and profile
+set (see "Measured tile blocks"). A profile's declared `seconds_per_tile`,
+`bytes_per_output_tile` and `written_share` only price the blocks nothing has
+measured yet.
 
 The write cost is charged on bytes rather than on tiles. A tile is only as
 expensive to store as it is large, and how large it is belongs to the profile
 that shaped it: a coastline profile's tiles are not a label profile's. So the
-old flat `output_tile` second is now `written_byte x bytes_per_output_tile`,
-the first a property of the runner's disk and the second of the profile. At
+old flat `output_tile` second is now `written_byte` times the bytes written,
+the first a property of the runner's disk and the second of the profiles --
+measured per tile block, or declared where no block was measured. At
 the reviewed figures the product is the same 4.9e-7s the single coefficient
 carried, so splitting it changed no prediction on the day it landed -- it only
 gave the two halves somewhere separate to move.
@@ -981,26 +991,27 @@ once at plan time and gets an exact figure. That is why `gap_bytes()` is a
 measures its own `transform_gap()`, and a profile that can answer without
 building the tile overrides it. There is no
 statistic to estimate and nothing for the state branch to remember. That also
-keeps gap tiles out of `bytes_per_output_tile`, which is the whole reason to do
-it: a run is anywhere from 0% to 94% gap tiles, and the two populations differ
+keeps gap tiles out of the measured block bytes, which is the whole reason to
+do it: a run is anywhere from 0% to 94% gap tiles, and the two populations differ
 by an order of magnitude, so one averaged figure would be set by the mix rather
 than by either. On a `land`-style profile over open ocean the measured gap tile
 is 54 B against the 250 B default a real tile is assumed to weigh.
 
 **Nothing settled here is written back onto a profile.** `prepare-shards`
-resolves the three sources of a profile's cost -- measured gap bytes, the
-state branch's medians, the profile's own declared estimates -- into one
-`cost.ProfileCost` per profile and holds it (`shard_prep._settle_costs()`).
+resolves the two sources of a profile's cost that are not per block --
+measured gap bytes and the profile's own declared estimates -- into one
+`cost.ProfileCost` per profile and holds it
+(`shard_prep._declared_profile_costs()`).
 A `Profile` stays the behaviour it is; it declares estimates and answers
 questions, and it never doubles as the mutable ledger of what a run decided to
 charge. `cost_weights()` takes those settled costs as an argument, so what a
 prediction was made from is visible at the call rather than sitting on an
 object somebody may have rewritten.
 
-`bytes_per_output_tile` is therefore measured from `output_bytes` -- the
-payload the transform actually produced, counted once per output tile and
-summed per profile as the run goes -- rather than from the finished shard's size
-on disk. `shard_bytes` stays reported, but as the storage-amplification
+A block's written bytes are therefore measured from the payload the
+transform actually produced, counted once per output tile and summed across
+the profiles as the run goes, and so is the `output_bytes` that `written_byte`
+is fitted against -- rather than from the finished shard's size on disk. `shard_bytes` stays reported, but as the storage-amplification
 diagnostic it always was, not as the basis of a coefficient: it carries sqlite
 page overhead and indices, and under `--shard-layout dedup` it carries the
 collapse of a whole gap into one `images` row.
@@ -1062,21 +1073,25 @@ each one actually depends on:
 | group | key | coefficients |
 | --- | --- | --- |
 | source | host + schema | `fetched_byte`, `decode_call`, `decoded_byte` |
-| profile | profile name | `seconds_per_tile`, `bytes_per_output_tile`, `written_share` |
 | shared | none | `manifest_record`, `written_byte`, `worker_setup_seconds`, `transform_parallelism` |
+| block (`state/blocks/`) | host + schema, profile set, tile block | the profiles' pooled seconds, the bytes they wrote |
 
-The archive's fetch rate and tile density belong to the provider. A profile's
-seconds belong to its own shapely -- `_entry_outputs()` runs
-`transform_tile()` once per profile, so a fused figure bills `land` for
-`cropped_waterways`' work. What is left over is tilealchemist's own
-bookkeeping, the runner's disk and the runner's cores, which belong to neither
-— `transform_parallelism` is shared for exactly that reason: how many seconds
-of shapely fit into one second of wall clock is a fact about the machine, not
-about the profile that spent them, which is why the profile's own figure stays
-the CPU seconds it was measured as. Splitting them
-this way is also what lets one measured profile be reused against a new
-archive, and one measured archive against a new profile, instead of every
-combination starting from the reviewed constants.
+The archive's fetch rate and tile density belong to the provider. What is
+left over is tilealchemist's own bookkeeping, the runner's disk and the
+runner's cores, which belong to neither — `transform_parallelism` is shared
+for exactly that reason: how many seconds of shapely fit into one second of
+wall clock is a fact about the machine, not about the profile that spent them,
+which is why a block's figure stays the CPU seconds it was measured as.
+
+**A profile has no group of its own here.** It used to: `seconds_per_tile`,
+`bytes_per_output_tile` and `written_share` per profile name. But a profile's
+cost is not a property of the profile alone -- profiles share derived work, so
+one profile's seconds only mean anything beside the same others, and the same
+profile clips different geometry out of a different archive. Keyed by name
+alone, a figure measured on Protomaps would have priced the same profile on
+OpenMapTiles. The tile blocks already carry exactly the right key, so they
+carry the profiles' whole cost, and `record_run()` drops a `profiles` section
+it still finds in an older `axes.json`.
 
 **The archive's build is deliberately not part of its key.** A provider's
 fetch rate and tile density are properties of the provider, not of this
@@ -1101,9 +1116,10 @@ rather than the one that confounds them.
 The coefficients above price a record by what its manifest entry says, and a
 manifest entry cannot say how hard a tile is to clip: R² 0.29, and the slow
 tail under-predicted 2-4x (see "What the model still cannot see"). What *can*
-say it is the last run that built the same tiles. So the profiles' seconds are
-measured per **tile block** and kept, and the next run charges a block what it
-cost last time instead of `seconds_per_tile` times its distinct entries.
+say it is the last run that built the same tiles. So the profiles' seconds,
+and the bytes they wrote, are measured per **tile block** and kept, and the
+next run charges a block what it cost last time instead of what the profiles
+declared per tile.
 
 **A block is a fixed range of tile ids, not a piece of a partition.**
 `tile_blocks.tile_block()` cuts every zoom level into runs of
@@ -1119,7 +1135,23 @@ two halves differ in kind. Fetch and decode are linear in the bytes, and this
 run's manifest knows its bytes exactly, for this build; last month's
 measurement of them would be strictly worse. Fetch also happens per range
 request, not per block, and has no clean per-block figure at all. The profiles'
-shapely is the part no manifest predicts, so that is the part a block carries.
+shapely, and how much of it they write, is the part no manifest predicts, so
+that is the part a block carries: its pooled seconds and its written bytes,
+the latter charged at the shared `written_byte`.
+
+**A record belongs to its blob's home block, not its own.** A deduplicated
+tile points back at the blob its first copy wrote, which in an archive written
+in tile id order sits wherever that first copy's tile falls -- for an ocean
+tile, near the very start. Keyed by its own block, each such record dragged
+that far-away offset into whichever worker held its tile: on standardprofiles
+run 37037515494 worker 0 fetched its 2.06M entries in one range request and
+worker 2 its 2.54M in 84, all but one of them stretches of blobs that earlier
+workers' tiles had written, read through up to 8 MB holes. So
+`tile_blocks.home_blocks()` keys every record by the block of the record that
+decodes its blob -- the first of its `(offset, length)` run, which
+`collect_entries()` sorts lowest tile id first. The measurement, the charge
+and the partition all use that key, so a block's records are the blobs it
+decodes and every tile pointing at them.
 
 **The key is the archive and the whole profile set**, as
 `state/blocks/<source key>/<profile set>.json`, with the set as
@@ -1132,30 +1164,37 @@ OpenMapTiles than out of Protomaps tiles. A new combination starts with
 nothing measured, and the model carries it until it has run once.
 
 **How a block is measured.** `transform.py` already clocks every profile per
-distinct entry; `TransformUsage.add_block()` also adds the sum to that entry's
-block. An entry deduplicated against the decode before it adds zero, which
-still records the block as walked, so "costs nothing" stays distinct from
-"never measured". The figures are pooled seconds, summed across the worker's
-process pool, and are divided by `transform_parallelism` when charged, the same
-as the per-tile coefficient they replace. Each worker writes them as its
-`scope=blocks` line, `merge-axes` sums them across workers -- a block split
-between two workers, by a run partitioned before blocks were the unit, still
-comes to one figure -- and appends one observation per block to that block's
-own history, `HISTORY_LENGTH` deep, the median read back. It records nothing
-unless every worker that reported also reported blocks: same biased-sample
-rule as the coefficients.
+distinct entry; `TransformUsage.add_block()` also adds the sum to the decoding
+entry's block, and `add_block_bytes()` adds every entry's written payload --
+a deduplicated one's included -- to that same block. A block that wrote
+nothing records zero bytes, so "costs nothing" stays distinct from "never
+measured". The seconds are pooled, summed across the worker's process pool,
+and are divided by `transform_parallelism` when charged, the same as the
+per-tile figure they replace. Each worker writes both as its `scope=blocks`
+line (`seconds=` and `written_bytes=`), `merge-axes` sums them across workers
+-- a block split between two workers, or a blob's run cut by a pool chunk,
+still comes to one figure -- and appends one observation per block to that
+block's own history, `HISTORY_LENGTH` deep, the median read back. It records
+nothing unless every worker that reported also reported blocks, and no bytes
+unless every one of them reported bytes: same biased-sample rule as the
+coefficients.
 
-**How a block is charged.** `cost.py` charges a measured block's figure once,
-on the first of its records it meets, and drops `seconds_per_tile` from every
-record in it; a block with no measurement keeps the per-tile charge. "First it
+**How a block is charged.** `cost.py` charges a measured block's seconds and
+bytes once, on the first of its decoding records it meets, and drops the
+profiles' declared seconds and write from every record homed in it; a block
+with no measurement keeps the declared per-tile charge. "First it
 meets" and not "first in a run" because records travel in offset order,
 which is what a worker fetches by, and in offset order one block's records
 are interleaved with others': a deduplicated tile points back at the blob its
 first copy wrote, however far away that is.
 
-**How a run is split.** `partition_by_tile_block()` hands out whole blocks in
-tile-id order and fills each worker until the next block would overrun its
-share, then starts the next worker. The shares end at fixed points of the
+**How a run is split.** `partition_by_tile_block()` hands out whole home
+blocks in byte offset order -- each where its first blob sits -- and fills
+each worker until the next block would overrun its share, then starts the
+next worker. So each worker is one stretch of the archive and one range
+request, whatever order the archive wrote its tiles in. Tile id order, which
+it used before, only came to the same thing for an archive clustered by tile
+id, and handed a worker of any other a scatter of ranges. The shares end at fixed points of the
 run's cumulative cost, `total * (i + 1) / N`, rather than at a per-worker
 budget, so what one worker leaves short is the next one's to take instead of
 piling up on the last. A block is never split, which keeps "what this block
@@ -1177,6 +1216,12 @@ the remaining overshoot being the modelled fetch and decode and a
 `transform_parallelism` that run had no state for. At planet scale a share is
 minutes and a z14 block seconds, so the bound is the low zooms, each a single
 block; a smaller `TILE_BLOCK_BITS` is the lever if they turn out to bind.
+
+**The file is versioned by what its blocks are keyed by.** Version 1 kept
+seconds alone, under each tile's own block; version 2 keeps `seconds` and
+`written_bytes` under the home block. A version-1 file is not read -- its
+figures describe different sets of records -- and the first run that writes it
+starts it afresh.
 
 **The file outgrows the contents API's 1 MB.** Five observations for ~87K
 blocks is a few MB even written compact, which `write_json(compact=True)` does

@@ -116,9 +116,9 @@ The defaults a profile can override, but usually doesn't:
   your profile can answer without building the tile.
 
   Neither declared figure is a promise you have to get right. A pipeline keeping
-  its measured axes on a state branch replaces both with what the last few runs
-  actually cost this profile, and a declared value is only what the first run
-  plans with; see
+  its measurements on a state branch replaces both, per tile block, with what
+  the last few runs actually cost this archive and this set of profiles, and a
+  declared value only prices the blocks nothing has measured yet; see
   [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#the-state-branch-and-the-job-that-writes-it)
   "The state branch, and the job that writes it".
 - **`_encode_tile(features, extent)`** wraps `mvt.encode_tile()` with this
