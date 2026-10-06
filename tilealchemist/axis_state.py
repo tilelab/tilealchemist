@@ -140,8 +140,8 @@ def _record_group(entry, measured):
         value = getattr(measured, name)
         if not _is_observation(value):
             continue
-        recorded = _observations(entry, name) + [float(value)]
-        entry[name] = recorded[-HISTORY_LENGTH:]
+        history = _observations(entry, name) + [float(value)]
+        entry[name] = history[-HISTORY_LENGTH:]
         recorded.append(name)
     return recorded
 
