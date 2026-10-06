@@ -23,8 +23,8 @@ class Profile(ABC):
     Everything else here has a default it may override.
 
     Attributes:
-        name: The profile's name, which its output layer and its .mbtiles are
-            named after unless overridden.
+        name: The profile's name, which its output layer and its metadata
+            `name` are taken from unless overridden.
         seconds_per_tile: What `transform_tile()` costs on one deduped source
             tile. A profile's own measurement, since the work is its shapely,
             not tilealchemist's; see docs/ARCHITECTURE.md "What a record costs".
@@ -62,7 +62,7 @@ class Profile(ABC):
 
     @property
     def mbtiles_name(self):
-        """The name this profile's output .mbtiles file carries."""
+        """The `name` this profile's output layer carries in its metadata."""
         return self.name
 
     @abstractmethod

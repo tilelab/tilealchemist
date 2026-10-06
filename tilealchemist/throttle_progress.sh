@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Throttles \r-redrawn output to at most one line per INTERVAL seconds, most
-# recent wins. A \r-redrawing tool repaints one line in place: tile-join's
-# "z/x/y", tilemaker's per-tile counters. \n-terminated lines always print
+# recent wins. A \r-redrawing tool repaints one line in place: `pmtiles
+# merge`'s progress bar, tile-join's "z/x/y", tilemaker's per-tile counters. \n-terminated lines always print
 # immediately. The split is on which byte ended a chunk, never on message
 # text, so it works for any such tool.
 #
@@ -99,6 +99,6 @@ done
 (( pending_set )) && printf '%s\n' "$pending"
 [[ -n $partial ]] && printf '%s\n' "$partial"
 
-# GitHub Actions runs with pipefail, so a false test above MUST NOT become
-# the whole step's exit status.
+# Under pipefail, which a step gets from `shell: bash` or `set -o pipefail`,
+# a false test above MUST NOT become the whole step's exit status.
 exit 0

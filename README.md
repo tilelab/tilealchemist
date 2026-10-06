@@ -33,7 +33,7 @@ build. A caller workflow calls `_pipeline.yml` (see
 [`docs/PROFILES.md`](docs/PROFILES.md) for a complete one), which walks the
 source archive once, fans out to as many parallel workers as the run needs
 (it sizes itself: no worker count to pick), and merges
-each profile's shards into its own `.pmtiles`
+each profile's parts into its own `.pmtiles`
 artifact. `profile`/`output_basename` accept a comma-separated list, so one
 run can build several profiles off a single `prepare-shards` walk and a
 single fetch per worker. OpenFreeMap sees each tile's bytes fetched once
@@ -94,12 +94,12 @@ else.
 | `tilealchemist/merge_axes.py` | The single-writer CLI a pipeline runs once per run: collects every worker's usage, fits, and pushes to the state branch -- but only if every worker reported. |
 | `tilealchemist/calibrate.py` | The by-hand equivalent: prints what it would change and, with `--out`, writes a flat `calibration.json`. It never edits `cost.py` and never writes the state branch. |
 | `tilealchemist/build_shard.py` | One worker's entry point: parses its flags, then hands off to `shard_worker.py`. |
-| `tilealchemist/shard_worker.py` | One worker's control flow: fetches its manifest's tiles in a single range request per contiguous run of them, drives the transform and the shard writing, logs the run. |
+| `tilealchemist/shard_worker.py` | One worker's control flow: fetches its manifest's tiles in a single range request per contiguous run of them, drives the transform and the part writing, logs the run. |
 | `tilealchemist/fetch_batching.py` | Groups a worker's manifest entries into range-GET batches (split at wide unread gaps) and fetches one batch's bytes. |
 | `tilealchemist/transform.py` | Fetched bytes to output tiles: one decode per tile shared by every selected `Profile`, timed apart from the per-profile transform. |
 | `tilealchemist/transform_pool.py` | Splits a batch into cost-balanced chunks and runs them across this machine's cores (`--transform-workers`), throttling how many are in flight. |
 | `tilealchemist/usage.py` | What the run actually cost: one `usage:` line per worker and one per profile (seconds by phase, bytes, distinct blobs, each profile's own transform seconds). A chunk measures itself and is merged into its worker's totals. |
-| `tilealchemist/mbtiles.py` | The shard files themselves: creating one mbtiles per profile in either layout (`--shard-layout`), expanding runs into rows (including the XYZ-to-TMS row flip). |
+| `tilealchemist/pmtiles_part.py` | The part files themselves: one clustered, deduplicated PMTiles archive per profile per worker, laid out so `pmtiles merge` can join them without decoding a tile. |
 | `tilealchemist/profile_requirements.py` | Reads a profile's inline PEP 723 dependency block without importing it, so CI can install what the profile needs before loading it. |
 | `tilealchemist/profiles/` | The `Profile` ABC and the path-based `load_profile()`. No profiles: those live in their own repositories. |
 | `tilealchemist/sources/` | The `Source` ABC (which archive URL to read, and which schema its tiles are in), plus `OpenFreeMapSource`, `ProtomapsSource` and `StaticUrlSource`. |

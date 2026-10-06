@@ -6,8 +6,9 @@ name: Test
 #
 # It runs against real OpenFreeMap data on purpose. Real OSM geometry turns
 # up the GEOS edge cases a water profile has to survive; hand-built polygons
-# do not. concurrency 1, worker_scale 1 and a low max_zoom keep that to one
-# shard and about a minute instead of a multi-hour production run, and
+# do not. A concurrency of 1 or 2, worker_scale 1 and a low max_zoom keep
+# that to a part or two and about a minute instead of a multi-hour production
+# run, and
 # prepare-shards downloads only the part of the archive's directory index the
 # zoom range needs (see pmtiles_index.py) -- tens of kilobytes, not the
 # archive's full ~96 MB. The worker count is not an input any more:
@@ -61,10 +62,13 @@ jobs:
       # level, so this is the one knob that makes the run meaningfully more
       # expensive.
       max_zoom: "4"
-      concurrency: "1"
+      # Two workers, so the merge job runs a real `pmtiles merge` over two
+      # parts per layer. The Protomaps call below stays on one worker and
+      # covers the other branch, where the single part is the layer.
+      concurrency: "2"
       worker_scale: "1"
-      # No state branch from CI. These runs stop at z4 on one worker, and a
-      # coefficient fitted on ~6 MB of tile data has no business setting the
+      # No state branch from CI. These runs stop at z4 on a worker or two, and
+      # a coefficient fitted on ~6 MB of tile data has no business setting the
       # median a planet run is then partitioned by. Calibration is exercised by
       # tilealchemist-merge-axes' own guards, not by writing to this repository.
       axis_state: "false"
@@ -148,4 +152,7 @@ jobs:
           # deduplication moves, and can only ever be a subset of it.
           assert 0 < contents <= addressed, (
               f"{path}: {contents} distinct contents against {addressed} tiles")
+          # What every part is written as and `pmtiles merge` keeps; a layer
+          # that lost it still serves, only with more requests per viewport.
+          assert header["clustered"], f"{path} is not clustered"
           PY

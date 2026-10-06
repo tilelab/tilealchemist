@@ -86,7 +86,8 @@ def run_prepare(args):
                                      groups)
     write_worker_manifests(args.out_dir, blocks)
     write_source_metadata(args.out_dir, resolved_source, args.min_zoom,
-                          args.max_zoom, header["tile_data_offset"])
+                          args.max_zoom, header["tile_data_offset"],
+                          attribution)
 
     non_empty_count = sum(1 for block in blocks if block)
     print(f"wrote {len(blocks)} manifests to {args.out_dir} "
@@ -111,8 +112,8 @@ def run_prepare(args):
           f"including {setup_seconds:.0f}s setup per worker, slowest worker "
           f"{max(worker_seconds) / 60:.0f}m against an even "
           f"{even_minutes:.0f}m", file=sys.stderr)
-    # stdout carries the attribution alone, for _pipeline.yml to hand to
-    # tile-join.
+    # stdout carries the attribution alone, for _pipeline.yml to refuse an
+    # unattributed layer by; the parts carry it from source.json.
     print(attribution)
 
 

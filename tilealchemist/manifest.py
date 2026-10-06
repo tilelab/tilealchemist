@@ -104,6 +104,9 @@ class SourceMetadata:
         max_zoom: Highest zoom level the run walks.
         tile_data_offset: Start of the archive's tile data, which the offsets
             in a manifest record are relative to.
+        attribution: What the built layers credit, settled once here so
+            that every part carries the same and `pmtiles merge` can take
+            any part's metadata as the layer's.
     """
 
     url: str
@@ -112,6 +115,7 @@ class SourceMetadata:
     min_zoom: ZoomLevel
     max_zoom: ZoomLevel
     tile_data_offset: int
+    attribution: str
 
     @property
     def axis_key(self):
@@ -131,6 +135,7 @@ class SourceMetadata:
             "min_zoom": self.min_zoom.value,
             "max_zoom": self.max_zoom.value,
             "tile_data_offset": self.tile_data_offset,
+            "attribution": self.attribution,
         }
 
     @classmethod
@@ -146,11 +151,12 @@ class SourceMetadata:
             min_zoom=ZoomLevel(document["min_zoom"]),
             max_zoom=ZoomLevel(document["max_zoom"]),
             tile_data_offset=document["tile_data_offset"],
+            attribution=document["attribution"],
         )
 
 
 def write_source_metadata(out_dir, resolved_source, min_zoom, max_zoom,
-                          tile_data_offset):
+                          tile_data_offset, attribution):
     """Write the `source.json` the workers read.
 
     Args:
@@ -159,6 +165,7 @@ def write_source_metadata(out_dir, resolved_source, min_zoom, max_zoom,
         min_zoom: Lowest zoom level the run walks.
         max_zoom: Highest zoom level the run walks.
         tile_data_offset: Start of the archive's tile data.
+        attribution: What the built layers credit.
     """
     metadata = SourceMetadata(
         url=resolved_source.url,
@@ -167,6 +174,7 @@ def write_source_metadata(out_dir, resolved_source, min_zoom, max_zoom,
         min_zoom=ZoomLevel(min_zoom),
         max_zoom=ZoomLevel(max_zoom),
         tile_data_offset=tile_data_offset,
+        attribution=attribution,
     )
     path = os.path.join(out_dir, "source.json")
     with open(path, "w", encoding="utf-8") as source_file:

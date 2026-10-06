@@ -18,6 +18,10 @@ dependencies = [
     # default "linework" repair punches a hole through the overlap it is
     # fixing, and only `method="structure"` merges it (see _compute_union()).
     "shapely>=2.1",
+    # Already pulled in by shapely; named explicitly because pmtiles_part.py
+    # sorts and lays out a worker's runs with it, millions of them on an
+    # ocean-heavy worker, where a Python-level sort would be the bottleneck.
+    "numpy",
 ]
 
 [project.urls]

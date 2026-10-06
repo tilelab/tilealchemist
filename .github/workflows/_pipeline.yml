@@ -3,7 +3,8 @@ name: TileAlchemist pipeline (reusable)
 # Builds one or more profiles' world-covering PMTiles layers. prepare-shards
 # walks the source archive once. build-shards runs every profile's per-tile
 # transform against the same fetched bytes, across `worker_count` parallel
-# workers. merge joins each profile's shards into its own .pmtiles file.
+# workers, each writing one clustered PMTiles part per profile. merge joins
+# each profile's parts into its own .pmtiles file with `pmtiles merge`.
 #
 # This workflow MUST publish nowhere: no GitHub Release, no B2 upload. That
 # is the calling workflow's job. Every caller is a separate repository (see
@@ -321,7 +322,7 @@ jobs:
           name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shard-manifests
           path: manifests
 
-      - name: "Build this worker's tile shard(s)"
+      - name: "Build this worker's tile part(s)"
         env:
           PROFILE: ${{ inputs.profile }}
           OUTPUT_BASENAME: ${{ inputs.output_basename }}
@@ -331,7 +332,7 @@ jobs:
           IFS=',' read -ra BASENAMES <<< "$OUTPUT_BASENAME"
           OUT_PATHS=()
           for BASENAME in "${BASENAMES[@]}"; do
-            OUT_PATHS+=("${BASENAME}-shard-${WORKER}.mbtiles")
+            OUT_PATHS+=("${BASENAME}-part-${WORKER}.pmtiles")
           done
           OUT_JOINED=$(IFS=,; echo "${OUT_PATHS[*]}")
           tilealchemist-build-shard \
@@ -342,14 +343,16 @@ jobs:
             --usage-out "usage-worker-${WORKER_ID}.txt" \
             --out "$OUT_JOINED"
 
-      # A missing file is expected, not a failure. One artifact per worker
-      # cannot collide across profiles; see docs/ARCHITECTURE.md "Worker
+      # A missing file is expected, not a failure: a profile that wrote no
+      # tile on this worker gets no part, and a worker cut short leaves only a
+      # `.tmp` this pattern does not match. One artifact per worker cannot
+      # collide across profiles; see docs/ARCHITECTURE.md "Worker
       # independence".
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shards-${{ matrix.worker }}
-          path: "*-shard-${{ matrix.worker }}.mbtiles"
+          path: "*-part-${{ matrix.worker }}.pmtiles"
           if-no-files-found: ignore
 
       # What this worker actually cost. Same "a worker that died wrote no file"
@@ -448,28 +451,40 @@ jobs:
           ref: ${{ job.workflow_sha }}
           path: .tilealchemist
 
-      # Every cell downloads every profile's shards and uses only its own,
+      # Every cell downloads every profile's parts and uses only its own,
       # by the filename prefix below. See docs/ARCHITECTURE.md "Publishing".
-      - name: Download all shard artifacts
+      - name: Download all part artifacts
         uses: actions/download-artifact@v4
         with:
           pattern: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shards-*
           path: shards
           merge-multiple: true
 
-      - name: Install tippecanoe
+      # A pinned release, checked against the hash of the tarball it was
+      # verified with: go-pmtiles publishes no checksums of its own. The
+      # merge depends on its exact rules for a clustered input; see
+      # docs/ARCHITECTURE.md "Part format".
+      - name: Install go-pmtiles
+        env:
+          PMTILES_VERSION: "1.31.2"
+          PMTILES_SHA256: "3ed7dbf4ec2e6dfe5e25b6f70d1ffc932729f93c86db353bf514dd71010a312f"
         run: |
-          sudo apt-get update
-          sudo apt-get install -y tippecanoe || {
-            git clone --depth 1 https://github.com/felt/tippecanoe.git /tmp/tippecanoe
-            make -C /tmp/tippecanoe -j"$(nproc)"
-            sudo make -C /tmp/tippecanoe install
-          }
+          TARBALL="go-pmtiles_${PMTILES_VERSION}_Linux_x86_64.tar.gz"
+          curl -fsSL --retry 5 -o "$RUNNER_TEMP/$TARBALL" \
+            "https://github.com/protomaps/go-pmtiles/releases/download/v${PMTILES_VERSION}/${TARBALL}"
+          echo "${PMTILES_SHA256}  $RUNNER_TEMP/$TARBALL" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$TARBALL" -C "$RUNNER_TEMP" pmtiles
+          sudo install "$RUNNER_TEMP/pmtiles" /usr/local/bin/pmtiles
+          pmtiles version
 
-      # tile-join rewrites a `z/x/y` progress line in place with \r.
-      # Throttled for the same reason as the worker logs (see README).
-      # Warnings and errors pass straight through.
-      - name: Merge this profile's shards into its final layer
+      # Every part already carries the layer's metadata, attribution
+      # included, so the merge has nothing to add; the attribution check stays
+      # here because it is this job that publishes. `pmtiles merge` refuses a
+      # single input, and a single part is already the whole layer. Its
+      # progress bar redraws one line in place with \r, throttled for the same
+      # reason as the worker logs (see README). `verify` re-reads the merged
+      # directory against the header before anything is uploaded.
+      - name: Merge this profile's parts into its final layer
         env:
           ATTRIBUTION: ${{ needs.prepare-shards.outputs.attribution }}
           OUTPUT_BASENAME: ${{ matrix.pair.output_basename }}
@@ -478,10 +493,25 @@ jobs:
             echo "::error::no attribution for ${OUTPUT_BASENAME}; a layer MUST NOT be published without one"
             exit 1
           fi
-          tile-join --no-tile-size-limit \
-            --attribution="$ATTRIBUTION" \
-            -o "${OUTPUT_BASENAME}.pmtiles" shards/"${OUTPUT_BASENAME}"-shard-*.mbtiles 2>&1 \
-            | .tilealchemist/tilealchemist/throttle_progress.sh 60
+          # Not a default without an explicit `shell: bash`, and without it
+          # a failed merge would exit as the throttle does: 0.
+          set -o pipefail
+          shopt -s nullglob
+          PARTS=(shards/"${OUTPUT_BASENAME}"-part-*.pmtiles)
+          case "${#PARTS[@]}" in
+            0)
+              echo "::error::no parts for ${OUTPUT_BASENAME}; every worker wrote nothing for it"
+              exit 1
+              ;;
+            1)
+              mv "${PARTS[0]}" "${OUTPUT_BASENAME}.pmtiles"
+              ;;
+            *)
+              pmtiles merge "${PARTS[@]}" "${OUTPUT_BASENAME}.pmtiles" 2>&1 \
+                | .tilealchemist/tilealchemist/throttle_progress.sh 60
+              ;;
+          esac
+          pmtiles verify "${OUTPUT_BASENAME}.pmtiles"
 
       - name: Summarize
         env:
@@ -491,14 +521,14 @@ jobs:
           MAX_ZOOM: ${{ inputs.max_zoom }}
           WORKER_COUNT: ${{ needs.prepare-shards.outputs.worker_count }}
         run: |
-          SHARD_COUNT=$(find shards -name "${OUTPUT_BASENAME}-shard-*.mbtiles" | wc -l | tr -d ' ')
+          PART_COUNT=$(find shards -name "${OUTPUT_BASENAME}-part-*.pmtiles" | wc -l | tr -d ' ')
           SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)
           {
             echo "### ${OUTPUT_BASENAME} layer"
             echo "- profile: ${PROFILE}"
             echo "- min_zoom: ${MIN_ZOOM}"
             echo "- max_zoom: ${MAX_ZOOM}"
-            echo "- non-empty shards merged: $SHARD_COUNT / $WORKER_COUNT"
+            echo "- parts merged: $PART_COUNT / $WORKER_COUNT workers"
             echo "- output size: $SIZE"
           } >> "$GITHUB_STEP_SUMMARY"
 

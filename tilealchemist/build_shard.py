@@ -4,7 +4,6 @@ import argparse
 import os
 
 from tilealchemist.fetch_batching import DEFAULT_MAX_FETCH_GAP
-from tilealchemist.mbtiles import SHARD_LAYOUTS
 from tilealchemist.profiles import load_profile
 from tilealchemist.shard_worker import run_worker
 from tilealchemist.transform import DEFAULT_REPORT_INTERVAL
@@ -16,12 +15,12 @@ docs/PROFILES.md says what a --profile computes per tile.
 
     tilealchemist-build-shard --worker-index 0 --profile ./my_profile.py \\
         --manifest manifests/worker-000.bin --source manifests/source.json \\
-        --out my-profile-shard-0.mbtiles
+        --out my-profile-part-0.pmtiles
 
     tilealchemist-build-shard --worker-index 0 \\
         --profile ./my_profile.py,./other_profile.py \\
         --manifest manifests/worker-000.bin --source manifests/source.json \\
-        --out my-profile-shard-0.mbtiles,other-profile-shard-0.mbtiles
+        --out my-profile-part-0.pmtiles,other-profile-part-0.pmtiles
 """
 
 # Shorter than --report-interval because the download phase it covers is
@@ -51,8 +50,9 @@ def parse_args():
              "archive, the schema its tiles are in, and the zoom range walked")
     parser.add_argument(
         "--out", required=True,
-        help="comma-separated output mbtiles path(s), one per --profile, "
-             "matched by position")
+        help="comma-separated output .pmtiles part path(s), one per "
+             "--profile, matched by position; a profile that writes no tile "
+             "gets no file")
     parser.add_argument(
         "--usage-out", default=None,
         help="where to write this worker's `usage:` lines, for the "
@@ -81,12 +81,6 @@ def parse_args():
              "another range request (default "
              f"{DEFAULT_MAX_FETCH_GAP}); such gaps come from PMTiles dedup, "
              "and get wide at a high --min-zoom")
-    parser.add_argument(
-        "--shard-layout", choices=SHARD_LAYOUTS, default="flat",
-        help="how this shard stores its tiles: \"flat\" writes one row per "
-             "tile, \"dedup\" stores each distinct blob once in an images "
-             "table with a map table pointing at it (default flat; see "
-             "docs/ARCHITECTURE.md \"Shard layout\" for when dedup pays)")
     parser.add_argument(
         "--transform-workers", type=int, default=os.cpu_count() or 1,
         help="parallel processes for the CPU-bound transform phase "

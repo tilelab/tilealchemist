@@ -104,9 +104,11 @@ exists to carry.
 An empty attribution is refused rather than published. An archive declaring
 none with no template to stand in for it, a template whose `{source}` has
 nothing to fill it with, and a template that composes to nothing all fail the
-run inside `prepare-shards`, before a worker is dispatched. `merge` asserts
-the value once more before `tile-join` stamps it, the value having crossed a
-job output in between.
+run inside `prepare-shards`, before a worker is dispatched. The value then
+travels in `source.json`, so every worker writes it into its parts' metadata
+and the merged layer takes it from there (see "Part format"). `merge` asserts
+it once more before publishing, the value having crossed a job output in
+between.
 
 ## Fetching: directory-driven, not one request per tile
 
@@ -180,7 +182,7 @@ community-run server. Instead:
 3. Each worker (`tilealchemist/build_shard.py` for the entry point,
    `shard_worker.py` for the run's flow, `fetch_batching.py` for splitting
    and fetching its manifest, `transform.py` for the CPU-bound transform,
-   `mbtiles.py` for the shard files it writes) reads only its own manifest
+   `pmtiles_part.py` for the part files it writes) reads only its own manifest
    and fetches it with a single range GET spanning its first entry's offset
    to its last entry's end, the manifest already being a contiguous slice
    of offset order.
@@ -213,7 +215,7 @@ community-run server. Instead:
    sentinel `length=0` so the worker asks each profile for `transform_gap`
    once and writes that at every one of their coordinates instead of
    fetching anything (see `shard_worker.py`'s `run_worker()` and
-   `mbtiles.py`'s `write_gap_tiles()`).
+   `pmtiles_part.py`'s `write_gap_tiles()`).
 
 ### Worker logging
 
@@ -250,9 +252,10 @@ so a higher `worker_count` doesn't add parallelism at any one moment, just
 keeps each job smaller -- and lets a lane on a fast runner take over more of
 them: that's why the sizing starts at a small multiple of that concurrency,
 `--worker-scale` times it, and only ever considers multiples of it rather
-than reaching for a large count outright (see "Sizing a run"). Each worker writes its own small mbtiles
-shard; a final job merges all shards
-with `tile-join` into one `.pmtiles` file.
+than reaching for a large count outright (see "Sizing a run"). Each worker
+writes its own PMTiles part per profile; a final job joins every part with
+`pmtiles merge` into one `.pmtiles` file, without decoding a tile (see "Part
+format").
 
 A worker building multiple profiles in one run (`_pipeline.yml` called with
 a comma-separated `profile`) still does exactly one fetch, so per-worker
@@ -506,8 +509,8 @@ Two scopes in the log, and a third in the usage file alone:
   written gaps out of `written` while leaving the skipped ones in `skipped`
   would read a profile that declines to fill gaps as one that declines tiles. `blobs` counts *distinct* blob objects
   rather than rows, so `written / blobs` is the storage amplification -- the
-  number that decides whether the deduplicated shard layout pays for itself
-  (see "Shard layout"). The gap figures are reported apart from the real
+  number the old deduplicated shard layout was judged by; a part now always
+  deduplicates (see "Part format"). The gap figures are reported apart from the real
   tiles' so a fit can keep two populations of very different size from
   averaging each other out. No per-profile coefficient comes from this row
   any more -- a profile's cost is kept per tile block -- but its seconds and
@@ -697,8 +700,8 @@ cost model with no coefficient in it that is not a measurement.
 it, so:
 
 - a **deduped run** contributes every tile id it covers. The archive stores
-  one blob for 40 identical ocean tiles and the worker writes 40 rows, because
-  a shard is flat and only the merge deduplicates (see "Shard layout").
+  one blob for 40 identical ocean tiles and the worker addresses all 40 of
+  them, each a tile the layer must serve (see "Part format").
 - a **gap** contributes every tile id it covers, for exactly the same reason.
   It is *priced* differently, though: a gap record is charged its write and
   nothing else. It has no source bytes to fetch or decode, and
@@ -786,8 +789,9 @@ low-zoom run rather than as a separate test, and runs a second one against
 a real Protomaps build alongside it (see that file for why the two calls
 aren't symmetric).
 
-Each chunk's output is written to its profile's mbtiles as soon as that
-chunk comes back, then dropped: `run_transform()` yields each chunk's
+Each chunk's output is written to its profile's part as soon as that
+chunk comes back, then dropped -- each new payload to the part's spool file,
+each run as 16 bytes of tile id, length and blob index: `run_transform()` yields each chunk's
 results as it completes and `shard_worker.py` writes that chunk out
 immediately, rather than collecting every chunk's output first. A worker
 with millions of real entries would otherwise hold its entire shard's
@@ -816,7 +820,7 @@ chunks in flight and submits the next one as it takes a result back. The
 lead is what stops a process idling while the parent writes, and measured on
 a 32-chunk batch across 4 processes the parent holds 7 slices where it used
 to hold 32. The same throttle bounds the other direction too: completed
-results can no longer pile up when the serial sqlite writer falls behind
+results can no longer pile up when the serial writer falls behind
 four parallel transformers, which is exactly the combination an ocean-heavy
 worker produces.
 
@@ -824,24 +828,19 @@ Where several chunks are already done, the lowest-numbered one is taken
 first. That is a tie-break among *ready* futures, never a wait for a
 particular chunk, so no chunk blocks the head of the line.
 
-A chunk is also committed as it is written, rather than the whole shard
-running from `init_mbtiles()` to `close_shards()` inside one open
-transaction. With `synchronous = OFF` a commit costs nothing, and it caps
-the journal instead of letting it grow to the size of the shard.
-
-That makes a half-written shard *more* plausible rather than less, so the
-shard says when it is whole: `close_shards()` writes
-`tilealchemist_complete` into `metadata` in the same commit as the last
-tiles. A worker killed mid-write leaves a database without it, which is what
-lets a merge tell a truncated shard from a small one -- `upload-artifact`
-runs with `if: always()` and `if-no-files-found: ignore`, so today such a
-shard is handed on silently and merges into a quietly short layer. (The
-merge-side check itself is not in this repository yet.) `tile-join` ignores
-the unknown metadata key; verified locally, output byte-identical with and
-without it.
+A part is never half-written where the merge could find it. Nothing exists
+at its path until `finalize_parts()`, which writes the whole archive to
+`<part>.tmp` and only then renames it into place. A worker killed before
+that leaves a `.tmp` at most, which the upload's `*-part-<N>.pmtiles` pattern
+does not match -- and `upload-artifact` runs with `if: always()` and
+`if-no-files-found: ignore`, so a truncated part, had one existed under the
+real name, would have been handed on silently and merged into a quietly
+short layer. The rename replaces the `tilealchemist_complete` metadata
+marker the mbtiles shards carried for the same purpose, whose merge-side
+check was never written.
 
 Free disk space is not checked: a worker that fills the disk finds out as an
-`ENOSPC` in the middle of an `INSERT`. A pre-batch check that warned below a
+`ENOSPC` in the middle of a spool or part write. A pre-batch check that warned below a
 threshold lived here and was removed; add it back if the failure mode turns
 out to be worth the warning.
 
@@ -856,10 +855,11 @@ only one of them is memory:
 | --- | --- | --- |
 | live objects in RAM | 156 B | the 4-tuple plus its three ints |
 | pickle across the process boundary | 13 B | pickle memoizes the shared `bytes` |
-| **disk** | **the whole blob** | a flat `tiles` table, deduplicated only at merge |
+| **disk** | **the whole blob** | the flat mbtiles `tiles` table shards had then |
 
-The blob is therefore not multiplied in RAM; it is multiplied on disk, which
-is what "Shard layout" is about. What the expansion does cost in RAM is the
+The blob is therefore not multiplied in RAM; it was multiplied on disk, which
+the part format has since ended (see "Part format"). What the expansion does
+cost in RAM is the
 tuples: the reference run's 357,913,942 output tiles per profile against its
 58,679,705 records is 6.1x, and its tile-heaviest worker held ~2.41 GB of
 them per profile where runs hold ~0.4 GB. Across the process boundary the
@@ -868,89 +868,91 @@ pure run of 50,000 tiles goes from 550,397 bytes to 236.
 
 Keeping a run a run until the writer also makes an all-ocean entry O(1)
 rather than O(run_length): a run whose output is `None` no longer builds the
-millions of tuples it would throw away on the next line. And it lets
-`write_output_tiles()` use `executemany` over a generator -- the shape
-`write_gap_tiles()` already had, which is why that function is now one call
-into the common path plus its log line, and why a gap entry needs no special
-writer at all: a gap *is* a run, one shared blob over `run_length` tiles.
+millions of tuples it would throw away on the next line. And it gives the
+writer one shape for everything -- the shape `write_gap_tiles()` already
+had, which is why that function is one call into the common path plus its
+log line, and why a gap entry needs no special writer at all: a gap *is* a
+run, one shared blob over `run_length` tiles.
 
 Folding *adjacent* entries that share an `(offset, length)` into one run as
 well would take the same ratio to 8.3x. That is a second and independent
 change, deliberately not made here.
 
-### Shard layout
+### Part format
 
-`--shard-layout` picks how a worker's mbtiles stores its tiles. `flat` is one
-`tiles` row per tile, the layout every shard has had until now. `dedup` is
-the layout `tile-join` writes itself:
+Each worker writes one `<basename>-part-<N>.pmtiles` per profile: a complete
+PMTiles v3 archive, MVT tiles, gzip throughout, holding that worker's share
+of the layer. A part is an ordinary archive -- `pmtiles show` and `verify`
+read it, and nothing about it is tilealchemist's own convention -- but it is
+written to satisfy the one tool the merge job hands it to, go-pmtiles'
+`pmtiles merge`, and that tool asks more of an input than being valid.
 
-    map    (zoom_level, tile_column, tile_row, tile_id)   UNIQUE (z, x, y)
-    images (tile_id INTEGER PRIMARY KEY, tile_data)
-    tiles  a view joining the two
+**It must be clustered, strictly.** `pmtiles merge` walks every input's
+entries in tile id order and reads each input's tile data front to back
+alongside, as one stream: a blob it has not met yet must be the next bytes
+in that stream, and a blob it has met is a back-reference to an offset it
+has already copied. So inside a part, blobs sit in the order the tile id
+walk *first* reaches them, packed with nothing between them. A part laid out
+any other way is refused ("must be clustered", or "clustered archive has
+out-of-order entries" if the flag is set but the layout is not).
 
-The default is `flat`, and the switch is staged on purpose: `dedup` pays only
-where a shard really repeats blobs, which is what `usage:`'s
-`written / blobs` measures, per profile, `land` and `cropped_waterways` being
-free to disagree. Per written tile, with `B` the blob size and
-`A = written / blobs`:
+**Runs arrive in the wrong order for that.** A worker transforms in source
+*offset* order, which is tile id order only where the source archive did not
+deduplicate: an entry pointing back at bytes stored for a much earlier tile
+arrives among that earlier tile's neighbours. So `PartWriter` only records
+while the worker runs, and lays the part out at `finalize()`:
 
-| layout | per written tile |
-| --- | --- |
-| flat | `B + ~26`, the row inline plus its index entry |
-| dedup | `~35 + B/A` |
+1. `write()` appends each run as `(tile_id, run_length, blob)` to three
+   `array.array`s, 16-ish bytes a run whatever its length, and each payload
+   it has not seen to a spool file beside the part.
+2. `finalize()` sorts the runs by tile id with numpy -- a stable argsort over
+   input that is nearly sorted already, the source being clustered --
+   refuses two runs covering one tile, and folds neighbours that continue
+   each other onto the same blob into one entry.
+3. Each blob is given its offset in order of first appearance, the
+   directories are built with `pmtiles.writer.optimize_directories()`, and
+   header, directories, metadata and the blobs, copied out of the spool in
+   that order, go to `<part>.tmp`, renamed into place once whole.
 
-| B | A | flat | dedup | factor |
-| --- | --- | --- | --- | --- |
-| 200 | 6.1 | 226 | 68 | 3.3x |
-| 200 | 2 | 226 | 135 | 1.7x |
-| 1000 | 6.1 | 1026 | 199 | 5.2x |
-| 200 | **1** | 226 | 235 | **0.96x, a loss** |
+The python `pmtiles.writer.Writer` would have done none of this: it takes one
+`write_tile()` per tile -- 86M calls for the ocean-heavy worker of a planet
+`land` run -- and marks its output unclustered as soon as tile ids arrive out
+of order, which ours do.
 
-Break-even is `B * (1 - 1/A) > 9`: from `A >= 2` the layout wins at any
-realistic blob size, and at `A = 1` it loses about 4%. The risk is therefore
-"needless complexity", not "catastrophe" -- but `A` has to be measured on a
-real run before the default moves, and `flat` stays a release as the way back.
+**Dedup is by content digest, per part.** A payload is matched first by
+identity against the previous one, which catches a run and two entries
+sharing an `(offset, length)` without hashing, then by a 16-byte BLAKE2b
+digest of its bytes. A digest key rather than the payload itself keeps the
+part's distinct bytes on disk instead of alive in a dict. `pmtiles merge`
+deduplicates no further: a blob two parts both hold is stored twice in the
+layer. Measured on a planet `land` run's shards, that is 1.00002x -- 1,328
+bytes across 63.8% of the layer's tiles -- because the duplication that
+matters (ocean, ice, a gap's single answer) is inside a worker's contiguous
+slice, not across slices. `tile-join`'s hash over the whole layer would have
+saved nothing worth its cost.
 
-**The key is a synthetic counter, not a content hash.** A 32-character hex
-digest costs ~33 B in *every* `map` row and again in every `map_index` entry;
-across the reference run's 357.9M output tiles that is ~23 GB of pure key
-material, which would eat the whole saving. A small integer costs 1-4 B.
-`INTEGER PRIMARY KEY` is a rowid alias besides, so `images` writes become a
-purely sequential append with no B-tree of their own and the merge's join a
-direct rowid seek, where a TEXT hash would need its own index and a random
-B-tree insert per distinct blob.
+**The header is the same in every part, as far as it can be.** `pmtiles
+merge` copies the metadata and center of whichever part is named first and
+takes the union of the bounds, so every part claims the whole Web Mercator
+world, the same center point, and carries the layer's complete metadata --
+`name`, `format`, `minzoom`, `maxzoom`, `attribution` (from `source.json`),
+and `vector_layers` as the profile declares them. The center *zoom* is the
+run's `min_zoom`, clamped into the part's own zoom range because `pmtiles
+verify` insists on it. `tile-join` wrote `vector_layers` from the fields it
+saw while decoding every tile, plus `tilestats`, `generator` and the like;
+the parts carry the profile's declared fields instead, nothing having
+decoded the output to see more.
 
-Blobs are matched by identity against the *previous* one -- `is`, against a
-variable holding a strong reference for the whole loop, so a freed address
-cannot be reused under it -- rather than by hashing. `id()` would not do:
-a freed address gets reused, and an `id()`-keyed dict can confuse two
-different blobs. That adjacency window covers exactly the two cases that are
-adjacent by construction: a run (one object over N tiles), and two
-consecutive entries sharing an `(offset, length)`, which already share one
-`outputs` list. Duplicates further apart get a second `images` row, which is
-fine: PMTiles' content hash catches them in the merge exactly as it does
-today. `write_gap_tiles()` collapses to a single `images` row per shard for
-free, every gap entry carrying the same `gap_data` object -- measured on a
-real run with hand-made gaps, 111 gap tiles became one `images` row and one
-`map` row per tile.
+**Nothing is written for no tiles.** A worker that wrote nothing for a
+profile -- an all-ocean slice has no waterway to crop -- leaves no part, and
+the merge counts what it got. The usage line's `shard_bytes` is the
+finished part's size, or 0.
 
-The `UNIQUE` index stays, moving from `tiles` onto `map`, for two independent
-reasons. An `IntegrityError` on a repeated `(z, x, y)` is a wanted invariant
--- it means a partitioning bug, and crashing is the right answer, which is
-also why neither `INSERT OR REPLACE` nor `OR IGNORE` belongs on `map`. And it
-carries the *merge*: `tile-join` reads
-`... from tiles order by zoom_level, tile_column, tile_row`, and without the
-index sqlite would have to sort those rows -- blobs included -- externally.
-
-`tile-join` supports this layout by construction rather than by accident: it
-writes this schema itself and reads only through `tiles`, so it can read its
-own output back. Both halves verified locally: a flat and a deduplicated
-shard of the same tiles produce byte-identical PMTiles content and identical
-headers, a mixed invocation (one of each, which a half-migrated
-`build-shards` can hand it) works, and `EXPLAIN QUERY PLAN` on tile-join's
-own query gives `SCAN map USING INDEX map_index` plus a rowid seek into
-`images`, with **no** `USE TEMP B-TREE FOR ORDER BY` -- at 490K map rows and
-after `ANALYZE` too.
+Against the mbtiles shards this replaced, on the planet `land` run: shard
+artifacts went from 19.2 GiB to an estimated ~6.7 GiB, about the layer's own
+size, the sqlite writes that took 824 of the ocean-heavy worker's 1,273
+seconds went away, and the merge job dropped from 247 minutes to the
+copy-bound ~10-15 that `pmtiles merge` takes.
 
 ### Learning the coefficients from the last run
 
@@ -1013,9 +1015,9 @@ A block's written bytes are therefore measured from the payload the
 transform actually produced, counted once per output tile and summed across
 the profiles as the run goes, and so is the `output_bytes` that `written_byte`
 is fitted against -- rather than from the finished shard's size on disk. `shard_bytes` stays reported, but as the storage-amplification
-diagnostic it always was, not as the basis of a coefficient: it carries sqlite
-page overhead and indices, and under `--shard-layout dedup` it carries the
-collapse of a whole gap into one `images` row.
+diagnostic it always was, not as the basis of a coefficient: it is the
+finished part, every distinct payload stored once and a whole gap collapsed
+into one blob (see "Part format").
 
 Every aggregate is `sum(seconds) / sum(units)`, never the mean of per-unit
 rates. That is the same choice tiledistillery's `fit_seconds_per_byte()`
@@ -1387,10 +1389,10 @@ Every `build-shards` matrix cell is fully independent, by construction:
 - There is **no shared mutable state anywhere in the run**: no queue, no
   claim file, no lock, no timing history, no state branch. Nothing a worker
   does is visible to any other worker.
-- Its output is one `<basename>-shard-<N>.mbtiles` per profile, named by its
+- Its output is one `<basename>-part-<N>.pmtiles` per profile, named by its
   own index, uploaded under its own artifact name, so two cells can never
   collide on a path. Every profile's file for one worker travels inside that
-  one artifact, which is safe because the fixed `-shard-<N>.mbtiles` suffix
+  one artifact, which is safe because the fixed `-part-<N>.pmtiles` suffix
   keeps one basename's files out of another basename's per-profile glob in
   `merge`. Producing no file at all, for some or all profiles, is expected
   rather than a failure (an all-ocean slice has no waterway to crop), hence
@@ -1431,7 +1433,7 @@ matched 1:1 (e.g. `output_basename: land,cropped-waterways`), so
 how many profiles are built (see "Fetching"/"Parallelism" above): its
 `build-shards` step passes the full profile list to one
 `tilealchemist-build-shard` invocation per worker (comma-separated
-`--profile`/`--out`, matched 1:1), bundles every profile's shard file for
+`--profile`/`--out`, matched 1:1), bundles every profile's part file for
 that worker under one artifact, and its `merge` job matrixes over
 `{profile, output_basename}` pairs, each producing its own
 `<output_basename>.pmtiles`, uploaded as its own workflow artifact. It
@@ -1442,11 +1444,33 @@ reference the `<output_basename>-pmtiles` artifact directly by name
 rather than through a job output, since that name is fully deterministic
 regardless of profile count, whereas GitHub Actions doesn't guarantee
 which matrix cell's value wins for a job-level output across multiple
-`merge` matrix cells. Each `merge` cell downloads *every* profile's shard
+`merge` matrix cells. Each `merge` cell downloads *every* profile's part
 artifacts and picks its own out by filename prefix, even on a single-profile
 run where there is only one set to download. That costs CI-internal
 bandwidth and nothing else: the source archive is never touched again after
 `build-shards`.
+
+The merge itself is go-pmtiles' `pmtiles merge`, pinned to one release and
+its tarball's hash. It reads every part's directory, sorts the entries by
+tile id across all of them, and copies tile data part by part without
+decoding a tile, so it costs about what copying the layer's bytes costs.
+`tile-join`, which it replaced, decoded, re-encoded and re-gzipped every
+tile, then converted mbtiles to PMTiles on one thread: 241 of a planet
+`land` merge's 247 minutes. Three rules come with it, each met by
+construction rather than checked here:
+
+- **Every input must be clustered**, which is what "Part format" is about.
+- **Inputs must be disjoint.** `pmtiles merge` refuses any tile id two parts
+  both address, which is the invariant the old `UNIQUE (z, x, y)` index
+  carried: a tile in two parts is a partitioning bug, and failing is right.
+- **At least two inputs.** A run with one part for a profile moves that part
+  into place instead, it being the whole layer already, and a run with none
+  fails, there being no layer to publish.
+
+The layer's metadata and center are copied from the first part, which is
+why every part carries the complete metadata, attribution included, and the
+same header bounds. `pmtiles verify` re-reads the result before it is
+uploaded.
 
 One more input exists for one situation: `artifact_namespace`. The artifacts
 the pipeline passes between its own jobs (`shard-manifests`, `shards-<n>`)
@@ -1608,16 +1632,16 @@ code and this section together.
       read_source_metadata()     manifest.py: source.json from prepare-shards
       read_manifest()            manifest.py: this worker's entries
       split_manifest_entries()   -> real entries / gap entries
-      init_mbtiles()             mbtiles.py: one ShardWriter per profile
+      init_part()                pmtiles_part.py: one PartWriter per profile
       real entries (_process_real_entries), one batch at a time:
         plan_fetch_batches()       fetch_batching.py: one range GET per batch
         fetch_batch_blob()         fetch_batching.py: that batch's bytes
         run_transform()            transform.py: a chunk of tiles at a time
-        ShardWriter.write()        mbtiles.py: that chunk, then drop it
+        PartWriter.write()         pmtiles_part.py: that chunk, then drop it
       gap entries (_process_gap_entries):
         Profile.transform_gap()    one blob for every gap tile in the run
-        write_gap_tiles()          mbtiles.py: nothing to fetch
-      close_shards()
+        write_gap_tiles()          pmtiles_part.py: nothing to fetch
+      finalize_parts()           pmtiles_part.py: sort, lay out, rename into place
       _report_worker_usage()     usage.py: one line per profile, one per worker
 
 ### Zoom levels (`zoom.py`)
@@ -1626,7 +1650,7 @@ A zoom is a `ZoomLevel` member everywhere the pipeline passes one around, so
 a level outside the set raises `ValueError` where it enters rather than
 walking to nothing. `IntEnum`, because a zoom level *is* a number wherever
 the pipeline computes with it — `zxy_to_tileid(max_zoom + 1, ...)`, the
-`min_zoom <= zoom <= max_zoom` filter, the `2 ** zoom` row flip.
+`min_zoom <= zoom <= max_zoom` filter.
 
 `MAX_SUPPORTED_ZOOM = 30` is a hard ceiling, not a preference:
 `zxy_to_tileid()` raises `OverflowError` above z31 because `tile_id` stops
@@ -1660,22 +1684,18 @@ and one `Tile.empty()` serving a hundred-thousand-tile gap region.
 in practice encodes every layer at the same one, and a tile with no layers
 falls back to the schema's `default_extent`.
 
-### Encoding (`mvt.py`, `mbtiles.py`)
+### Encoding (`mvt.py`, `pmtiles_part.py`)
 
 `gzip.compress(..., mtime=0)` is required, not tidiness. Without it gzip
 embeds the current time, so byte-identical tile content — every gap tile, in
-particular — compresses differently across worker processes and defeats
-PMTiles' content-hash dedup in the final merge.
-
-mbtiles numbers rows TMS-style while a PMTiles tile ID decodes to XYZ, so
-every write flips the row (`(2 ** zoom - 1) - tile_row`).
+particular — compresses differently across worker processes and defeats the
+part's content-digest dedup.
 
 The transform hands the writer *runs*, `(tile_id, run_length, output_data)`,
-rather than one tuple per tile, so `mbtiles.py` is where a run becomes rows.
-`_tile_rows()` must stay a generator: a worker holding a million-tile run (an
-ocean, an ice sheet interior) would otherwise materialize them all as one
-list before sqlite3 sees them. `_run_counts()` walks the runs rather than the
-rows, which is what lets the counting and that generator coexist.
+rather than one tuple per tile, and a run stays one directory entry all the
+way into the part: nothing in `pmtiles_part.py` is O(run_length), so a
+million-tile run (an ocean, an ice sheet interior) costs what a single tile
+does. `_run_counts()` walks the same runs for the usage counters.
 
 A run is clipped to the zoom range in `transform_batch_blob_multi()`, and
 *before* the `None` test, because the per-tile filter it replaces ran there

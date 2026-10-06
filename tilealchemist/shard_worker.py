@@ -5,10 +5,10 @@ import time
 
 from tilealchemist.fetch_batching import fetch_batch_blob, plan_fetch_batches
 from tilealchemist.manifest import read_manifest, read_source_metadata
-from tilealchemist.mbtiles import (
+from tilealchemist.pmtiles_part import (
     ProfileTileCounts,
-    close_shards,
-    init_mbtiles,
+    finalize_parts,
+    init_part,
     write_gap_tiles,
 )
 from tilealchemist.ranged_fetch import make_session
@@ -35,11 +35,12 @@ def split_manifest_entries(entries):
 
 
 def run_worker(args):
-    """Build one worker's shard of every profile's output layer.
+    """Build one worker's part of every profile's output layer.
 
     One fetch per batch, shared between the profiles, then a transform and a
-    write per chunk. The shards are marked complete on the way out, so that a
-    worker cut short leaves shards a later step can tell are unfinished.
+    write per chunk. Each part is only written out at the end, and renamed
+    into place once whole, so that a worker cut short leaves no part rather
+    than a short one.
 
     Args:
         args: The parsed command line from build_shard.py.
@@ -59,8 +60,8 @@ def run_worker(args):
     print(f"{len(real_entries)} real entries + {len(gap_entries)} gap ranges "
           f"assigned", file=sys.stderr)
 
-    writers = [init_mbtiles(out, source.min_zoom, source.max_zoom, profile,
-                            schema, args.shard_layout)
+    writers = [init_part(out, source.min_zoom, source.max_zoom, profile,
+                         schema, source.attribution)
                for out, profile in zip(args.out, profiles)]
     counts = [ProfileTileCounts() for _ in profiles]
     gap_totals = [(0, 0, 0) for _ in profiles]
@@ -73,7 +74,7 @@ def run_worker(args):
               "fetched_bytes": 0, "peak_batch_bytes": 0}
 
     if not real_entries and not gap_entries:
-        close_shards(writers)
+        finalize_parts(writers)
         print(f"done: (empty shard) -> {', '.join(args.out)}", file=sys.stderr)
         _report_worker_usage(args, profiles, counts, phases, wall_start,
                              totals, usage, gap_totals)
@@ -91,7 +92,7 @@ def run_worker(args):
                                               writers, counts)
 
     with phases.phase("close"):
-        close_shards(writers)
+        finalize_parts(writers)
 
     for profile, out, profile_counts in zip(profiles, args.out, counts):
         print(f"done: profile={profile.name} written={profile_counts.written} "
@@ -176,7 +177,7 @@ def _process_real_entries(real_entries, args, source, schema, profiles,
         source: The archive's metadata.
         schema: The schema its tiles are in.
         profiles: The profiles to run, in output order.
-        writers: Each profile's shard, in the same order.
+        writers: Each profile's part, in the same order.
         counts: Each profile's tile counts, in the same order.
         phases: The per-phase seconds to charge the work to.
         usage: The worker's running transform measurements.
@@ -209,7 +210,6 @@ def _process_real_entries(real_entries, args, source, schema, profiles,
                         for profile_counts, profile_runs, writer in zip(
                                 counts, chunk_results, writers):
                             profile_counts.add(*writer.write(profile_runs))
-                            writer.connection.commit()
     return fetched_bytes, peak_batch
 
 
@@ -223,7 +223,7 @@ def _process_gap_entries(gap_entries, schema, profiles, writers, counts):
         gap_entries: The gap records this worker carries.
         schema: The schema the output is written against.
         profiles: The profiles to run, in output order.
-        writers: Each profile's shard, in the same order.
+        writers: Each profile's part, in the same order.
         counts: Each profile's tile counts, in the same order.
 
     Returns:

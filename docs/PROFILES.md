@@ -23,7 +23,7 @@ implements two things, and everything else in
 ```python
 class Profile(ABC):
     name: str        # identifier for logging and, by default, the output layer
-                     # and mbtiles metadata name
+                     # and the layer's metadata name
 
     def transform(self, tile): ...   # the actual per-tile work
 ```
@@ -79,7 +79,9 @@ The defaults a profile can override, but usually doesn't:
   own call rather than derived from the feature sets it reads: which input
   fields survive into the output is exactly what the transform decides.
 - **`vector_layers_json(schema)`** returns the `vector_layers` array embedded in
-  the output mbtiles metadata's `json` field. The default,
+  the output layer's metadata, as is: nothing downstream adds the fields it
+  sees in the tiles, so what `output_fields()` declares is what a consumer
+  reads. The default,
   `[{"id": output_layer_name, "fields": output_fields()}]`, covers every
   profile that writes a single output layer, which is what `transform()`'s
   contract describes.
