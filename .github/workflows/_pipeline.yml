@@ -70,7 +70,7 @@ on:
         description: "How many workers each concurrency lane gets at least. GitHub starts a queued worker as soon as a lane frees, so a lane that drew a fast runner works through more of them, and runner speed -- which varies by up to ~2x across GitHub's hosted CPUs -- evens out across the run instead of the slowest runner setting its end. Each extra worker costs its setup, ~1 minute. Set to \"1\" for one worker per lane (see docs/ARCHITECTURE.md \"Sizing a run\")."
         required: false
         type: string
-        default: "3"
+        default: "6"
       output_basename:
         description: "Base name for each profile's output .pmtiles file and artifact: one value, or a comma-separated list matched 1:1 with profile, e.g. \"land\" or \"land,cropped-waterways\"."
         required: true
