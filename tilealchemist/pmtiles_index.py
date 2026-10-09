@@ -21,9 +21,9 @@ PMTILES_HEADER_LENGTH = 127
 # PMTiles v3 section 4 requires header plus root inside the first 16,384 bytes.
 HEADER_AND_ROOT_PREFIX_LENGTH = 16 * 1024
 
-# Caps one gap record, so a single unbroken gap cannot land wholly on one
+# Caps one gap entry, so a single unbroken gap cannot land wholly on one
 # worker.
-GAP_CHUNK_SIZE = 200_000
+MAX_GAP_RUN_LENGTH = 200_000
 
 LOG_INTERVAL = 1.0
 RETRY_LABEL = "prepare-shards"
@@ -85,18 +85,18 @@ class LeafWindow:
     """The one slice of the leaf section a walk needs, held in memory.
 
     Attributes:
-        blob: The fetched bytes.
-        start: The offset within the leaf section that `blob` begins at.
+        buffer: The fetched bytes.
+        start: The offset within the leaf section that `buffer` begins at.
     """
 
-    def __init__(self, blob, start):
+    def __init__(self, buffer, start):
         """Hold a fetched slice of the leaf section.
 
         Args:
-            blob: The fetched bytes.
-            start: The offset within the leaf section that `blob` begins at.
+            buffer: The fetched bytes.
+            start: The offset within the leaf section that `buffer` begins at.
         """
-        self.blob = blob
+        self.buffer = buffer
         self.start = start
 
     def node_bytes(self, entry):
@@ -114,17 +114,17 @@ class LeafWindow:
                 without fetching the whole leaf section.
         """
         offset = entry.offset - self.start
-        if offset < 0 or offset + entry.length > len(self.blob):
+        if offset < 0 or offset + entry.length > len(self.buffer):
             raise RuntimeError(
                 f"directory at leaf-section offset {entry.offset} "
-                f"(+{entry.length} bytes) lies outside the {len(self.blob)} "
+                f"(+{entry.length} bytes) lies outside the {len(self.buffer)} "
                 f"bytes fetched from {self.start}. `leaf_window_for()` spans "
                 f"what the root points at, in the file order PMTiles v3 "
                 f"section 4 asks for -- leaf order SHOULD ascend by TileID, "
                 f"and more than one level of leaf directories is discouraged. "
                 f"This archive breaks one of the two; reading it needs the "
                 f"whole leaf section.")
-        return self.blob[offset:offset + entry.length]
+        return self.buffer[offset:offset + entry.length]
 
 
 def leaf_window_for(root_directory, tile_id_start, tile_id_limit):
@@ -196,8 +196,8 @@ def compute_gaps(entries, min_zoom, max_zoom):
         max_zoom: Highest zoom level the run walks.
 
     Returns:
-        Gap records covering every tile id in range that no entry covers,
-        chunked so that no one record is larger than GAP_CHUNK_SIZE.
+        Gap entries covering every tile id in range that no entry covers,
+        split so that no one gap entry runs longer than MAX_GAP_RUN_LENGTH.
     """
     tile_id_start, tile_id_limit = tile_id_bounds(min_zoom, max_zoom)
     gaps = []
@@ -206,27 +206,27 @@ def compute_gaps(entries, min_zoom, max_zoom):
     # too.
     for entry in sorted(entries, key=operator.attrgetter("tile_id")):
         if entry.tile_id > expected:
-            gaps.extend(_chunk_gap(expected, entry.tile_id))
+            gaps.extend(_split_gap(expected, entry.tile_id))
         expected = entry.tile_id + entry.run_length
     if expected < tile_id_limit:
-        gaps.extend(_chunk_gap(expected, tile_id_limit))
+        gaps.extend(_split_gap(expected, tile_id_limit))
     return gaps
 
 
-def _chunk_gap(start, end):
-    """Cut one gap into records small enough to spread across workers.
+def _split_gap(start, end):
+    """Cut one gap into entries small enough to spread across workers.
 
     Args:
         start: First uncovered tile id.
         end: One past the last uncovered tile id.
 
     Returns:
-        Gap records spanning the range, each marked by the `length=0` sentinel
+        Gap entries spanning the range, each marked by the `length=0` sentinel
         that split_manifest_entries() tells a gap by.
     """
-    return [Entry(tile_id=chunk_start, offset=0, length=0,
-                  run_length=min(GAP_CHUNK_SIZE, end - chunk_start))
-            for chunk_start in range(start, end, GAP_CHUNK_SIZE)]
+    return [Entry(tile_id=piece_start, offset=0, length=0,
+                  run_length=min(MAX_GAP_RUN_LENGTH, end - piece_start))
+            for piece_start in range(start, end, MAX_GAP_RUN_LENGTH)]
 
 
 def walk_directory_tree(root_directory, leaf_window, tile_id_start,
@@ -244,7 +244,7 @@ def walk_directory_tree(root_directory, leaf_window, tile_id_start,
         its result, so an entry straddling a bound comes back whole.
     """
     entries = []
-    progress = WalkProgress(len(leaf_window.blob), entries)
+    progress = WalkProgress(len(leaf_window.buffer), entries)
     frontier = [root_directory]
 
     while frontier:
@@ -290,7 +290,7 @@ def collect_entries(session, url, min_zoom, max_zoom):
           f"expected)", file=sys.stderr)
     entries = walk_directory_tree(root_directory, leaf_window, tile_id_start,
                                   tile_id_limit)
-    # Lowest tile id first within a shared offset: that record is the run's
+    # Lowest tile id first within a shared offset: that entry is the blob's
     # home; see home_blocks().
     entries.sort(key=lambda entry: (entry.offset, entry.tile_id))
     return header, entries
@@ -344,9 +344,9 @@ def _fetch_leaf_window(session, url, header, window_start, window_length):
     print(f"starting download ({window_length} bytes of leaf directories, "
           f"{header['tile_entries_count']} entries in the archive)",
           file=sys.stderr)
-    blob = fetch_range(
+    buffer = fetch_range(
         session, url, header["leaf_directory_offset"] + window_start,
         window_length, retry_label=RETRY_LABEL,
-        on_chunk=DownloadProgress(window_length, LOG_INTERVAL,
-                                  "directory index").update)
-    return LeafWindow(blob, window_start)
+        on_progress=DownloadProgress(window_length, LOG_INTERVAL,
+                                     "directory index").update)
+    return LeafWindow(buffer, window_start)

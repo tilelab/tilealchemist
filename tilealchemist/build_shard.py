@@ -3,12 +3,12 @@
 import argparse
 import os
 
-from tilealchemist.fetch_batching import DEFAULT_MAX_FETCH_GAP
+from tilealchemist.fetch_batching import DEFAULT_MAX_FETCH_HOLE
 from tilealchemist.profiles import load_profile
 from tilealchemist.shard_worker import run_worker
 from tilealchemist.transform import DEFAULT_REPORT_INTERVAL
 
-HELP = """One worker's shard of a profile's output layer.
+HELP = """One worker: every profile's part, built from one shard.
 
 docs/ARCHITECTURE.md "Fetching" and "Parallelism" say what this does and why;
 docs/PROFILES.md says what a --profile computes per tile.
@@ -75,21 +75,21 @@ def parse_args():
              "15, shorter than --report-interval because the download phase "
              "it covers is itself shorter)")
     parser.add_argument(
-        "--max-fetch-gap", type=int, default=DEFAULT_MAX_FETCH_GAP,
+        "--max-fetch-hole", type=int, default=DEFAULT_MAX_FETCH_HOLE,
         help="how many bytes of archive that this worker does not read may "
              "sit between two of its entries before the batch is split into "
              "another range request (default "
-             f"{DEFAULT_MAX_FETCH_GAP}); such gaps come from PMTiles dedup, "
+             f"{DEFAULT_MAX_FETCH_HOLE}); such holes come from PMTiles dedup, "
              "and get wide at a high --min-zoom")
     parser.add_argument(
-        "--transform-workers", type=int, default=os.cpu_count() or 1,
+        "--transform-processes", type=int, default=os.cpu_count() or 1,
         help="parallel processes for the CPU-bound transform phase "
              "(default: all available cores; 1 disables pooling and runs "
              "inline, same as before this flag existed)")
     args = parser.parse_args()
 
-    if args.max_fetch_gap < 0:
-        parser.error(f"--max-fetch-gap ({args.max_fetch_gap}) must not be "
+    if args.max_fetch_hole < 0:
+        parser.error(f"--max-fetch-hole ({args.max_fetch_hole}) must not be "
                      f"negative")
 
     profile_paths = args.profile.split(",")

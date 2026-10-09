@@ -17,7 +17,7 @@ VERSION = 2
 DEFAULT_BLOCK_STATE_DIR = "state/blocks"
 
 BlockMeasurement = namedtuple(
-    "BlockMeasurement", "source_key profiles seconds written_bytes workers")
+    "BlockMeasurement", "source_key profile_set seconds written_bytes workers")
 
 # What the recorded runs say each block costs: the profiles' pooled seconds, and
 # the bytes written.
@@ -26,26 +26,26 @@ BlockCosts = namedtuple("BlockCosts", "seconds written_bytes")
 NO_BLOCK_COSTS = BlockCosts(seconds={}, written_bytes={})
 
 
-def block_state_path(root, source_key, profiles):
+def block_state_path(root, source_key, profile_set):
     """Where one archive and profile set's block history lives.
 
     Args:
         root: The directory every block file sits under.
         source_key: The archive's key, as `SourceMetadata.axis_key` gives it.
-        profiles: The profile set's key, as `profile_combo_key()` gives it.
+        profile_set: The profile set's key, as `profile_set_key()` gives it.
 
     Returns:
         The file's path, `/`-separated so it serves both a checkout and the
         contents API.
     """
-    return f"{root.rstrip('/')}/{source_key}/{profiles}.json"
+    return f"{root.rstrip('/')}/{source_key}/{profile_set}.json"
 
 
 def _summed(block_rows, field):
     """Sum one per-block field across every worker that reported it.
 
     A block can be split across workers -- one block bigger than a worker's
-    share, or a run of one blob cut by a pool chunk -- so the run's figure for
+    share, or a tile run of one blob cut by a chunk -- so the run's figure for
     it is the sum of what each worker spent there.
 
     Args:
@@ -82,29 +82,30 @@ def measure_blocks(rows):
     block_rows = [row for row in rows if row.get("scope") == "blocks"]
     if not block_rows:
         return None
-    keys = {(row.get("source_key"), row.get("profiles")) for row in block_rows}
+    keys = {(row.get("source_key"), row.get("profile_set"))
+            for row in block_rows}
     if len(keys) != 1:
-        raise ValueError(f"block rows name {len(keys)} archive/profile "
+        raise ValueError(f"block rows name {len(keys)} archive/profile set "
                          f"pairs: {sorted(keys)}")
-    (source_key, profiles), = keys
-    return BlockMeasurement(source_key=source_key, profiles=profiles,
+    (source_key, profile_set), = keys
+    return BlockMeasurement(source_key=source_key, profile_set=profile_set,
                             seconds=_summed(block_rows, "seconds") or {},
                             written_bytes=_summed(block_rows, "written_bytes"),
                             workers=len(block_rows))
 
 
-def empty_document(source_key, profiles):
+def empty_document(source_key, profile_set):
     """A block document holding no measurement at all.
 
     Args:
         source_key: The archive the document is for.
-        profiles: The profile set it is for.
+        profile_set: The profile set it is for.
 
     Returns:
         The document.
     """
-    return {"version": VERSION, "source_key": source_key, "profiles": profiles,
-            "seconds": {}, "written_bytes": {}}
+    return {"version": VERSION, "source_key": source_key,
+            "profile_set": profile_set, "seconds": {}, "written_bytes": {}}
 
 
 def _append(histories, measured, digits):
@@ -141,7 +142,11 @@ def record_blocks(document, measurement, build=None):
     if document.get("version") != VERSION:
         document.clear()
         document.update(empty_document(measurement.source_key,
-                                       measurement.profiles))
+                                       measurement.profile_set))
+    # Filed under `profiles` before the glossary named it; the blocks
+    # themselves are keyed the same either way.
+    document.pop("profiles", None)
+    document["profile_set"] = measurement.profile_set
     seconds = document.setdefault("seconds", {})
     # Milliseconds: what a block costs is never balanced finer than that.
     _append(seconds, measurement.seconds, 3)
@@ -154,7 +159,7 @@ def record_blocks(document, measurement, build=None):
         recorded_bytes = "and their written bytes"
     else:
         recorded_bytes = "but no written bytes, which not every worker reported"
-    return (f"blocks {measurement.source_key}/{measurement.profiles}: "
+    return (f"blocks {measurement.source_key}/{measurement.profile_set}: "
             f"recorded {len(measurement.seconds)} blocks' seconds "
             f"{recorded_bytes}, from {measurement.workers} workers, "
             f"{len(seconds)} on file")
@@ -197,13 +202,13 @@ def block_costs(document):
                       written_bytes=_medians(document.get("written_bytes", {})))
 
 
-def read_block_costs(root, source_key, profiles):
+def read_block_costs(root, source_key, profile_set):
     """Read the medians for one archive and profile set out of a checkout.
 
     Args:
         root: The checked-out block state directory, or None.
         source_key: The archive the run reads.
-        profiles: The profile set the run builds.
+        profile_set: The profile set's key, as `profile_set_key()` gives it.
 
     Returns:
         The BlockCosts, empty where there is no directory or no file for this
@@ -214,7 +219,8 @@ def read_block_costs(root, source_key, profiles):
     """
     if not root:
         return NO_BLOCK_COSTS
-    document = read_state_file(block_state_path(root, source_key, profiles))
+    document = read_state_file(block_state_path(root, source_key,
+                                                profile_set))
     if document is None:
         return NO_BLOCK_COSTS
     return block_costs(document)

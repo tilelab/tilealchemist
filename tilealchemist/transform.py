@@ -92,7 +92,7 @@ def _entry_outputs(tile_data, entry, profiles, schema, usage, block):
     tile = Tile.decode(tile_data, schema)
     profile_start = time.perf_counter()
     decode_seconds = profile_start - decode_start
-    outputs, profile_seconds = [], []
+    outputs = []
     for profile in profiles:
         try:
             outputs.append(profile.transform_tile(tile))
@@ -100,17 +100,13 @@ def _entry_outputs(tile_data, entry, profiles, schema, usage, block):
             raise RuntimeError(
                 f"profile {profile.name!r} failed on "
                 f"{_describe_entry(entry)}") from error
-        # One clock serves as this profile's end and the next one's start: no
-        # gap goes unbilled.
-        finished = time.perf_counter()
-        profile_seconds.append(finished - profile_start)
-        profile_start = finished
-    usage.add_decode(len(tile_data), decode_seconds, profile_seconds, block)
+    usage.add_decode(len(tile_data), decode_seconds,
+                     time.perf_counter() - profile_start, block)
     return outputs
 
 
-def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom,
-                               transform_progress, profiles, schema, usage):
+def transform_batch(buffer, batch, min_zoom, max_zoom, transform_progress,
+                    profiles, schema, usage):
     """Transform one fetched batch, for every profile at once.
 
     Entries arrive in offset order, which puts duplicate bytes next to each
@@ -118,7 +114,7 @@ def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom,
     profiles together.
 
     Args:
-        blob: The batch's fetched bytes.
+        buffer: The batch's fetched bytes.
         batch: The `(offset, length, entries)` batch they came from.
         min_zoom: Lowest zoom level the run walks.
         max_zoom: Highest zoom level the run walks.
@@ -138,28 +134,23 @@ def transform_batch_blob_multi(blob, batch, min_zoom, max_zoom,
     for entry in batch_entries:
         key = (entry.offset, entry.length)
         if key != previous_key:
-            # The decoding record's block is the whole run's home; see
+            # The decoding entry's block is the whole tile run's home; see
             # home_blocks().
             block = tile_block(entry.tile_id)
             start = entry.offset - batch_offset
-            outputs = _entry_outputs(blob[start:start + entry.length], entry,
+            outputs = _entry_outputs(buffer[start:start + entry.length], entry,
                                      profiles, schema, usage, block)
             previous_key = key
-        usage.entries += 1
         transform_progress.tick(tileid_to_zxy(entry.tile_id))
         run_start = max(entry.tile_id, tile_id_start)
         run_end = min(entry.tile_id + entry.run_length, tile_id_limit)
         run_length = run_end - run_start
         if run_length <= 0:
             continue
-        usage.output_tiles += run_length
         written = 0
-        for index, (profile_results, output_data) in enumerate(
-                zip(results, outputs)):
+        for profile_results, output_data in zip(results, outputs):
             profile_results.append((run_start, run_length, output_data))
             if output_data:
-                output_bytes = len(output_data) * run_length
-                usage.profile_output_bytes[index] += output_bytes
                 written += len(output_data) * run_length
         usage.add_block_bytes(block, written)
     return results

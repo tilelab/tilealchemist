@@ -49,7 +49,7 @@ WORLD_BOUNDS_E7 = {
 DIGEST_SIZE = 16
 
 # Bytes copied out of the spool per write once a part is laid out.
-COPY_CHUNK_BYTES = 64 * 2 ** 20
+COPY_STEP_BYTES = 64 * 2 ** 20
 
 
 class ProfileTileCounts:
@@ -247,7 +247,7 @@ class PartWriter:
             raise ValueError(
                 f"{self.path}: {overlapping.size} runs overlap the one "
                 f"before them, starting at tile {tileid_to_zxy(first)}; a "
-                f"tile must come from exactly one manifest record")
+                f"tile must come from exactly one manifest entry")
 
         starts = np.ones(tile_ids.size, dtype=bool)
         starts[1:] = ((tile_ids[1:] != run_ends[:-1])
@@ -365,9 +365,9 @@ class PartWriter:
                        access=mmap.ACCESS_READ) as spool:
             for first, last in zip(spool_offsets[span_starts].tolist(),
                                    ends[span_ends - 1].tolist()):
-                for chunk_start in range(first, last, COPY_CHUNK_BYTES):
-                    part.write(spool[chunk_start:min(last, chunk_start
-                                                     + COPY_CHUNK_BYTES)])
+                for step_start in range(first, last, COPY_STEP_BYTES):
+                    part.write(spool[step_start:min(last, step_start
+                                                    + COPY_STEP_BYTES)])
 
 
 def init_part(path, min_zoom, max_zoom, profile, schema, attribution):
@@ -402,7 +402,7 @@ def write_gap_tiles(gap_entries, writer, output_data):
     """Write the profile's single gap answer at every gap tile.
 
     Args:
-        gap_entries: The gap records this worker carries.
+        gap_entries: The gap entries this worker carries.
         writer: The part to write into.
         output_data: The profile's answer for a gap tile, or None to write
             nothing at all.

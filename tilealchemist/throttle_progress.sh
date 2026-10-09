@@ -2,7 +2,7 @@
 # Throttles \r-redrawn output to at most one line per INTERVAL seconds, most
 # recent wins. A \r-redrawing tool repaints one line in place: `pmtiles
 # merge`'s progress bar, tile-join's "z/x/y", tilemaker's per-tile counters. \n-terminated lines always print
-# immediately. The split is on which byte ended a chunk, never on message
+# immediately. The split is on which byte ended a piece, never on message
 # text, so it works for any such tool.
 #
 # Particularly worth using ahead of a GitHub Actions log. Its viewer does not
@@ -47,31 +47,31 @@ show_pending_if_due() {
   pending_set=0
 }
 
-# Takes one \n-free chunk and keeps only the redraw ending at its last \r.
-# Earlier ones in the same chunk are already superseded, and only one could
+# Takes one \n-free piece and keeps only the redraw ending at its last \r.
+# Earlier ones in the same piece are already superseded, and only one could
 # print per interval anyway. What follows that \r has no terminator yet, so
 # it goes back to waiting in partial.
 consume() {
-  local chunk=$1 head
-  if [[ $chunk != *$'\r'* ]]; then
-    partial+=$chunk
+  local piece=$1 head
+  if [[ $piece != *$'\r'* ]]; then
+    partial+=$piece
     return 0
   fi
-  head=${chunk%$'\r'*}
+  head=${piece%$'\r'*}
   if [[ $head == *$'\r'* ]]; then
     pending=${head##*$'\r'}
   else
     pending=$partial$head
   fi
   pending_set=1
-  partial=${chunk##*$'\r'}
+  partial=${piece##*$'\r'}
   show_pending_if_due
 }
 
 while :; do
-  IFS= read -r -t "$interval" chunk
+  IFS= read -r -t "$interval" piece
   status=$?
-  consume "$chunk"
+  consume "$piece"
 
   if (( status == 0 )); then
     # \n: a complete line, printed as is; any stale redraw dies with it.

@@ -12,7 +12,7 @@ from tilealchemist.cost import (
 from tilealchemist.fetch_batching import peak_batch_bytes
 from tilealchemist.partition import (
     count_output_tiles,
-    partition_into_worker_blocks,
+    partition_into_shards,
     tile_block_groups,
 )
 
@@ -34,7 +34,7 @@ WORKER_SCALE_FACTOR = 3
 Limits = namedtuple("Limits",
                     "job_seconds concurrency tail_factor worker_scale")
 
-BlockLoad = namedtuple("BlockLoad", "seconds tiles records batch_bytes")
+ShardLoad = namedtuple("ShardLoad", "seconds tiles entries batch_bytes")
 
 DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS,
                         concurrency=DEFAULT_CONCURRENCY,
@@ -42,43 +42,43 @@ DEFAULT_LIMITS = Limits(job_seconds=DEFAULT_JOB_SECONDS,
                         worker_scale=WORKER_SCALE_FACTOR)
 
 
-def block_load(block, model=DEFAULT_COST_MODEL,
+def shard_load(shard, model=DEFAULT_COST_MODEL,
                setup_seconds=WORKER_SETUP_SECONDS):
-    """Predict what one worker's block will cost it.
+    """Predict what one shard will cost its worker.
 
     Args:
-        block: The entries assigned to that worker.
+        shard: The entries assigned to that worker.
         model: The CostModel to price with.
-        setup_seconds: What a worker costs before it reaches its first record.
+        setup_seconds: What a worker costs before it reaches its first entry.
 
     Returns:
-        The block's predicted seconds, output tiles, record count and peak
-        batch size, as a BlockLoad.
+        The shard's predicted seconds, output tiles, entry count and peak
+        batch size, as a ShardLoad.
     """
-    return BlockLoad(
-        seconds=setup_seconds + cost_weights(block, model)[1],
-        tiles=count_output_tiles(block),
-        records=len(block),
-        batch_bytes=peak_batch_bytes(block))
+    return ShardLoad(
+        seconds=setup_seconds + cost_weights(shard, model)[1],
+        tiles=count_output_tiles(shard),
+        entries=len(shard),
+        batch_bytes=peak_batch_bytes(shard))
 
 
-def block_loads(blocks, model=DEFAULT_COST_MODEL,
+def shard_loads(shards, model=DEFAULT_COST_MODEL,
                 setup_seconds=WORKER_SETUP_SECONDS):
-    """Predict what every worker's block will cost it, in worker order.
+    """Predict what every shard will cost its worker, in worker order.
 
     A caller that reports per-worker predictions and then judges the run as a
-    whole wants both from one pass: pricing a planet run's blocks twice is
+    whole wants both from one pass: pricing a planet run's shards twice is
     work enough to notice, and two passes can only ever agree by accident.
 
     Args:
-        blocks: One entry block per worker, in worker order.
+        shards: One shard per worker, in worker order.
         model: The CostModel to price with.
-        setup_seconds: What a worker costs before it reaches its first record.
+        setup_seconds: What a worker costs before it reaches its first entry.
 
     Returns:
-        One BlockLoad per block, in the same order.
+        One ShardLoad per shard, in the same order.
     """
-    return [block_load(block, model, setup_seconds) for block in blocks]
+    return [shard_load(shard, model, setup_seconds) for shard in shards]
 
 
 def worst_of(loads):
@@ -88,35 +88,35 @@ def worst_of(loads):
     envelope a limit has to hold against rather than any one worker's load.
 
     Args:
-        loads: One BlockLoad per worker.
+        loads: One ShardLoad per worker.
 
     Returns:
-        A BlockLoad whose every field is the maximum across them.
+        A ShardLoad whose every field is the maximum across them.
     """
-    return BlockLoad(*(max(getattr(load, field) for load in loads)
-                       for field in BlockLoad._fields))
+    return ShardLoad(*(max(getattr(load, field) for load in loads)
+                       for field in ShardLoad._fields))
 
 
-def worst_load(blocks, model=DEFAULT_COST_MODEL,
+def worst_load(shards, model=DEFAULT_COST_MODEL,
                setup_seconds=WORKER_SETUP_SECONDS):
-    """Take the worst value of each axis across every block.
+    """Take the worst value of each axis across every shard.
 
     Args:
-        blocks: One entry block per worker.
+        shards: One shard per worker.
         model: The CostModel to price with.
-        setup_seconds: What a worker costs before it reaches its first record.
+        setup_seconds: What a worker costs before it reaches its first entry.
 
     Returns:
-        A BlockLoad whose every field is the maximum across the blocks.
+        A ShardLoad whose every field is the maximum across the shards.
     """
-    return worst_of(block_loads(blocks, model, setup_seconds))
+    return worst_of(shard_loads(shards, model, setup_seconds))
 
 
 def breaches(load, limits):
     """List the limits a worker's load would break.
 
     Args:
-        load: One worker's BlockLoad, or the envelope `worst_of()` gives.
+        load: One worker's ShardLoad, or the envelope `worst_of()` gives.
         limits: The run's hard limits.
 
     Returns:
@@ -170,18 +170,18 @@ def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL,
 
     Args:
         entries: The archive entries this run will walk.
-        gaps: The gap records covering tiles the archive does not hold.
-        model: The CostModel to price with, which is also what the blocks are
+        gaps: The gap entries covering tiles the archive does not hold.
+        model: The CostModel to price with, which is also what the shards are
             partitioned by, so that a run is judged by the model it was split
             with.
         limits: The run's hard limits.
         cell_limit: The most matrix cells a run may have.
-        setup_seconds: What a worker costs before it reaches its first record.
+        setup_seconds: What a worker costs before it reaches its first entry.
         groups: The entries' TileBlockGroups under the same model, where the
             caller already grouped them; grouped here, once, otherwise.
 
     Returns:
-        The chosen count, its blocks, its worst load, and every
+        The chosen count, its shards, its worst load, and every
         `(worker_count, load, breaches)` attempt made along the way. Where no
         count fits, the largest is returned with the limits it still breaks.
     """
@@ -189,13 +189,13 @@ def choose_worker_count(entries, gaps, model=DEFAULT_COST_MODEL,
     if groups is None:
         groups = tile_block_groups(entries, model)
     for worker_count in candidate_worker_counts(limits, cell_limit):
-        blocks = partition_into_worker_blocks(entries, gaps, worker_count,
-                                              model, groups)
-        load = worst_load(blocks, model, setup_seconds)
+        shards = partition_into_shards(entries, gaps, worker_count, model,
+                                       groups)
+        load = worst_load(shards, model, setup_seconds)
         broken = breaches(load, limits)
         attempts.append((worker_count, load, broken))
         if not broken:
             break
     # Whether the loop broke out or ran dry, the last partition is the one to
     # keep.
-    return worker_count, blocks, load, attempts
+    return worker_count, shards, load, attempts

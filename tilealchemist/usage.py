@@ -96,32 +96,24 @@ class PhaseSeconds:
                 for name, value in sorted(self.seconds.items())}
 
 
-class TransformUsage:
-    """What a transform cost, measured as it ran, for a chunk or a worker.
+class ShardUsage:
+    """What a shard's decode and profiles cost, for the shard or one chunk.
 
-    A chunk's measurements are taken in the process that ran it and merged into
-    the worker's own on the way back, so that a worker reports once rather than
-    once per chunk; see docs/ARCHITECTURE.md "Measuring a run".
+    Only what is measured inside the transform pool's processes is kept here,
+    since the worker cannot see it any other way: a chunk measures itself in
+    the process that ran it, and is merged into the shard's own on the way
+    back, so that a worker reports once rather than once per chunk; see
+    docs/ARCHITECTURE.md "Measuring a run". Everything the worker can see for
+    itself -- its phases, fetched bytes and tile counts -- it reports directly.
 
     Attributes:
-        entries: Manifest entries walked.
-        decode_calls: Tiles actually decoded, a duplicate not counted twice.
-        decoded_bytes: Source bytes decoded.
-        decode_seconds: Seconds spent decoding.
-        profile_seconds: Seconds spent inside each profile, in profile order, so
-            that a profile's own cost is attributable to it rather than to the
-            run's profile set as a whole.
-        profile_output_bytes: Output payload bytes each profile wrote, in the
-            same order, counted once per output tile. Measured here rather than
-            from the finished shard so it is payload alone -- no sqlite page
-            overhead, and no gap tiles, which are a different size entirely and
-            counted separately.
-        output_tiles: Tiles written out, per profile: every profile is offered
-            the same tiles.
         buckets: Per-bucket `[calls, bytes, decode]`, bucketed by the bit length
             of the tile, which is the shape the decode axes are fitted against.
+            Every decode is counted here and nowhere else: its calls, bytes
+            and seconds in total are these summed, a duplicate not counted
+            twice.
         block_seconds: Seconds every profile spent together, per home tile
-            block -- the block of the record that decoded the blob, as
+            block -- the block of the entry that decoded the blob, as
             `home_blocks()` defines it.
         block_bytes: Output payload bytes every profile wrote together, per
             home tile block, a deduplicated tile's included under the blob's
@@ -129,20 +121,8 @@ class TransformUsage:
             at zero, which is a measurement, not a hole.
     """
 
-    def __init__(self, profile_count=0):
-        """Start every measurement at zero.
-
-        Args:
-            profile_count: How many profiles the run builds, which fixes the
-                length of `profile_seconds` for the run.
-        """
-        self.entries = 0
-        self.decode_calls = 0
-        self.decoded_bytes = 0
-        self.decode_seconds = 0.0
-        self.output_tiles = 0
-        self.profile_seconds = [0.0] * profile_count
-        self.profile_output_bytes = [0] * profile_count
+    def __init__(self):
+        """Start every measurement at zero."""
         self.buckets = [[0, 0, 0.0] for _ in range(LENGTH_BUCKET_COUNT)]
         self.block_seconds = {}
         self.block_bytes = {}
@@ -166,20 +146,15 @@ class TransformUsage:
         self.block_bytes[block] = self.block_bytes.get(block, 0) + byte_count
 
     def add_decode(self, length, decode_seconds, profile_seconds, block):
-        """Record one tile's decode, and what each profile spent on it.
+        """Record one tile's decode, and what the profiles spent on it.
 
         Args:
             length: The tile's source bytes.
             decode_seconds: Seconds spent decoding it.
-            profile_seconds: Seconds each profile spent on it, in profile order.
+            profile_seconds: Seconds every profile spent on it together.
             block: The tile block the profiles' seconds are charged to.
         """
-        self.add_block(block, sum(profile_seconds))
-        self.decode_calls += 1
-        self.decoded_bytes += length
-        self.decode_seconds += decode_seconds
-        for index, seconds in enumerate(profile_seconds):
-            self.profile_seconds[index] += seconds
+        self.add_block(block, profile_seconds)
         bucket = self.buckets[min(length.bit_length(), LENGTH_BUCKET_COUNT - 1)]
         bucket[0] += 1
         bucket[1] += length
@@ -188,22 +163,11 @@ class TransformUsage:
     def merge(self, other):
         """Fold one chunk's measurements into these.
 
-        Every field is a running total, so merging is addition throughout; the
-        run's profile set is fixed, which is what lets `profile_seconds` add
-        position by position.
+        Every field is a running total, so merging is addition throughout.
 
         Args:
             other: The measurements to add, from a chunk this worker ran.
         """
-        self.entries += other.entries
-        self.decode_calls += other.decode_calls
-        self.decoded_bytes += other.decoded_bytes
-        self.decode_seconds += other.decode_seconds
-        self.output_tiles += other.output_tiles
-        for index, seconds in enumerate(other.profile_seconds):
-            self.profile_seconds[index] += seconds
-        for index, byte_count in enumerate(other.profile_output_bytes):
-            self.profile_output_bytes[index] += byte_count
         for bucket, addend in zip(self.buckets, other.buckets):
             bucket[0] += addend[0]
             bucket[1] += addend[1]
@@ -212,14 +176,6 @@ class TransformUsage:
             self.add_block(block, seconds)
         for block, byte_count in other.block_bytes.items():
             self.add_block_bytes(block, byte_count)
-
-    def transform_seconds(self):
-        """What every profile spent together.
-
-        Returns:
-            The summed per-profile seconds.
-        """
-        return sum(self.profile_seconds)
 
     def length_histogram(self):
         """The per-length buckets, as one usage-line field value.
@@ -236,19 +192,16 @@ class TransformUsage:
     def fields(self):
         """These measurements as usage-line fields.
 
-        The per-profile seconds are left out: they belong on the `scope=profile`
-        line, which is already keyed by the profile they were measured on. So
-        are the per-block seconds and bytes, which have a `scope=blocks` line
-        of their own.
+        The per-block seconds and bytes appear here summed over the blocks;
+        each block's own figures go on the `scope=blocks` line. The profiles'
+        seconds are named `profile_seconds` rather than `transform_seconds`,
+        which is the worker's wall-clock phase of that name.
 
         Returns:
             A mapping of field name to value.
         """
         return {
-            "entries": self.entries,
-            "decode_calls": self.decode_calls,
-            "decoded_bytes": self.decoded_bytes,
-            "decode_seconds": self.decode_seconds,
-            "output_tiles": self.output_tiles,
+            "profile_seconds": sum(self.block_seconds.values()),
+            "output_bytes": sum(self.block_bytes.values()),
             "length_hist": self.length_histogram(),
         }

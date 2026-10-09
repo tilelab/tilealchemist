@@ -21,13 +21,13 @@ from tilealchemist.partition import (
 from tilealchemist.pmtiles_index import collect_entries, compute_gaps
 from tilealchemist.ranged_fetch import make_session
 from tilealchemist.sizing import (
-    block_loads,
     breaches,
     choose_worker_count,
+    shard_loads,
     worst_of,
 )
 from tilealchemist.sources import resolve_source
-from tilealchemist.tile_blocks import TILE_BLOCK_BITS, profile_combo_key
+from tilealchemist.tile_blocks import TILE_BLOCK_BITS, profile_set_key
 
 
 def run_prepare(args):
@@ -82,20 +82,20 @@ def run_prepare(args):
           f"declared figures; the costliest is {largest / 60:.1f}m, which no "
           f"worker's share can go below", file=sys.stderr)
 
-    worker_count, blocks = _size_run(args, entries, gaps, model, setup_seconds,
+    worker_count, shards = _size_run(args, entries, gaps, model, setup_seconds,
                                      groups)
-    write_worker_manifests(args.out_dir, blocks)
+    write_worker_manifests(args.out_dir, shards)
     write_source_metadata(args.out_dir, resolved_source, args.min_zoom,
                           args.max_zoom, header["tile_data_offset"],
                           attribution)
 
-    non_empty_count = sum(1 for block in blocks if block)
-    print(f"wrote {len(blocks)} manifests to {args.out_dir} "
+    non_empty_count = sum(1 for shard in shards if shard)
+    print(f"wrote {len(shards)} manifests to {args.out_dir} "
           f"({non_empty_count} non-empty)", file=sys.stderr)
-    print(f"largest block holds {max(len(block) for block in blocks)} "
-          f"records", file=sys.stderr)
-    print(_tiles_line(blocks), file=sys.stderr)
-    loads = block_loads(blocks, model, setup_seconds)
+    print(f"largest shard holds {max(len(shard) for shard in shards)} "
+          f"entries", file=sys.stderr)
+    print(_tiles_line(shards), file=sys.stderr)
+    loads = shard_loads(shards, model, setup_seconds)
     _print_worker_predictions(loads, args.limits)
     load = worst_of(loads)
     broken = breaches(load, args.limits)
@@ -107,7 +107,7 @@ def run_prepare(args):
               f"on {', '.join(broken)} at {worker_count} workers",
               file=sys.stderr)
     worker_seconds = [worker_load.seconds for worker_load in loads]
-    even_minutes = sum(worker_seconds) / len(blocks) / 60
+    even_minutes = sum(worker_seconds) / len(shards) / 60
     print(f"cost model predicts {sum(worker_seconds) / 3600:.1f} core-hours "
           f"including {setup_seconds:.0f}s setup per worker, slowest worker "
           f"{max(worker_seconds) / 60:.0f}m against an even "
@@ -133,7 +133,7 @@ def _print_worker_predictions(loads, limits):
     around them, and a terminal shows it as the plain line it is.
 
     Args:
-        loads: One BlockLoad per worker, in worker order.
+        loads: One ShardLoad per worker, in worker order.
         limits: The run's hard limits, for what share of its budget each
             prediction spends.
     """
@@ -143,7 +143,7 @@ def _print_worker_predictions(loads, limits):
         budget_share = load.seconds * limits.tail_factor / limits.job_seconds
         print(f"worker-{worker_index:03d}: {load.seconds / 60:6.1f}m "
               f"predicted, "
-              f"{load.tiles} output tiles, {load.records} records, "
+              f"{load.tiles} output tiles, {load.entries} entries, "
               f"{budget_share:.0%} of budget", file=sys.stderr)
     print("::endgroup::", file=sys.stderr)
 
@@ -191,20 +191,20 @@ def _settle_costs(args, resolved_source):
                                             resolved_source.schema)
     for note in notes:
         print(f"::warning title=axis state::{note}", file=sys.stderr)
-    blocks = block_state.NO_BLOCK_COSTS
+    block_costs = block_state.NO_BLOCK_COSTS
     if args.block_state and args.profiles:
-        profiles_key = profile_combo_key(profile.name
-                                         for profile in args.profiles)
-        blocks = block_state.read_block_costs(args.block_state, source_key,
-                                              profiles_key)
-        print(f"block state: {len(blocks.seconds)} tile blocks' seconds and "
-              f"{len(blocks.written_bytes)} blocks' written bytes measured for "
-              f"{source_key}/{profiles_key}, each the median of up to "
-              f"{axis_state.HISTORY_LENGTH} runs", file=sys.stderr)
+        profile_set = profile_set_key(profile.name
+                                      for profile in args.profiles)
+        block_costs = block_state.read_block_costs(args.block_state,
+                                                   source_key, profile_set)
+        print(f"block state: {len(block_costs.seconds)} tile blocks' seconds "
+              f"and {len(block_costs.written_bytes)} blocks' written bytes "
+              f"measured for {source_key}/{profile_set}, each the median of "
+              f"up to {axis_state.HISTORY_LENGTH} runs", file=sys.stderr)
     model = cost_model(axis=axis, profiles=profile_costs,
                        transform_parallelism=parallelism,
-                       block_seconds=blocks.seconds,
-                       block_bytes=blocks.written_bytes)
+                       block_seconds=block_costs.seconds,
+                       block_bytes=block_costs.written_bytes)
     print(f"costing: one worker's pool buys "
           f"{model.transform_parallelism:.2f}s of decode and profile work per "
           f"second of its wall clock", file=sys.stderr)
@@ -246,37 +246,37 @@ def _declared_profile_costs(profiles, schema):
     return costs
 
 
-def _tiles_line(blocks):
-    """Say what the worst block writes.
+def _tiles_line(shards):
+    """Say what the worst shard writes.
 
     Args:
-        blocks: One entry block per worker.
+        shards: One shard per worker.
 
     Returns:
         That line, ready for stderr.
     """
-    worst = max(blocks, key=count_output_tiles)
+    worst = max(shards, key=count_output_tiles)
     tiles, gap_tiles = count_output_tiles(worst), count_gap_tiles(worst)
-    return (f"worst block: {len(worst)} records writing {tiles} output tiles "
+    return (f"worst shard: {len(worst)} entries writing {tiles} output tiles "
             f"({gap_tiles} of them gap tiles)")
 
 
 def _size_run(args, entries, gaps, model, setup_seconds, groups):
-    """The worker count this run sized itself to, and its blocks.
+    """The worker count this run sized itself to, and its shards.
 
     Args:
         args: The parsed command line, for the limits.
         entries: The archive's directory entries for this run.
-        gaps: The gap records covering what the archive does not hold.
+        gaps: The gap entries covering what the archive does not hold.
         model: The CostModel this run is priced by.
-        setup_seconds: What a worker costs before it reaches its first record.
+        setup_seconds: What a worker costs before it reaches its first entry.
         groups: The entries' TileBlockGroups under that model.
 
     Returns:
-        The chosen worker count and its blocks. Every count tried is logged,
+        The chosen worker count and its shards. Every count tried is logged,
         so the log says which limit pushed the run to the count it landed on.
     """
-    worker_count, blocks, unused_load, attempts = choose_worker_count(
+    worker_count, shards, unused_load, attempts = choose_worker_count(
         entries, gaps, model, args.limits, setup_seconds=setup_seconds,
         groups=groups)
     for tried, load, broken in attempts:
@@ -284,4 +284,4 @@ def _size_run(args, entries, gaps, model, setup_seconds, groups):
         print(f"sizing: {tried} workers, worst worker "
               f"{load.seconds / 60:.0f}m predicted, {load.tiles} output tiles "
               f"-- {verdict}", file=sys.stderr)
-    return worker_count, blocks
+    return worker_count, shards

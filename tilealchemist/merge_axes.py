@@ -278,7 +278,7 @@ def main():
         """
         if not document:
             document = block_state.empty_document(blocks.source_key,
-                                                  blocks.profiles)
+                                                  blocks.profile_set)
         print(block_state.record_blocks(document, blocks, build=build),
               file=sys.stderr)
         return document
@@ -304,7 +304,7 @@ def main():
           f"{axis_state.HISTORY_LENGTH}", file=sys.stderr)
     if blocks:
         block_path = block_state.block_state_path(
-            args.block_state_dir, blocks.source_key, blocks.profiles)
+            args.block_state_dir, blocks.source_key, blocks.profile_set)
         update_json(
             args.repo, args.token, args.state_branch, block_path, mutate_blocks,
             message=f"record {len(blocks.seconds)} tile blocks from {seen} "

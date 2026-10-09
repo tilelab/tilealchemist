@@ -11,13 +11,13 @@ from tilealchemist.schemas import SchemaName
 from tilealchemist.zoom import ZoomLevel
 
 # tile_id, offset, length, run_length; no framing needed.
-RECORD = struct.Struct("<QQII")
+ENTRY_STRUCT = struct.Struct("<QQII")
 
 Entry = namedtuple("Entry", ["tile_id", "offset", "length", "run_length"])
 
 
 def write_manifest(path, entries):
-    """Write entries out as fixed-width records.
+    """Write entries out at a fixed width each.
 
     Args:
         path: File to write.
@@ -25,8 +25,8 @@ def write_manifest(path, entries):
     """
     with open(path, "wb") as file:
         for entry in entries:
-            file.write(RECORD.pack(entry.tile_id, entry.offset, entry.length,
-                                   entry.run_length))
+            file.write(ENTRY_STRUCT.pack(entry.tile_id, entry.offset,
+                                         entry.length, entry.run_length))
 
 
 def read_manifest(path):
@@ -40,20 +40,20 @@ def read_manifest(path):
     """
     with open(path, "rb") as file:
         data = file.read()
-    return [Entry(*fields) for fields in RECORD.iter_unpack(data)]
+    return [Entry(*fields) for fields in ENTRY_STRUCT.iter_unpack(data)]
 
 
-def write_worker_manifests(out_dir, blocks):
+def write_worker_manifests(out_dir, shards):
     """Write one manifest per worker.
 
     Args:
         out_dir: Directory the `worker-NNN.bin` files go in.
-        blocks: One entry block per worker, in worker order. An empty block
-            still gets its file, so worker N always has one to read.
+        shards: One shard per worker, in worker order. An empty shard still
+            gets its file, so worker N always has one to read.
     """
-    for worker_index, block in enumerate(blocks):
+    for worker_index, shard in enumerate(shards):
         path = os.path.join(out_dir, f"worker-{worker_index:03d}.bin")
-        write_manifest(path, block)
+        write_manifest(path, shard)
 
 
 def axis_key_for(url, schema):
@@ -103,7 +103,7 @@ class SourceMetadata:
         min_zoom: Lowest zoom level the run walks.
         max_zoom: Highest zoom level the run walks.
         tile_data_offset: Start of the archive's tile data, which the offsets
-            in a manifest record are relative to.
+            in a manifest entry are relative to.
         attribution: What the built layers credit, settled once here so
             that every part carries the same and `pmtiles merge` can take
             any part's metadata as the layer's.

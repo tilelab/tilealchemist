@@ -67,9 +67,10 @@ refuses one rather than quietly ignoring it.
 
 - [`docs/PROFILES.md`](docs/PROFILES.md): the `Profile`/`TileSchema`
   contracts and how to write and distribute a profile of your own.
-- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): `Source` resolution,
-  batched fetching, configurable sharding, publishing, and the GitHub
-  Actions structure.
+- [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md): the glossary of run,
+  shard, batch, chunk, part and tile block, `Source` resolution, batched
+  fetching, configurable sharding, publishing, and the GitHub Actions
+  structure.
 
 ## Repository layout
 
@@ -78,7 +79,7 @@ else.
 
 | Path | Purpose |
 | --- | --- |
-| `.github/workflows/_pipeline.yml` | Reusable: prepares shards, builds them in parallel, merges into one `.pmtiles` artifact per profile. Never publishes. Safe to call cross-repo. |
+| `.github/workflows/_pipeline.yml` | Reusable: prepares shards, builds each shard's parts in parallel, merges each profile's parts into one `.pmtiles` artifact. Never publishes. Safe to call cross-repo. |
 | `.github/workflows/_publish-release.yml` | Reusable: publishes a merged `.pmtiles` artifact as a GitHub Release. Safe to call cross-repo. |
 | `.github/workflows/test.yml` | CI: real low-zoom runs against live OpenFreeMap *and* Protomaps data, built with [tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)' profiles, on every push and PR. |
 | `pyproject.toml` | Packaging: dependencies and console scripts. A profile needing anything beyond these declares it inline, in a PEP 723 block in its own `.py` file. |
@@ -94,11 +95,11 @@ else.
 | `tilealchemist/merge_axes.py` | The single-writer CLI a pipeline runs once per run: collects every worker's usage, fits, and pushes to the state branch -- but only if every worker reported. |
 | `tilealchemist/calibrate.py` | The by-hand equivalent: prints what it would change and, with `--out`, writes a flat `calibration.json`. It never edits `cost.py` and never writes the state branch. |
 | `tilealchemist/build_shard.py` | One worker's entry point: parses its flags, then hands off to `shard_worker.py`. |
-| `tilealchemist/shard_worker.py` | One worker's control flow: fetches its manifest's tiles in a single range request per contiguous run of them, drives the transform and the part writing, logs the run. |
+| `tilealchemist/shard_worker.py` | One worker's control flow: fetches its shard's tiles in one range request per batch, drives the transform and the part writing, logs the run. |
 | `tilealchemist/fetch_batching.py` | Groups a worker's manifest entries into range-GET batches (split at wide unread gaps) and fetches one batch's bytes. |
 | `tilealchemist/transform.py` | Fetched bytes to output tiles: one decode per tile shared by every selected `Profile`, timed apart from the per-profile transform. |
-| `tilealchemist/transform_pool.py` | Splits a batch into cost-balanced chunks and runs them across this machine's cores (`--transform-workers`), throttling how many are in flight. |
-| `tilealchemist/usage.py` | What the run actually cost: one `usage:` line per worker and one per profile (seconds by phase, bytes, distinct blobs, each profile's own transform seconds). A chunk measures itself and is merged into its worker's totals. |
+| `tilealchemist/transform_pool.py` | Splits a batch into cost-balanced chunks and runs them across this machine's cores (`--transform-processes`), throttling how many are in flight. |
+| `tilealchemist/usage.py` | What the run actually cost: one `usage:` line per worker and one per profile (seconds by phase, bytes, distinct blobs, tile counts), and the profiles' seconds and bytes per tile block. A chunk measures itself and is merged into its shard's `ShardUsage`. |
 | `tilealchemist/pmtiles_part.py` | The part files themselves: one clustered, deduplicated PMTiles archive per profile per worker, laid out so `pmtiles merge` can join them without decoding a tile. |
 | `tilealchemist/profile_requirements.py` | Reads a profile's inline PEP 723 dependency block without importing it, so CI can install what the profile needs before loading it. |
 | `tilealchemist/profiles/` | The `Profile` ABC and the path-based `load_profile()`. No profiles: those live in their own repositories. |
@@ -109,7 +110,7 @@ else.
 | `tilealchemist/tile.py` | The `Tile` a profile's `transform()` is handed: decoded layers, extent, schema feature sets, per-tile memoization. |
 | `tilealchemist/mvt.py` | Gzip+MVT decode/encode helper any profile can use, including output grid snapping. |
 | `tilealchemist/water.py` | Geometry math offered to water-related profiles; used by no other module here, only by profiles that ask for it. |
-| `tilealchemist/manifest.py` | Both sides of everything `shard_prep.py` hands the workers: the binary per-worker manifest format, and the shared `source.json` (as the `SourceMetadata` record a worker reads it back into). |
+| `tilealchemist/manifest.py` | Both sides of everything `shard_prep.py` hands the workers: the binary per-worker manifest format, and the shared `source.json` (as the `SourceMetadata` object a worker reads it back into). |
 | `tilealchemist/ranged_fetch.py` | HTTP Range fetching against the source archive (session, retry/backoff, 206 enforcement, download progress), shared by `pmtiles_index.py`/`fetch_batching.py`. |
 | `tilealchemist/backoff.py`, `tilealchemist/throttle.py`, `tilealchemist/throttle_progress.sh` | HTTP retry backoff, throttled progress logging. |
 

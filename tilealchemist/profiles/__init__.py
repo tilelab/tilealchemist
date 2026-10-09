@@ -21,7 +21,7 @@ def load_profile(path):
         raise ValueError(f"profile file not found: {path}")
     spec = importlib.util.spec_from_file_location(path.stem, path)
     module = importlib.util.module_from_spec(spec)
-    # Deliberately not registered in sys.modules: pool workers reload by path
+    # Deliberately not registered in sys.modules: pool processes reload by path
     # under spawn.
     spec.loader.exec_module(module)
     if not hasattr(module, "PROFILE"):

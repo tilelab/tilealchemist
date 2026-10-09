@@ -90,7 +90,7 @@ class _RetryableFailure(Exception):
         self.final = final
 
 
-def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size,
+def _attempt_fetch_range(session, url, range_header, on_progress, read_size,
                          dest=None):
     """Make one ranged request and read its body.
 
@@ -98,8 +98,9 @@ def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size,
         session: The requests session to use.
         url: Absolute URL of the archive.
         range_header: The `bytes=start-end` value to ask for.
-        on_chunk: Called with the running byte total as chunks arrive, or None.
-        chunk_size: How many bytes to read at a time.
+        on_progress: Called with the running byte total as the body
+            arrives, or None.
+        read_size: How many bytes to read at a time.
         dest: An open binary file to stream the body into, or None to return
             it as bytes. A caller that passes one rewinds it before a retry.
 
@@ -139,16 +140,16 @@ def _attempt_fetch_range(session, url, range_header, on_chunk, chunk_size,
         body = bytearray() if dest is None else None
         downloaded = 0
         try:
-            for chunk in response.iter_content(chunk_size=chunk_size):
-                if not chunk:
+            for piece in response.iter_content(chunk_size=read_size):
+                if not piece:
                     continue
                 if dest is None:
-                    body += chunk
+                    body += piece
                 else:
-                    dest.write(chunk)
-                downloaded += len(chunk)
-                if on_chunk is not None:
-                    on_chunk(downloaded)
+                    dest.write(piece)
+                downloaded += len(piece)
+                if on_progress is not None:
+                    on_progress(downloaded)
             return downloaded if dest is not None else bytes(body)
         except (requests.exceptions.ChunkedEncodingError,
                 requests.exceptions.ConnectionError) as error:
@@ -174,7 +175,7 @@ def _warn_retry(retry_label, detail, attempt, delay):
 
 
 def fetch_range(session, url, offset, length, retry_label,
-                on_chunk=None, chunk_size=1024 * 1024, dest_path=None):
+                on_progress=None, read_size=1024 * 1024, dest_path=None):
     """Fetch a byte range, retrying the failures that are worth retrying.
 
     Args:
@@ -183,8 +184,9 @@ def fetch_range(session, url, offset, length, retry_label,
         offset: First byte to read.
         length: How many bytes to read.
         retry_label: What to call this fetch in a retry warning.
-        on_chunk: Called with the running byte total as chunks arrive, or None.
-        chunk_size: How many bytes to read at a time.
+        on_progress: Called with the running byte total as the body
+            arrives, or None.
+        read_size: How many bytes to read at a time.
         dest_path: A path to stream the range into rather than holding it in
             memory. The file is truncated before every attempt, a partial one
             being no use to a caller that has to ask again from byte zero.
@@ -203,13 +205,13 @@ def fetch_range(session, url, offset, length, retry_label,
     if dest_path is not None:
         with open(dest_path, "wb") as dest:
             return _fetch_range_attempts(session, url, range_header,
-                                         on_chunk, chunk_size, retry_label,
+                                         on_progress, read_size, retry_label,
                                          dest)
-    return _fetch_range_attempts(session, url, range_header, on_chunk,
-                                 chunk_size, retry_label, None)
+    return _fetch_range_attempts(session, url, range_header, on_progress,
+                                 read_size, retry_label, None)
 
 
-def _fetch_range_attempts(session, url, range_header, on_chunk, chunk_size,
+def _fetch_range_attempts(session, url, range_header, on_progress, read_size,
                           retry_label, dest):
     """Run one range's attempts until one succeeds or they run out.
 
@@ -217,8 +219,9 @@ def _fetch_range_attempts(session, url, range_header, on_chunk, chunk_size,
         session: The requests session to use.
         url: Absolute URL of the archive.
         range_header: The `bytes=start-end` value to ask for.
-        on_chunk: Called with the running byte total as chunks arrive, or None.
-        chunk_size: How many bytes to read at a time.
+        on_progress: Called with the running byte total as the body
+            arrives, or None.
+        read_size: How many bytes to read at a time.
         retry_label: What to call this fetch in a retry warning.
         dest: An open binary file to stream into, or None to return bytes.
 
@@ -237,7 +240,7 @@ def _fetch_range_attempts(session, url, range_header, on_chunk, chunk_size,
                 dest.seek(0)
                 dest.truncate(0)
             return _attempt_fetch_range(session, url, range_header,
-                                        on_chunk, chunk_size, dest)
+                                        on_progress, read_size, dest)
         except _RetryableFailure as failure:
             if attempt == MAX_RANGE_ATTEMPTS:
                 raise failure.final from failure

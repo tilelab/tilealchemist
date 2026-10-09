@@ -1,4 +1,4 @@
-"""What one manifest record costs a worker, in seconds.
+"""What one manifest entry costs a worker, in seconds.
 
 See docs/ARCHITECTURE.md "Parallelism".
 """
@@ -12,7 +12,7 @@ WORKER_SETUP_SECONDS = 39.0
 
 AxisSeconds = namedtuple(
     "AxisSeconds",
-    "manifest_record decode_call fetched_byte decoded_byte written_byte")
+    "manifest_entry decode_call fetched_byte decoded_byte written_byte")
 
 # What one profile costs a run, as the caller that assembled it settled it.
 ProfileCost = namedtuple(
@@ -22,7 +22,7 @@ ProfileCost = namedtuple(
 # Every per-byte axis charges length itself; docs/ARCHITECTURE.md has the
 # retired decode exponent.
 AXIS_SECONDS = AxisSeconds(
-    manifest_record=1e-6,
+    manifest_entry=1e-6,
     decode_call=2.5e-4,
     fetched_byte=3.3e-7,
     decoded_byte=1.1e-7,
@@ -69,10 +69,10 @@ def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None,
         block_seconds: The pooled profile seconds measured per home tile
             block for this run's archive and profile set, or None where
             nothing was measured. A measured block's figure replaces the
-            profiles' per-tile seconds for every record homed in it.
+            profiles' per-tile seconds for every entry homed in it.
         block_bytes: The output bytes measured per home tile block, the same
             way. A measured block's figure replaces the profiles' declared
-            weight and written share for every record homed in it.
+            weight and written share for every entry homed in it.
 
     Returns:
         The CostModel to price with.
@@ -88,39 +88,40 @@ def cost_model(axis=AXIS_SECONDS, profiles=None, transform_parallelism=None,
 DEFAULT_COST_MODEL = cost_model()
 
 
-def _record_costs(model, records):
-    """Price each record, charging a shared fetch only to the first to use it.
+def _entry_costs(model, entries):
+    """Price each entry, charging a shared fetch only to the first to use it.
 
-    Consecutive records naming the same (offset, length) are one fetch and one
-    decode between them, so only the first of such a run carries that cost.
+    Consecutive entries naming the same (offset, length) are one fetch and one
+    decode between them, so only the first of such a tile run carries that
+    cost.
 
-    A gap record is priced as the write it is and nothing else. It has no
+    A gap entry is priced as the write it is and nothing else. It has no
     source bytes to fetch or decode, and `transform_gap()` answers every gap
     tile in the run with one call, so charging a gap a decode or a profile's
     per-tile seconds bills it for work no worker does.
 
     The decode and the profiles' seconds are divided by the model's transform
     parallelism, and the fetch and the write are not. Both halves are measured
-    the way a worker spends them: `length_hist` and a profile's
-    `transform_seconds` are summed across the pool processes that ran them,
-    while `fetch_batch_blob()` and `ShardWriter.write()` run in the worker
+    the way a worker spends them: `length_hist` and the profiles'
+    `profile_seconds` are summed across the pool processes that ran them,
+    while `fetch_batch_buffer()` and `PartWriter.write()` run in the worker
     itself, one batch at a time.
 
-    Where the model carries a measurement for a record's home tile block --
-    the block of the record that decodes its blob, as `home_blocks()` defines
+    Where the model carries a measurement for an entry's home tile block --
+    the block of the entry that decodes its blob, as `home_blocks()` defines
     it -- the profiles' seconds and the write are that measurement instead,
-    each charged once on the block's first decoding record and nothing on the
+    each charged once on the block's first decoding entry and nothing on the
     rest: the block is what was measured, and a partition that keeps blocks
-    whole never needs it spread any finer. Records arrive in offset order,
-    where one block's records are interleaved with others', so "first" means
-    the first seen, not the first in a run.
+    whole never needs it spread any finer. Entries arrive in offset order,
+    where one block's entries are interleaved with others', so "first" means
+    the first seen, not the first in a tile run.
 
     Args:
         model: The CostModel to price with.
-        records: Manifest records, in the order a worker will walk them.
+        entries: Manifest entries, in the order a worker will walk them.
 
     Yields:
-        The predicted seconds for each record, in the same order.
+        The predicted seconds for each entry, in the same order.
     """
     axis = model.axis
     pooled_per_tile = (profile_seconds(model.profiles)
@@ -130,29 +131,30 @@ def _record_costs(model, records):
     measured_seconds, measured_bytes = model.block_seconds, model.block_bytes
     charged_blocks = set()
     previous_key = home = None
-    for record in records:
-        if not record.length:
-            yield axis.manifest_record + gap_write_seconds * record.run_length
+    for entry in entries:
+        if not entry.length:
+            yield axis.manifest_entry + gap_write_seconds * entry.run_length
             continue
-        entry = 0.0
-        key = (record.offset, record.length)
+        seconds = 0.0
+        key = (entry.offset, entry.length)
         if key != previous_key:
             # Inlined home_blocks(): this is the hot loop of every partition
             # pass.
-            home = tile_block(record.tile_id)
+            home = tile_block(entry.tile_id)
             if home not in charged_blocks:
                 charged_blocks.add(home)
-                entry += (measured_seconds.get(home, 0.0)
-                          / model.transform_parallelism
-                          + axis.written_byte * measured_bytes.get(home, 0.0))
-            entry += (axis.fetched_byte * record.length
-                      + (axis.decode_call + axis.decoded_byte * record.length)
-                      / model.transform_parallelism
-                      + (0.0 if home in measured_seconds else pooled_per_tile))
+                seconds += (measured_seconds.get(home, 0.0)
+                            / model.transform_parallelism
+                            + axis.written_byte * measured_bytes.get(home, 0.0))
+            seconds += (axis.fetched_byte * entry.length
+                        + (axis.decode_call + axis.decoded_byte * entry.length)
+                        / model.transform_parallelism
+                        + (0.0 if home in measured_seconds
+                           else pooled_per_tile))
             previous_key = key
         write = (0.0 if home in measured_bytes
-                 else write_seconds * record.run_length)
-        yield axis.manifest_record + entry + write
+                 else write_seconds * entry.run_length)
+        yield axis.manifest_entry + seconds + write
 
 
 def profile_seconds(profile_costs):
@@ -171,14 +173,14 @@ def profile_seconds(profile_costs):
 
 
 def written_bytes_per_tile(profile_costs):
-    """What one real record tile costs to write across every profile in the run.
+    """What one real tile costs to write across every profile in the run.
 
     A profile is handed every tile in the run and writes only some of them:
     `transform_tile()` returns None wherever there is nothing to say, and
     `_run_counts()` skips those rather than storing an empty payload. So the
     charge is the profile's weight for a tile it *does* write, times the share
     of tiles it writes at all -- `bytes_per_output_tile` is measured over the
-    written tiles alone, and multiplying it by every tile in a record would
+    written tiles alone, and multiplying it by every tile in an entry would
     bill a whole ocean for the coastline it does not contain.
 
     Args:
@@ -186,7 +188,7 @@ def written_bytes_per_tile(profile_costs):
             prices tilealchemist's own work alone.
 
     Returns:
-        The summed bytes one record tile is expected to write, falling back to
+        The summed bytes one real tile is expected to write, falling back to
         the default weight for one tile where no profile says.
     """
     if not profile_costs:
@@ -218,16 +220,16 @@ def gap_bytes_per_tile(profile_costs):
     return sum(cost.gap_bytes for cost in profile_costs)
 
 
-def cost_weights(records, model=DEFAULT_COST_MODEL):
-    """Price every record, and the run as a whole.
+def cost_weights(entries, model=DEFAULT_COST_MODEL):
+    """Price every entry, and the run as a whole.
 
     Args:
-        records: Manifest records, in the order a worker will walk them.
+        entries: Manifest entries, in the order a worker will walk them.
             Iterated twice, so a one-shot iterator will not do.
         model: The CostModel to price with.
 
     Returns:
-        A pair of the per-record seconds, lazily, and the total seconds the
+        A pair of the per-entry seconds, lazily, and the total seconds the
         run is predicted to take.
     """
-    return _record_costs(model, records), sum(_record_costs(model, records))
+    return _entry_costs(model, entries), sum(_entry_costs(model, entries))

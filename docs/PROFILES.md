@@ -106,7 +106,7 @@ The defaults a profile can override, but usually doesn't:
   [`docs/ARCHITECTURE.md`](ARCHITECTURE.md#why-no-budget-caps-a-worker)
   "Why no budget caps a worker" for the caps that were tried and dropped.
 - **`bytes_per_output_tile`** is what one of this profile's output tiles
-  weighs in the shard. The write is charged on bytes rather than on tiles,
+  weighs in the part. The write is charged on bytes rather than on tiles,
   because a tile is only as expensive to store as it is large, and how large
   it is belongs to the profile that shaped it: a coastline profile's tiles are
   not a label profile's. It still does not *bound* anything — nothing caps what

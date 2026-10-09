@@ -7,6 +7,36 @@ For what a profile actually computes, see
 [tilealchemist-standardprofiles](https://github.com/tilelab/tilealchemist-standardprofiles)
 (a worked example: the `land`/`cropped-waterways` layers).
 
+## Glossary
+
+Each unit of work has one name, used in code, logs and prose alike. A word
+that means one of these never means anything else; where code needs a second
+sense, it gets a second word.
+
+| Term | What it is | Code |
+| --- | --- | --- |
+| **run** | One pipeline execution: one walk, every shard, every part, one merge. | `measure_run()` |
+| **entry** | One manifest entry, the shape of a PMTiles directory entry: `(tile_id, offset, length, run_length)`. Either real, pointing at bytes in the archive, or a gap. | `manifest.Entry` |
+| **gap** | A gap entry: `length=0`, a `tile_id` range the archive holds nothing for, at most `MAX_GAP_RUN_LENGTH` tiles. | `compute_gaps()` |
+| **tile run** | The `run_length` consecutive tile ids one entry covers, all served by the same bytes. In code, a "run" next to `run_length` is always this. | `run_length`, `runs` |
+| **blob** | One distinct payload at an `(offset, length)`, in the source archive or in a part. Deduplicated tiles share one. | `blobs` |
+| **tile block** | `2 ** TILE_BLOCK_BITS` = 4096 consecutive Hilbert tile ids in one zoom level: a fixed piece of the world, the same in every run. The unit cost is measured and charged in. "Block" alone always means this. | `tile_block()` |
+| **home block** | The tile block of the entry that decodes a blob, which every entry sharing that blob is filed under. | `home_blocks()` |
+| **profile set** | The profiles a run builds together, the key a tile block's cost is kept under. | `profile_set_key()` |
+| **shard** | One worker's share of a run's entries, cut by `prepare-shards`. Recomputed every run, so it has no identity across runs. | `partition_into_shards()`, `ShardLoad`, `ShardUsage` |
+| **worker** | The `build-shards` matrix job that builds one shard. | `shard_worker.py` |
+| **batch** | One range request's worth of a shard's entries, fetched into one buffer. | `fetch_batching.Batch` |
+| **hole** | Unread bytes between two entries in a batch. One wider than `--max-fetch-hole` splits the batch. | `_split_on_wide_holes()` |
+| **buffer** | Fetched bytes held in memory or mapped: a batch's, a chunk's slice of it, the leaf window, the metadata. | `fetch_batch_buffer()` |
+| **chunk** | One task of a batch for the transform pool, the unit of parallelism inside a worker. | `_chunk_entries()`, `ChunkJob` |
+| **process** | One member of a worker's transform pool, `--transform-processes` of them. Never called a worker. | `CHUNKS_PER_PROCESS` |
+| **part** | One output PMTiles file per worker and profile, merged into the profile's layer. | `PartWriter`, `part_bytes` |
+| **share** | What `partition_by_cost()` cuts: a run's shards, or a batch's chunks. | `_share_end_weight()` |
+
+Two words keep an outside meaning where an outside API sets it:
+`state_branch.py`'s "blob" is a git blob, and `ranged_fetch.py` reads a
+response body in pieces of `read_size` bytes.
+
 ## Source resolution
 
 `Source.resolve()` (`tilealchemist/sources/`) finds the PMTiles archive URL
@@ -160,7 +190,7 @@ community-run server. Instead:
    out of an assumed order. A run reads 29 KB of OpenFreeMap's index and
    132 KB of a Protomaps build's for z0..z4.
 2. It sorts entries by *offset* (not tile-ID) and splits them into
-   **contiguous** chunks, one per worker, at a count it picks itself (see
+   **contiguous** shards, one per worker, at a count it picks itself (see
    "Sizing a run") (`tilealchemist/partition.py`,
    written out by `tilealchemist/manifest.py`). Offset order tracks tile-ID
    order almost everywhere, but also catches what tile-ID order misses: an
@@ -168,15 +198,15 @@ community-run server. Instead:
    (e.g. the same "all water" tile recurring across different oceans) lands
    in the same worker as the tile it's deduped against, instead of a random
    other worker re-fetching the same bytes. `partition.py`'s
-   `partition_by_cost()` cuts at the record where a worker's share ends,
+   `partition_by_cost()` cuts at the entry where a worker's share ends,
    through a run of same-offset entries or not (see "Parallelism" for what a
-   share weighs), so every block lands within one record of its share. A cut
+   share weighs), so every shard lands within one entry of its share. A cut
    through such a run costs one tile fetched and transformed again by the
    next worker. Keeping runs whole was tried and cost far more: a Protomaps
    planet build dedupes its open ocean into same-offset runs of millions of
-   entries, chopped into chunks of one whole share each, and a chunk landed
-   on a worker in one piece whatever it already held. Standardprofiles run
-   36608758128 handed worker 0 a 2660s chunk on top of the 1081s it had,
+   entries, cut into pieces of one whole share each, and a piece landed
+   on a worker whole whatever it already held. Standardprofiles run
+   36608758128 handed worker 0 a 2660s piece on top of the 1081s it had,
    63m predicted against an even 45m, and the offset carried through the
    next three workers until worker 4 was left with 18m.
 3. Each worker (`tilealchemist/build_shard.py` for the entry point,
@@ -193,9 +223,9 @@ community-run server. Instead:
    below it, sitting far back in the file among data the run never reads.
    Two neighbouring entries can then be gigabytes apart and one GET across
    them would download all of it, so `plan_fetch_batches()` splits the
-   manifest at every gap wider than `--max-fetch-gap` (8 MB by default) and
+   manifest at every hole wider than `--max-fetch-hole` (8 MB by default) and
    the worker fetches, transforms and drops one batch at a time. Narrower
-   gaps are fetched through, a few MB of unread bytes on an open, streaming
+   holes are fetched through, a few MB of unread bytes on an open, streaming
    connection being cheaper than another round trip against a cold CDN.
 
    When a worker is building multiple profiles in one invocation (a
@@ -211,7 +241,7 @@ community-run server. Instead:
 5. Accounts for *gaps*: tile-IDs with no directory entry at all (OpenFreeMap
    only stores a tile if it has something to render, so large empty
    stretches like desert or ice sheet interiors are simply absent).
-   `pmtiles_index.py`'s `compute_gaps()` finds and chunks these, tagged with a
+   `pmtiles_index.py`'s `compute_gaps()` finds and splits these, tagged with a
    sentinel `length=0` so the worker asks each profile for `transform_gap`
    once and writes that at every one of their coordinates instead of
    fetching anything (see `shard_worker.py`'s `run_worker()` and
@@ -235,7 +265,7 @@ and is meant to be read by machine; see "Measuring a run" below.
 
 Download progress gets its own flag, and its own shorter default, rather
 than sharing `--report-interval`, because the phase it covers is itself
-shorter: a shard's whole-batch download is a single Range request of tens to
+shorter: a worker's whole-batch download is a single Range request of tens to
 low hundreds of MB and routinely finishes well under 60s on a healthy
 connection, so at the transform's interval it would print nothing at all,
 while the transform right after it, with many chunks each logging a major
@@ -263,7 +293,7 @@ a comma-separated `profile`) still does exactly one fetch, so per-worker
 with the number of profiles either: `transform.py` decodes each unique tile
 once into a single `Tile` object (see `tilealchemist/tile.py`) and hands
 that same object to every profile back-to-back (entries outer, profiles
-inner in `transform_batch_blob_multi()`). Anything derived from a tile (its
+inner in `transform_batch()`). Anything derived from a tile (its
 decoded layers, a schema feature set, `water.py`'s
 `surface_water_union()`) is memoized on that object, so a second profile
 reading the same tile gets the first one's result rather than repeating the
@@ -276,30 +306,30 @@ pair's own shared water union) come out cheaper.
 
 Independently of that, the transform phase itself (decode, transform,
 encode, sqlite insert, all of them CPU-bound rather than network) fans out
-across a worker's own CPU cores via `--transform-workers` (default: all
+across a worker's own CPU cores via `--transform-processes` (default: all
 available cores; `1` disables pooling and runs everything in the worker
 process).
 `real_entries` is split into contiguous chunks by `partition.py`'s
 `partition_by_cost()`, the same function that splits a run's gaps across
 workers (its real entries go by whole tile blocks; see "Measured tile
 blocks"), deliberately producing several times more chunks than there are processes
-(`TRANSFORM_CHUNKS_PER_WORKER`). Both halves of that matter.
+(`CHUNKS_PER_PROCESS`). Both halves of that matter.
 
-### What a record costs
+### What an entry costs
 
 `cost.py` answers that, and `partition_by_cost()` splits on cumulative cost
-rather than on a record count. `AXIS_SECONDS` holds five coefficients, all
-in seconds, and a record's cost is their terms added up:
+rather than on an entry count. `AXIS_SECONDS` holds five coefficients, all
+in seconds, and an entry's cost is their terms added up:
 
 - **Per decode call** and **per byte decoded**, the pair that dominates.
-  Both are paid once per *distinct* entry — a record repeating the previous
+  Both are paid once per *distinct* entry — an entry repeating the previous
   one's `(offset, length)` pays neither, matching what
-  `transform_batch_blob_multi()` actually does. The byte term grows *faster*
+  `transform_batch()` actually does. The byte term grows *faster*
   than byte length, a bigger tile also being a denser one: more features to
   decode, more geometry for a profile to clip and union.
 - **Per byte fetched**, also once per distinct entry: the range GET is real
-  time, and bytes are what bound a worker's peak blob memory.
-- **Per record**, at its measured cost; the memory bound it used to stand in
+  time, and bytes are what bound a worker's peak buffer memory.
+- **Per entry**, at its measured cost; the memory bound it used to stand in
   for is nothing now (see "Why no budget caps a worker").
 - **Per output tile**, one sqlite insert per tile per profile.
 
@@ -310,18 +340,18 @@ bugs, and what they cost").
 **The decode and the profiles' seconds are divided by
 `transform_parallelism`, and the fetch and the write are not.** That split is
 the one the worker itself makes: `run_transform()` fans a batch out across
-`--transform-workers` processes, so `length_hist` and a profile's
-`transform_seconds` come back *summed across the pool*, while
-`fetch_batch_blob()` and `ShardWriter.write()` run in the worker, one batch at
+`--transform-processes` processes, so `length_hist` and the profiles'
+`profile_seconds` come back *summed across the pool*, while
+`fetch_batch_buffer()` and `PartWriter.write()` run in the worker, one batch at
 a time. Charging a summed figure to a wall clock overstates it by whatever the
 pool bought.
 
-**The write is charged on bytes.** Where the record's tile block has been
+**The write is charged on bytes.** Where the entry's home block has been
 measured, on the bytes that block wrote last time (see "Measured tile
 blocks"). Where it has not, on the profile's declared `bytes_per_output_tile ×
 written_share`: a profile is handed every tile in the run and writes only the
 ones it has something to say about, and `bytes_per_output_tile` is the weight
-of a tile it *wrote*, so charging it on every tile in a record bills an ocean
+of a tile it *wrote*, so charging it on every tile in an entry bills an ocean
 for a coastline that is not in it.
 
 `cost_weights()` therefore returns a predicted *duration* rather than a
@@ -373,7 +403,7 @@ track what the run is actually made of, which is the point.
 
 `AXIS_SECONDS` is fitted against the shard manifests and the 128 measured
 worker durations of the 2026-09-19 `land` + `cropped_waterways` planet run
-(standardprofiles run 35447809178): 58,679,705 records, 43,272,366 distinct
+(standardprofiles run 35447809178): 58,679,705 entries, 43,272,366 distinct
 decode calls, 357,913,942 output tiles, no gap ranges at all, 15.7
 core-hours, workers between 39s and 34m12s. The coefficients are scaled so
 the model's total matches that run's measured work, which is what makes the
@@ -383,9 +413,9 @@ affect partitioning.
 Two single-worker observations from that run set the small coefficients
 directly, without a regression:
 
-- One worker held 1,449,554 records whose `(offset, length)` deduped down
+- One worker held 1,449,554 entries whose `(offset, length)` deduped down
   to **one** distinct entry. It finished in 39s -- the floor across all 128,
-  i.e. job setup and nothing else. A record that decodes nothing therefore
+  i.e. job setup and nothing else. An entry that decodes nothing therefore
   costs single-digit microseconds, not the 25% of a worker's budget the
   normalized model gave it.
 - Another wrote 16,569,677 output tiles in 49s total. That bounds one
@@ -415,7 +445,7 @@ spent in another.
 profiles' `seconds_per_tile`, and the run's profile rows report 38.4
 core-hours of `transform_seconds` — the prediction was almost exactly right.
 It was right about *CPU*. Those seconds are measured inside the pool processes
-`run_transform()` fans a batch across and merged by `TransformUsage.merge()`,
+`run_transform()` fans a batch across and merged by `ShardUsage.merge()`,
 which is addition, so a 4-process worker reports about four seconds of them per
 second of its own clock. Its `transform` phase measured 12.9 core-hours of wall
 time against 50.1 of pooled CPU (decode included), a ratio of **3.88** — the
@@ -428,7 +458,7 @@ profile-tiles. The run wrote 167.4M of them and skipped **77%**: a profile
 returns None wherever it has nothing to say, and `_run_counts()` stores
 nothing for those. `bytes_per_output_tile` was fitted over the written tiles
 alone (`output_bytes / (written - gap_tiles)`) and then charged on every tile
-in a record, a denominator and a numerator that never matched. Predicted write
+in an entry, a denominator and a numerator that never matched. Predicted write
 cost 4.8 core-hours against 0.5 measured. `written_share` is what reconciles
 them, and it is per profile because the profiles disagree wildly: 0.411 for
 `land` against 0.057 for `cropped_waterways` on that run.
@@ -447,7 +477,7 @@ Its R² against those durations caps out at **0.29**, and it under-predicts
 the slow tail by 2-4x: the worst worker was predicted at 8m and ran 34m12s.
 What is missing is content complexity. A dense coastline tile costs far
 more to clip and union than an open-ocean tile of the same byte length, and
-nothing in a manifest record exposes that -- the same effect the
+nothing in a manifest entry exposes that -- the same effect the
 over-chunking below exists to absorb. Treat the printed prediction as a
 ranking signal, not an estimate -- for the profiles' share, which is where the
 content complexity lives, "Measured tile blocks" replaces it with what the
@@ -503,22 +533,26 @@ job logs, and that grep is what the next run's coefficients are fitted from.
 Two scopes in the log, and a third in the usage file alone:
 
 - **`scope=profile`**, one per profile per worker: `written`, `skipped`,
-  `blobs`, `transform_seconds`, `output_bytes`, `gap_tiles`, `gap_skipped`,
-  `gap_bytes`, and the finished shard's size on disk. The gap counts come in
+  `blobs`, `gap_tiles`, `gap_skipped`, `gap_bytes`, and the finished part's
+  size on disk, `part_bytes`. The gap counts come in
   both halves because `written_share` is a real-tile figure: netting only the
   written gaps out of `written` while leaving the skipped ones in `skipped`
   would read a profile that declines to fill gaps as one that declines tiles. `blobs` counts *distinct* blob objects
   rather than rows, so `written / blobs` is the storage amplification -- the
-  number the old deduplicated shard layout was judged by; a part now always
+  number the old deduplicated layout was judged by; a part now always
   deduplicates (see "Part format"). The gap figures are reported apart from the real
   tiles' so a fit can keep two populations of very different size from
   averaging each other out. No per-profile coefficient comes from this row
-  any more -- a profile's cost is kept per tile block -- but its seconds and
-  bytes are what `transform_parallelism` and `written_byte` are fitted
-  against.
+  any more -- a profile's cost is kept per tile block -- and only its
+  `gap_bytes` reaches a fit, `written_byte`'s. It used to carry the profile's
+  own `transform_seconds` and `output_bytes` too, but every fit summed them
+  across the profiles first, so they are on the worker's row as those sums.
 - **`scope=worker`**, one per worker: the archive key it read, wall-clock
   seconds split by phase (`fetch`, `transform`, `write`, `close`), bytes
-  fetched, entry counts, and the decode totals including `length_hist`.
+  fetched, manifest entry counts, the decode as `length_hist`, and the
+  profiles' pooled seconds and written payload bytes summed across every
+  profile, as `profile_seconds` and `output_bytes`. The seconds are not called
+  `transform_seconds`, which is the `transform` phase's wall clock.
   `PhaseSeconds` nests exclusively, so the `write` time spent inside the
   transform loop is not also counted as `transform`.
 - **`scope=blocks`**, one per worker, written to `--usage-out` and never
@@ -529,9 +563,9 @@ Two scopes in the log, and a third in the usage file alone:
 
 **There used to be a third, `scope=chunk`, one line per transform chunk, and
 it was removed.** The reasoning for it recorded here was that
-`TRANSFORM_CHUNKS_PER_WORKER = 8` turns 128 worker measurements into ~4,096
+eight chunks per process turns 128 worker measurements into ~4,096
 chunk ones, and that chunks vary in composition where the deliberately
-equal-cost worker blocks do not, which would break a collinearity a
+equal-cost shards do not, which would break a collinearity a
 worker-level regression cannot get past. That argument describes a fit nobody
 wrote. Every consumer of those rows in `calibration.py` summed them first --
 `sum(output_tiles)`, and `length_buckets()` adding the histograms together --
@@ -542,14 +576,14 @@ worker yields bit-identical coefficients. What the per-chunk lines bought was
 ~32 lines of log per worker.
 
 The worker is therefore the reporting unit. Each chunk still measures itself in
-the process that ran it -- that is where the clock is -- and `TransformUsage`
-travels back through the pool and is merged into the worker's own totals
-(`TransformUsage.merge()`), which is addition throughout. The archive key
+the process that ran it -- that is where the clock is -- and `ShardUsage`
+travels back through the pool and is merged into the shard's own totals
+(`ShardUsage.merge()`), which is addition throughout. The archive key
 travels on the row with the measurement, so a fit never has to guess which
 archive a number came from, and two runs' logs concatenated by accident are
 detected rather than averaged together.
 
-`decode_seconds` and `transform_seconds` are reported separately because they
+The decode's seconds and `profile_seconds` are reported separately because they
 are different work on different inputs. `Tile.decode()` is gunzip plus
 protobuf, close to linear in byte length, paid once per *distinct* entry;
 `profile.transform_tile()` is shapely clip and union, paid once per profile
@@ -561,23 +595,28 @@ transform". The split also makes profile count a real factor: a run costs
 
 `length_hist` accumulates the decode into log2 buckets of entry length
 (bucket `i` holds lengths whose bit length is `i`, i.e. `[2**(i-1), 2**i)`),
-as `bits:count:bytes:decode_seconds`. The profiles' seconds are not in here:
-they are on the `scope=profile` rows, one per profile.
+as `bits:count:bytes:decode_seconds`. It is the decode's only measurement:
+the run's decode calls, bytes and seconds are its buckets summed, and were
+once reported beside it as `decode_calls`, `decoded_bytes` and
+`decode_seconds` too, a second copy of the same numbers. The profiles'
+seconds are not in here: they are `profile_seconds`, beside it on the same
+row.
 Buckets rather than 43M individual samples: the curve is what the per-entry
 coefficients are fitted from, and it fits in a log line. It is also what
 retired the decode exponent (see "Where the coefficients come from") and what
 would catch decode going superlinear again.
 
-The instrumentation is `2 + N` `perf_counter()` calls per distinct entry, for
-`N` profiles: one clock serves as each profile's end and the next one's start,
-so attributing the seconds per profile costs one extra call per profile rather
-than two. At 26ns a call that is 3.4s across the reference run's 43,272,366
-distinct entries at two profiles -- 0.006% of its 15.7 core-hours.
+The instrumentation is three `perf_counter()` calls per distinct entry,
+however many profiles run: one before the decode, one between the decode and
+the profiles, and one after the last profile. The profiles are clocked
+together, because nothing fits a figure for one profile alone. At 26ns a call
+that is 3.4s across the reference run's 43,272,366 distinct entries -- 0.006%
+of its 15.7 core-hours.
 
 Peak RSS is not measured. It used to be read twice -- a `RUSAGE_SELF` peak
 per chunk alongside the worker's `RUSAGE_CHILDREN` figure, because the latter
 is the *maximum* over finished children rather than their sum and alone
-under-reports a pooled worker by up to `--transform-workers`x -- and both
+under-reports a pooled worker by up to `--transform-processes`x -- and both
 were removed. Anything added back needs that pair, not one half of it, and
 needs to scale `ru_maxrss` by platform: `getrusage` reports it in bytes on
 macOS and in kibibytes on Linux. Every `usage:` byte figure is bytes.
@@ -647,13 +686,13 @@ touches no branch. The automatic path is `merge-axes`; the manual one is
 
 ### Why no budget caps a worker
 
-The per-record coefficient used to carry a memory bound. At its measured time
+The per-entry coefficient used to carry a memory bound. At its measured time
 cost (~1e-6) nothing holds deduped repeats together, and replaying the
-reference run put 8.5M records on one worker -- `read_manifest()` materializes
+reference run put 8.5M entries on one worker -- `read_manifest()` materializes
 those as namedtuples, about 1 GB before a single tile is fetched. Raising the
 coefficient to 9e-5 pulled that to 3.8M:
 
-| per record | max entries in a block | manifest RAM | correlation |
+| per entry | max entries in a shard | manifest RAM | correlation |
 | --- | --- | --- | --- |
 | 1e-6 (measured) | 8.5M | 0.95 GB | 0.538 |
 | 9e-5 | 3.8M | 0.43 GB | 0.537 |
@@ -661,15 +700,15 @@ coefficient to 9e-5 pulled that to 3.8M:
 
 That worked, but it could never *guarantee* anything, and it is worth being
 precise about why. The table is a measured curve with no closed form: 9e-5
-produced 3.8M on **that** run, and on a run with a different record
+produced 3.8M on **that** run, and on a run with a different entry
 distribution the same coefficient produces something else. A price cannot
 enforce a limit; it can only make crossing it expensive.
 
 What followed was a run of steadily more elaborate caps, each one a hard
 condition in `partition_by_cost()`'s loop beside the `_share_end_weight`
-comparison: **records per block** at a measured ~184 B per `Entry`, **peak
+comparison: **entries per shard** at a measured ~184 B per `Entry`, **peak
 batch bytes**, a single `--worker-disk-budget` that the manifest, the one
-spooled batch and the shards were all charged against, and finally
+spooled batch and the parts were all charged against, and finally
 **`--max-tiles`**, the output tiles one worker may write. Each was more
 faithful than the last, and the byte ones each needed the same thing to
 work: a model of what a source byte turns into on the runner's disk, which
@@ -692,45 +731,46 @@ counts, and neither is worth carrying before a run has actually hit the
 wall. When one does, what goes in is a check against that wall -- the
 specific resource, measured -- rather than another general budget.
 
-`manifest_record` stays at its measured ~1e-6 either way, which leaves the
+`manifest_entry` stays at its measured ~1e-6 either way, which leaves the
 cost model with no coefficient in it that is not a measurement.
 
-**What a block writes is still counted, in rows rather than records.**
-`count_output_tiles()` sums `run_length` over the block and `prepare-shards` logs
+**What a shard writes is still counted, in rows rather than entries.**
+`count_output_tiles()` sums `run_length` over the shard and `prepare-shards` logs
 it, so:
 
 - a **deduped run** contributes every tile id it covers. The archive stores
   one blob for 40 identical ocean tiles and the worker addresses all 40 of
   them, each a tile the layer must serve (see "Part format").
 - a **gap** contributes every tile id it covers, for exactly the same reason.
-  It is *priced* differently, though: a gap record is charged its write and
+  It is *priced* differently, though: a gap entry is charged its write and
   nothing else. It has no source bytes to fetch or decode, and
   `transform_gap()` answers the whole run with one call, so charging a gap a
   decode or a profile's per-tile seconds bills it for work no worker does. At
-  `GAP_CHUNK_SIZE = 200_000` tiles per record that used to be a rounding error;
-  it is wrong either way, and the fix is one branch in `_record_costs()`.
-- a **record** contributes nothing by itself. Its ~184 B of namedtuple
-  against a row's ~250 B of shard is not worth a second axis.
+  `MAX_GAP_RUN_LENGTH = 200_000` tiles per gap entry that used to be a
+  rounding error; it is wrong either way, and the fix is one branch in
+  `_entry_costs()`.
+- an **entry** contributes nothing by itself. Its ~184 B of namedtuple
+  against a row's ~250 B of part is not worth a second axis.
 
 It is counted **per worker, not per profile**: a run building two profiles
-writes two shards of that many rows.
+writes two parts of that many rows.
 
-    worst block: 458123 records writing 7798155 output tiles (7340032 of
+    worst shard: 458123 entries writing 7798155 output tiles (7340032 of
     them gap tiles)
 
 That line is a measurement now rather than a verdict, and it is worth
 reading as one. The gaps are spread across workers before the real entries
 are (see "Parallelism"), so a worker's rows are the sum of two
-independently balanced blocks. While `--max-tiles` existed the real
+independently balanced shares. While `--max-tiles` existed the real
 partition was handed each worker's gap rows as a reservation to start owing,
 so that the two halves would add up inside one cap; measured on a 6K-entry
 synthetic manifest whose 120 gaps came to 600K of its 653K output tiles, at
-16 workers under a 40K cap, that held blocks 0-14 between 39,976 and 40,040
+16 workers under a 40K cap, that held shards 0-14 between 39,976 and 40,040
 rows where an unreserved partition put eight of them 8% over. With no cap
 there is nothing for the halves to add up inside, both are balanced on cost
 alone, and how lopsided the sum gets is what this line reports.
 
-Counting records, the unit used before any of this, fails the other way: it
+Counting entries, the unit used before any of this, fails the other way: it
 is *exactly* even and says nothing about cost. In a 128-worker planet run it
 gave every worker 458K entries and between 32MB and 3,494MB of tile data,
 and those workers ran between 26s and 57m42s. Across all 128, job duration
@@ -745,16 +785,16 @@ removes is the tail. That run spent its last 19 minutes at a concurrency of
 
 ### A gap is a tile like any other
 
-A gap record is a `tile_id` range the archive holds nothing for, and it is
+A gap entry is a `tile_id` range the archive holds nothing for, and it is
 cheap in exactly one way: there is nothing to fetch. It costs no download
 and, carrying `length=0`, it can never widen a batch -- both
 `_split_on_wide_holes()` and `peak_batch_bytes()` skip it. Everything else
-about it is an ordinary tile. It occupies a manifest record like any other,
+about it is an ordinary tile. It occupies a manifest entry like any other,
 and the worker writes one output tile per tile id it covers, which for one
 unbroken ice sheet interior is hundreds of thousands of rows.
 
-That is why a gap is chunked at all: `GAP_CHUNK_SIZE` cuts every gap into
-200K-tile records so that one unbroken gap cannot land whole on a single
+That is why a gap is split at all: `MAX_GAP_RUN_LENGTH` cuts every gap into
+gap entries of at most 200K tiles so that one unbroken gap cannot land whole on a single
 worker. `Profile.transform_gap()` is called once per run and its bytes reused
 for every tile in it, so the profile work is free -- but the rows are not,
 and a worker still writes every one of them.
@@ -769,9 +809,9 @@ why chunk count exceeds process count: it turns `ProcessPoolExecutor`'s own
 call queue into a work queue, where a process that finishes early pulls the
 next pending chunk instead of idling while one unlucky core grinds through
 a dense coastline. Balancing gets the chunks roughly even; over-chunking
-absorbs whatever imbalance is left. `TRANSFORM_CHUNKS_PER_WORKER` is 8:
+absorbs whatever imbalance is left. `CHUNKS_PER_PROCESS` is 8:
 enough to keep the idle tail at roughly an eighth of a process's share,
-while leaving per-chunk overhead (one profile reimport, one blob-slice
+while leaving per-chunk overhead (one profile reimport, one chunk-buffer
 pickle) noise against multi-minute chunks.
 
 Both together are what close the tail. The same planet run's worst worker
@@ -782,7 +822,7 @@ Weighted, the same manifest yields 32 chunks of 5MB to 107MB.
 Each task reloads its profiles from their own `--profile` paths rather than
 receiving live instances: profiles loaded via `load_profile()`'s
 `importlib.util.spec_from_file_location()` aren't registered in
-`sys.modules`, so the default pickler used to hand work to a pool worker
+`sys.modules`, so the default pickler used to hand work to a pool process
 can't reconstruct them there. `.github/workflows/test.yml` runs both of
 these paths against real OpenFreeMap data on every push/PR, as a normal
 low-zoom run rather than as a separate test, and runs a second one against
@@ -811,14 +851,14 @@ before chunking — a planet run's two largest shards died to exactly that,
 on runners that report it as `The runner has received a shutdown signal`.
 
 Submitting is throttled for the mirror image of the same reason.
-`_blob_slice_for_chunk()` *copies*, and `ProcessPoolExecutor`'s work queue
+`_chunk_buffer()` *copies*, and `ProcessPoolExecutor`'s work queue
 holds every argument until that chunk is dispatched, so submitting all of
-them up front left the parent holding ~28 slices that roughly tile the
-batch — the batch a second time, on top of the blob it already has.
-`_pooled_chunk_results()` therefore keeps only `max_workers + SUBMIT_LEAD`
+them up front left the parent holding ~28 chunk buffers that roughly tile the
+batch — the batch a second time, on top of the buffer it already has.
+`_pooled_chunk_results()` therefore keeps only `process_count + SUBMIT_LEAD`
 chunks in flight and submits the next one as it takes a result back. The
 lead is what stops a process idling while the parent writes, and measured on
-a 32-chunk batch across 4 processes the parent holds 7 slices where it used
+a 32-chunk batch across 4 processes the parent holds 7 chunk buffers where it used
 to hold 32. The same throttle bounds the other direction too: completed
 results can no longer pile up when the serial writer falls behind
 four parallel transformers, which is exactly the combination an ocean-heavy
@@ -836,7 +876,7 @@ does not match -- and `upload-artifact` runs with `if: always()` and
 `if-no-files-found: ignore`, so a truncated part, had one existed under the
 real name, would have been handed on silently and merged into a quietly
 short layer. The rename replaces the `tilealchemist_complete` metadata
-marker the mbtiles shards carried for the same purpose, whose merge-side
+marker the old mbtiles outputs carried for the same purpose, whose merge-side
 check was never written.
 
 Free disk space is not checked: a worker that fills the disk finds out as an
@@ -846,7 +886,7 @@ out to be worth the warning.
 
 ### Runs stay runs until the writer
 
-`transform_batch_blob_multi()` used to expand every `run_length` into one
+`transform_batch()` used to expand every `run_length` into one
 tuple per output tile, and `write_output_tiles()` turned each of those into
 its own `INSERT`. Measured, the cost of that expansion splits three ways and
 only one of them is memory:
@@ -855,13 +895,13 @@ only one of them is memory:
 | --- | --- | --- |
 | live objects in RAM | 156 B | the 4-tuple plus its three ints |
 | pickle across the process boundary | 13 B | pickle memoizes the shared `bytes` |
-| **disk** | **the whole blob** | the flat mbtiles `tiles` table shards had then |
+| **disk** | **the whole blob** | the flat mbtiles `tiles` table the old outputs had |
 
 The blob is therefore not multiplied in RAM; it was multiplied on disk, which
 the part format has since ended (see "Part format"). What the expansion does
 cost in RAM is the
 tuples: the reference run's 357,913,942 output tiles per profile against its
-58,679,705 records is 6.1x, and its tile-heaviest worker held ~2.41 GB of
+58,679,705 entries is 6.1x, and its tile-heaviest worker held ~2.41 GB of
 them per profile where runs hold ~0.4 GB. Across the process boundary the
 saving is larger still, pickle having already memoized the shared blob: one
 pure run of 50,000 tiles goes from 550,397 bytes to 236.
@@ -925,7 +965,7 @@ sharing an `(offset, length)` without hashing, then by a 16-byte BLAKE2b
 digest of its bytes. A digest key rather than the payload itself keeps the
 part's distinct bytes on disk instead of alive in a dict. `pmtiles merge`
 deduplicates no further: a blob two parts both hold is stored twice in the
-layer. Measured on a planet `land` run's shards, that is 1.00002x -- 1,328
+layer. Measured on a planet `land` run's parts, that is 1.00002x -- 1,328
 bytes across 63.8% of the layer's tiles -- because the duplication that
 matters (ocean, ice, a gap's single answer) is inside a worker's contiguous
 slice, not across slices. `tile-join`'s hash over the whole layer would have
@@ -945,11 +985,11 @@ decoded the output to see more.
 
 **Nothing is written for no tiles.** A worker that wrote nothing for a
 profile -- an all-ocean slice has no waterway to crop -- leaves no part, and
-the merge counts what it got. The usage line's `shard_bytes` is the
+the merge counts what it got. The usage line's `part_bytes` is the
 finished part's size, or 0.
 
-Against the mbtiles shards this replaced, on the planet `land` run: shard
-artifacts went from 19.2 GiB to an estimated ~6.7 GiB, about the layer's own
+Against the mbtiles outputs this replaced, on the planet `land` run: the
+per-worker artifacts went from 19.2 GiB to an estimated ~6.7 GiB, about the layer's own
 size, the sqlite writes that took 824 of the ocean-heavy worker's 1,273
 seconds went away, and the merge job dropped from 247 minutes to the
 copy-bound ~10-15 that `pmtiles merge` takes.
@@ -965,10 +1005,10 @@ Each coefficient comes from the measurement that isolates it:
 | coefficient | fitted from |
 | --- | --- |
 | `fetched_byte` | `sum(fetch_seconds) / sum(fetched_bytes)` over workers |
-| `written_byte` | `sum(write_seconds) / sum(output_bytes + gap_bytes)` over the profile rows |
+| `written_byte` | `sum(write_seconds) / sum(output_bytes + gap_bytes)`, `output_bytes` over the workers and `gap_bytes` over the profile rows |
 | `decode_call`, `decoded_byte` | two-parameter least squares over the `length_hist` buckets, against `(count, bytes)` |
-| `manifest_record` | the slope of `setup_seconds` against a worker's record count |
-| `transform_parallelism` | `sum(decode_seconds) + sum(transform_seconds)` over the profile rows, `/ sum(transform_seconds)` over the workers |
+| `manifest_entry` | the slope of `setup_seconds` against a worker's entry count |
+| `transform_parallelism` | `(sum(length_hist decode) + sum(profile_seconds)) / sum(transform_seconds)`, all over the workers |
 
 No coefficient is per profile. A profile's own cost -- its shapely and the
 bytes it writes -- depends on which archive it reads and which profiles run
@@ -1014,7 +1054,7 @@ object somebody may have rewritten.
 A block's written bytes are therefore measured from the payload the
 transform actually produced, counted once per output tile and summed across
 the profiles as the run goes, and so is the `output_bytes` that `written_byte`
-is fitted against -- rather than from the finished shard's size on disk. `shard_bytes` stays reported, but as the storage-amplification
+is fitted against -- rather than from the finished part's size on disk. `part_bytes` stays reported, but as the storage-amplification
 diagnostic it always was, not as the basis of a coefficient: it is the
 finished part, every distinct payload stored once and a whole gap collapsed
 into one blob (see "Part format").
@@ -1028,16 +1068,16 @@ distinct entry weigh as much as the one holding 2M.
 The entry-cost fit targets the decode alone. It used to target
 `decode_seconds + transform_seconds` together, because the model charged both
 to the same per-distinct-entry axes -- but the profiles' own seconds are now
-measured per profile and charged to the profile that spent them, so folding
-them back into the archive's coefficients would bill one profile's shapely to
-the other's. The byte term is the bucket's byte total outright, decode being
+measured per tile block, under the run's profile set, so folding them back
+into the archive's coefficients would bill the profiles' shapely to every
+profile set that reads the archive. The byte term is the bucket's byte total outright, decode being
 linear in length; the sweep that used to search for an exponent there is gone
 with it.
 
 This borrows tiledistillery's mechanism. `leaves.py` looks each Geofabrik
 region up in `timings.json`, where a measurement *beats* the model; the fitted
 `seconds_per_byte` exists only to place regions that were never built. A
-worker block is recomputed every run, so `worker-042.bin` means something
+shard is recomputed every run, so `worker-042.bin` means something
 different next time and is no key to hang a measurement on -- but a fixed
 range of tile ids is, and "Measured tile blocks" is the per-region half of
 tiledistillery's scheme built on that. The coefficients here are the other
@@ -1076,7 +1116,7 @@ each one actually depends on:
 | group | key | coefficients |
 | --- | --- | --- |
 | source | host + schema | `fetched_byte`, `decode_call`, `decoded_byte` |
-| shared | none | `manifest_record`, `written_byte`, `worker_setup_seconds`, `transform_parallelism` |
+| shared | none | `manifest_entry`, `written_byte`, `worker_setup_seconds`, `transform_parallelism` |
 | block (`state/blocks/`) | host + schema, profile set, tile block | the profiles' pooled seconds, the bytes they wrote |
 
 The archive's fetch rate and tile density belong to the provider. What is
@@ -1116,7 +1156,7 @@ rather than the one that confounds them.
 
 ### Measured tile blocks
 
-The coefficients above price a record by what its manifest entry says, and a
+The coefficients above price an entry by what the manifest says of it, and a
 manifest entry cannot say how hard a tile is to clip: R² 0.29, and the slow
 tail under-predicted 2-4x (see "What the model still cannot see"). What *can*
 say it is the last run that built the same tiles. So the profiles' seconds,
@@ -1130,8 +1170,8 @@ declared per tile.
 one z8 cell at z14, one z7 cell at z13, and the whole level from z6 down. Its
 key is its first tile id. That depends on nothing but the tile id, so a block
 is the same piece of the world in every run -- whichever archive build, zoom
-range or worker count the run has -- which is exactly the stable key a worker
-block lacks. A z0..z14 run has about 87K of them.
+range or worker count the run has -- which is exactly the stable key a shard
+lacks. A z0..z14 run has about 87K of them.
 
 **Only the profiles' share is measured; fetch and decode stay modelled.** The
 two halves differ in kind. Fetch and decode are linear in the bytes, and this
@@ -1142,40 +1182,40 @@ shapely, and how much of it they write, is the part no manifest predicts, so
 that is the part a block carries: its pooled seconds and its written bytes,
 the latter charged at the shared `written_byte`.
 
-**A record belongs to its blob's home block, not its own.** A deduplicated
+**An entry belongs to its blob's home block, not its own.** A deduplicated
 tile points back at the blob its first copy wrote, which in an archive written
 in tile id order sits wherever that first copy's tile falls -- for an ocean
-tile, near the very start. Keyed by its own block, each such record dragged
+tile, near the very start. Keyed by its own block, each such entry dragged
 that far-away offset into whichever worker held its tile: on standardprofiles
 run 37037515494 worker 0 fetched its 2.06M entries in one range request and
 worker 2 its 2.54M in 84, all but one of them stretches of blobs that earlier
 workers' tiles had written, read through up to 8 MB holes. So
-`tile_blocks.home_blocks()` keys every record by the block of the record that
+`tile_blocks.home_blocks()` keys every entry by the block of the entry that
 decodes its blob -- the first of its `(offset, length)` run, which
 `collect_entries()` sorts lowest tile id first. The measurement, the charge
-and the partition all use that key, so a block's records are the blobs it
+and the partition all use that key, so a block's entries are the blobs it
 decodes and every tile pointing at them.
 
 **The key is the archive and the whole profile set**, as
 `state/blocks/<source key>/<profile set>.json`, with the set as
-`profile_combo_key()` gives it (`cropped-waterways+land`). Not the profile
+`profile_set_key()` gives it (`cropped-waterways+land`). Not the profile
 alone: profiles share derived work through `Tile.derived()` -- the water
 union, for one -- and whichever runs first is billed for it, so one profile's
 seconds only mean anything beside the same others. Not the profile alone
 across archives either: the same profile clips different geometry out of
-OpenMapTiles than out of Protomaps tiles. A new combination starts with
+OpenMapTiles than out of Protomaps tiles. A new profile set starts with
 nothing measured, and the model carries it until it has run once.
 
-**How a block is measured.** `transform.py` already clocks every profile per
-distinct entry; `TransformUsage.add_block()` also adds the sum to the decoding
-entry's block, and `add_block_bytes()` adds every entry's written payload --
+**How a block is measured.** `transform.py` clocks the profiles together per
+distinct entry, and `ShardUsage.add_block()` adds those seconds to the
+decoding entry's block, and `add_block_bytes()` adds every entry's written payload --
 a deduplicated one's included -- to that same block. A block that wrote
 nothing records zero bytes, so "costs nothing" stays distinct from "never
 measured". The seconds are pooled, summed across the worker's process pool,
 and are divided by `transform_parallelism` when charged, the same as the
 per-tile figure they replace. Each worker writes both as its `scope=blocks`
 line (`seconds=` and `written_bytes=`), `merge-axes` sums them across workers
--- a block split between two workers, or a blob's run cut by a pool chunk,
+-- a block split between two shards, or a blob's tile run cut by a chunk,
 still comes to one figure -- and appends one observation per block to that
 block's own history, `HISTORY_LENGTH` deep, the median read back. It records
 nothing unless every worker that reported also reported blocks, and no bytes
@@ -1183,29 +1223,29 @@ unless every one of them reported bytes: same biased-sample rule as the
 coefficients.
 
 **How a block is charged.** `cost.py` charges a measured block's seconds and
-bytes once, on the first of its decoding records it meets, and drops the
-profiles' declared seconds and write from every record homed in it; a block
+bytes once, on the first of its decoding entries it meets, and drops the
+profiles' declared seconds and write from every entry homed in it; a block
 with no measurement keeps the declared per-tile charge. "First it
-meets" and not "first in a run" because records travel in offset order,
-which is what a worker fetches by, and in offset order one block's records
+meets" and not "first in a tile run" because entries travel in offset order,
+which is what a worker fetches by, and in offset order one block's entries
 are interleaved with others': a deduplicated tile points back at the blob its
 first copy wrote, however far away that is.
 
 **How a run is split.** `partition_by_tile_block()` hands out whole home
 blocks in byte offset order -- each where its first blob sits -- and fills
-each worker until the next block would overrun its share, then starts the
-next worker. So each worker is one stretch of the archive and one range
+each shard until the next block would overrun its share, then starts the
+next shard. So each shard is one stretch of the archive and one range
 request, whatever order the archive wrote its tiles in. Tile id order, which
 it used before, only came to the same thing for an archive clustered by tile
 id, and handed a worker of any other a scatter of ranges. The shares end at fixed points of the
 run's cumulative cost, `total * (i + 1) / N`, rather than at a per-worker
 budget, so what one worker leaves short is the next one's to take instead of
 piling up on the last. A block is never split, which keeps "what this block
-cost" a figure one worker measured whole. Each worker's records are then
+cost" a figure one worker measured whole. Each shard's entries are then
 routed back out in offset order, so its manifest is still offset-sorted for
 the fetch batching. `tile_block_groups()` does the grouping once per run --
-one group index per record, in an `array('I')` -- and every worker count the
-sizing tries reuses it. Gaps are still split by record, having no profile
+one group index per entry, in an `array('I')` -- and every worker count the
+sizing tries reuses it. Gaps are still split by entry, having no profile
 seconds to measure.
 
 The price of an indivisible block is that no worker's share can go below the
@@ -1223,7 +1263,7 @@ block; a smaller `TILE_BLOCK_BITS` is the lever if they turn out to bind.
 **The file is versioned by what its blocks are keyed by.** Version 1 kept
 seconds alone, under each tile's own block; version 2 keeps `seconds` and
 `written_bytes` under the home block. A version-1 file is not read -- its
-figures describe different sets of records -- and the first run that writes it
+figures describe different sets of entries -- and the first run that writes it
 starts it afresh.
 
 **The file outgrows the contents API's 1 MB.** Five observations for ~87K
@@ -1243,18 +1283,18 @@ same job, so the manifests exist by then. `gen-workers` counts
 many workers there are -- and with no input left to contradict them, the only
 possible one.
 
-Partitioning is one pass over the records, so the search needs no closed
+Partitioning is one pass over the entries, so the search needs no closed
 form:
 
     for N = SC, 2SC, 4SC, ..., 256:     # C = --concurrency, in practice 20
                                          # S = --worker-scale, 3 by default
-        blocks = partition_into_worker_blocks(entries, gaps, N)
-        if every budget holds for the worst block: take N
+        shards = partition_into_shards(entries, gaps, N)
+        if every budget holds for the worst shard: take N
 
 **The step doubles rather than adding one wave at a time.** Stepping by `C`
 made the cost of the search proportional to the answer: a run that needed 240
 workers paid twelve full partition passes to find out, each one a complete
-sweep over every record, and eleven of them thrown away. Doubling makes that
+sweep over every entry, and eleven of them thrown away. Doubling makes that
 five passes at most from 20 to 256, and a run that fits its first try -- which
 is every run small enough for the concurrency to hold it -- still pays exactly
 one, the same as before. Every candidate stays a multiple of the concurrency,
@@ -1264,7 +1304,7 @@ What it gives up is granularity: at the defaults the search can only land on
 60, 120, 240 or 256, so a run that would have fitted 90 workers takes 120. That is the right
 trade in this direction. Overshooting the worker count costs
 `WORKER_SETUP_SECONDS` per extra worker (~39s of runner boot, artifact
-download and pip install) against blocks that are correspondingly smaller,
+download and pip install) against shards that are correspondingly smaller,
 while undershooting the *search* costs a full partition pass per step for a
 number nobody sees. And the tail this whole model exists to remove gets
 shorter with more workers, not longer.
@@ -1278,15 +1318,15 @@ before any of the storage budgets existed, and what it is chosen against
 again. `breaches()` still returns a *list*, because the shape of the search
 does not change when a second limit comes back.
 
-The limit falls as N rises -- more workers, smaller blocks, smaller spans,
+The limit falls as N rises -- more workers, smaller shards, smaller spans,
 smaller batches -- and only setup overhead and wave count rise, so the first
 N that fits is the best one and the search is a loop rather than an
 optimization. Both retired axes are kept here because what they demonstrated
 is the search's behaviour rather than their own. On the tile axis: against a
 6K-entry synthetic manifest of 653K output tiles at `--concurrency 4`, the
 chosen N rose 4 -> 8 -> 16 as a 200K -> 100K -> 50K cap tightened, and at
-each step every block stayed inside it, the remainder one included -- the
-search only takes an N whose *worst* block fits, so a remainder that overran
+each step every shard stayed inside it, the remainder one included -- the
+search only takes an N whose *worst* shard fits, so a remainder that overran
 is what made it try the next N. That run's candidates are 4, 8, 16, ...
 either way, so doubling changed nothing about it. On the byte axis: against a
 1.5M-entry, 77 GiB synthetic manifest the chosen N fell 120 -> 60 -> 40 -> 20
@@ -1298,7 +1338,7 @@ what it demonstrates still holds -- the log names which limit bound the run at
 each step -- not as a result to re-derive.
 
 **Only multiples of the concurrency are considered.** At 20 lanes and
-roughly equal-cost blocks a run goes in waves, and the candidates fall on
+roughly equal-cost shards a run goes in waves, and the candidates fall on
 whole ones:
 
 | workers | waves | last wave |
@@ -1320,10 +1360,10 @@ several CPU generations -- EPYC 7763, 9V74 and 9V45, Xeon Platinum 8573C and
 Xeon 6973P-C have all been reported -- and pins the image, not the CPU. A
 protomaps planet run at 20 workers, one wave, showed it plainly: decoding
 the same blob sizes ran at 0.61-0.70 of the pooled rate on four runners and
-up to 1.30 on the rest. Those four were the run's four fastest shards, at
+up to 1.30 on the rest. Those four were the run's four fastest workers, at
 0.48-0.67 of their predictions, while the slowest ran 1.30 over. The model
 was right on average -- 41.3m actual against 42m predicted across all 20 --
-and the run still ended at 57m, because one block per lane leaves nothing
+and the run still ended at 57m, because one shard per lane leaves nothing
 for a fast lane to take over.
 
 Which runner a worker lands on cannot be known when the manifests are
@@ -1335,7 +1375,7 @@ share rather than on its slowest runner. Every queued worker draws a fresh
 runner, which averages the speeds further. At the default of 3, a run that
 fits 20 workers is cut into 60 of a third the size; the price is
 `WORKER_SETUP_SECONDS` and roughly half a minute of artifact upload per extra
-worker, a few percent of a planet run, and more shard files for `merge`. The
+worker, a few percent of a planet run, and more part files for `merge`. The
 costliest tile block is the floor on a worker's share, so a scale past the
 point where shares reach it buys nothing. Doubling more *concurrent* lanes
 would not do the same: it shortens every lane alike and leaves the spread
@@ -1372,7 +1412,7 @@ time is not the binding limit today either -- it is simply the only one that
 has ever been worth enforcing, and the only one a measured run has never
 quietly broken.
 
-`calibrate` still fits a `runner` block from `usage:`'s shard bytes per
+`calibrate` still fits a `runner` block from `usage:`'s part bytes per
 output tile, and writes it to `calibration.json`. Sizing reads none of it. It is there to be read by a
 person deciding whether a resource has become binding -- which is the
 evidence a new limit would be built from, and the reason the figures are
@@ -1473,21 +1513,21 @@ same header bounds. `pmtiles verify` re-reads the result before it is
 uploaded.
 
 One more input exists for one situation: `artifact_namespace`. The artifacts
-the pipeline passes between its own jobs (`shard-manifests`, `shards-<n>`)
+the pipeline passes between its own jobs (`shard-manifests`, `parts-<n>`)
 are named per pipeline, not per call, which two calls in the *same* workflow
 run would collide over — GitHub rejects a second upload of a name already
 taken in a run. A caller doing that (this repo's `test.yml`, running the
 same profiles against two different sources) names one of them, and its
-artifacts become `<namespace>-shard-manifests` and `<namespace>-shards-<n>`.
+artifacts become `<namespace>-shard-manifests` and `<namespace>-parts-<n>`.
 Callers that call the pipeline once, which is nearly all of them, never set
 it.
 
-A prefix rather than a suffix, because the `merge` job globs for the shards
+A prefix rather than a suffix, because the `merge` job globs for the parts
 it merges and a prefix is what makes those globs disjoint for free. An
-unnamespaced call's `shards-*` cannot reach into `protomaps-shards-0`, so
+unnamespaced call's `parts-*` cannot reach into `protomaps-parts-0`, so
 namespacing the *second* call is enough and the first is left alone; with a
-suffix, `shards-*-protomaps` would still have matched a hypothetical third
-call's `shards-0-x-protomaps`, and every call would have had to be named to
+suffix, `parts-*-protomaps` would still have matched a hypothetical third
+call's `parts-0-x-protomaps`, and every call would have had to be named to
 be safe. It also groups an Actions run's artifact list by call rather than
 by artifact kind, which is the more useful order at 128 workers.
 
@@ -1622,7 +1662,7 @@ code and this section together.
       fetch_declared_attribution()    attribution.py: what the archive credits
       compose_attribution()           attribution.py: what this layer credits
       compute_gaps()                  pmtiles_index.py: tile_ids no entry covers
-      _size_run()                     sizing.py: how many workers, and their blocks
+      _size_run()                     sizing.py: how many workers, and their shards
       write_worker_manifests()        manifest.py: worker-NNN.bin
       write_source_metadata()         manifest.py: source.json, shared
 
@@ -1635,7 +1675,7 @@ code and this section together.
       init_part()                pmtiles_part.py: one PartWriter per profile
       real entries (_process_real_entries), one batch at a time:
         plan_fetch_batches()       fetch_batching.py: one range GET per batch
-        fetch_batch_blob()         fetch_batching.py: that batch's bytes
+        fetch_batch_buffer()       fetch_batching.py: that batch's bytes
         run_transform()            transform.py: a chunk of tiles at a time
         PartWriter.write()         pmtiles_part.py: that chunk, then drop it
       gap entries (_process_gap_entries):
@@ -1657,12 +1697,12 @@ the pipeline computes with it — `zxy_to_tileid(max_zoom + 1, ...)`, the
 fitting a 64-bit int, and `tile_id_bounds()` always asks it for
 `max_zoom + 1`. The members are generated through the functional API with
 `module=`/`qualname=` set, which is what makes them picklable — `ChunkJob`
-carries one into a transform pool worker.
+carries one into a transform pool process.
 
 ### The manifest format (`manifest.py`)
 
-One file per worker, a flat sequence of fixed-size records, no framing: file
-size / `RECORD.size` gives the count.
+One file per worker, a flat sequence of fixed-size entries, no framing: file
+size / `ENTRY_STRUCT.size` gives the count.
 
     tile_id: uint64, offset: uint64, length: uint32, run_length: uint32
 
@@ -1697,7 +1737,7 @@ way into the part: nothing in `pmtiles_part.py` is O(run_length), so a
 million-tile run (an ocean, an ice sheet interior) costs what a single tile
 does. `_run_counts()` walks the same runs for the usage counters.
 
-A run is clipped to the zoom range in `transform_batch_blob_multi()`, and
+A run is clipped to the zoom range in `transform_batch()`, and
 *before* the `None` test, because the per-tile filter it replaces ran there
 too: a tile outside the range appears in **neither** `written` nor `skipped`.
 Clipping there is exact rather than approximate, because PMTiles tile IDs are
@@ -1739,7 +1779,7 @@ shapes, none of them permanent:
   the halfway point of a large batch. There is no response left to read a
   `Retry-After` from, so the backoff runs on jitter alone.
 
-`on_chunk(bytes_so_far)` receives the running total for the *current*
+`on_progress(bytes_so_far)` receives the running total for the *current*
 attempt, not a delta, so a retry that restarts the transfer rewinds the
 progress line instead of counting the re-sent bytes twice.
 `_warn_retry()` emits a `::warning` workflow command as the retry happens, so
@@ -1751,28 +1791,28 @@ Entries arrive sorted by offset, but sorted is not adjacent: dedup points an
 entry at whatever tile first held its bytes, so two neighbours can sit
 gigabytes apart with data this run never reads in between. One GET across
 such a hole would download all of it, so the manifest is split at every hole
-wider than `--max-fetch-gap`. Two entries at the same offset are zero apart
+wider than `--max-fetch-hole`. Two entries at the same offset are zero apart
 and must not be split. The 8 MB default is where one request still beats two:
 a few MB of unread bytes on an open, streaming connection cost less than
 another round trip against a cold CDN.
 
 `peak_batch_bytes()` lives here rather than with the planner that calls it,
-because it is the same rule read the other way: it walks a block and reports
+because it is the same rule read the other way: it walks a shard and reports
 the widest span `plan_fetch_batches()` would produce, without building the
 batches. Split the two across modules and one of them drifts.
 
 `_chunk_entries()` must keep chunks contiguous and in order.
-`_blob_slice_for_chunk()` slices one byte range per chunk, and
-`transform_batch_blob_multi()`'s dedup compares only against the previous
+`_chunk_buffer()` cuts one byte range per chunk, and
+`transform_batch()`'s dedup compares only against the previous
 entry, so a duplicate pair split across a chunk boundary misses that one
 dedup — harmlessly, but only because the chunks are contiguous.
 
 `_transform_chunk()` rebuilds two things that cannot cross a process
-boundary: the profiles, which the pickler cannot reconstruct in a worker at
-all, reimported once per chunk rather than per tile; and its
+boundary: the profiles, which the pickler cannot reconstruct in a pool
+process at all, reimported once per chunk rather than per tile; and its
 `TransformProgress`, which holds a `threading.Lock`. Only that object is
-unpicklable, not the reporting — the interval is a plain float, so a worker
-throttles its own lines over its own chunk while the parent's "chunk N done"
+unpicklable, not the reporting — the interval is a plain float, so a pool
+process throttles its own lines over its own chunk while the parent's "chunk N done"
 lines carry the whole-shard view. The schema crosses as its `SchemaName`, and
 the child looks the same singleton up out of `SCHEMAS`.
 
@@ -1794,10 +1834,10 @@ the two strategies.
 ### Profiles and gaps
 
 `load_profile()` deliberately does not register the module in `sys.modules`.
-Transform pool workers reload profiles by path, which works under both fork
+Transform pool processes reload profiles by path, which works under both fork
 and spawn; registering would only help under fork.
 
-`compute_gaps()` tags a gap record `length=0`, the sentinel
+`compute_gaps()` tags a gap entry `length=0`, the sentinel
 `split_manifest_entries()` tells a gap by, there being nothing to fetch.
-`GAP_CHUNK_SIZE` caps one such record so that a single huge unbroken gap — a
+`MAX_GAP_RUN_LENGTH` caps one such entry so that a single huge unbroken gap — a
 whole ice sheet's interior — cannot land entirely on one worker.

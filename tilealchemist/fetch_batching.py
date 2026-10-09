@@ -9,29 +9,29 @@ from tilealchemist.ranged_fetch import DownloadProgress, fetch_range
 
 # 8 MB: below this, skipping unread bytes on an open connection beats another
 # round trip.
-DEFAULT_MAX_FETCH_GAP = 8 * 1024 * 1024
+DEFAULT_MAX_FETCH_HOLE = 8 * 1024 * 1024
 
 # One range request's worth of entries; see docs/ARCHITECTURE.md "Fetching".
 Batch = namedtuple("Batch", "offset length entries")
 
 
-def plan_fetch_batches(real_entries, max_fetch_gap):
+def plan_fetch_batches(real_entries, max_fetch_hole):
     """Entries as one Batch per range request."""
     return [_batch(entries)
-            for entries in _split_on_wide_holes(real_entries, max_fetch_gap)]
+            for entries in _split_on_wide_holes(real_entries, max_fetch_hole)]
 
 
-def peak_batch_bytes(entries, max_fetch_gap=DEFAULT_MAX_FETCH_GAP):
+def peak_batch_bytes(entries, max_fetch_hole=DEFAULT_MAX_FETCH_HOLE):
     """The largest range request these entries need under plan_fetch_batches.
 
-    Measured rather than planned: the planner asks this of whole blocks it
+    Measured rather than planned: the planner asks this of whole shards it
     has not batched and will not fetch, so it walks the entries by the same
     rule _split_on_wide_holes() splits on without building the batches.
 
     Args:
-        entries: The entries to measure, in walk order; a gap record carries
+        entries: The entries to measure, in walk order; a gap entry carries
             no bytes and is skipped.
-        max_fetch_gap: The largest gap that still shares one fetch.
+        max_fetch_hole: The largest hole that still shares one fetch.
 
     Returns:
         The widest span any one batch will reach.
@@ -41,29 +41,30 @@ def peak_batch_bytes(entries, max_fetch_gap=DEFAULT_MAX_FETCH_GAP):
     for entry in entries:
         if entry.length == 0:
             continue
-        if start is None or entry.offset - reach > max_fetch_gap:
+        if start is None or entry.offset - reach > max_fetch_hole:
             start = reach = entry.offset
         reach = max(reach, entry.offset + entry.length)
         peak = max(peak, reach - start)
     return peak
 
 
-def _split_on_wide_holes(real_entries, max_fetch_gap):
-    """Cut entries apart where the unread gap between them is too wide.
+def _split_on_wide_holes(real_entries, max_fetch_hole):
+    """Cut entries apart where the unread hole between them is too wide.
 
     Args:
         real_entries: The worker's real entries, in offset order.
-        max_fetch_gap: The largest gap still worth reading through rather than
-            opening a second request.
+        max_fetch_hole: The largest hole still worth reading through rather
+            than opening a second request.
 
     Yields:
-        Runs of entries, each to be fetched in one range request.
+        One batch's entries at a time, each to be fetched in one range
+        request.
     """
     entries, reach = [], 0
     for entry in real_entries:
         # A running end, not the previous entry's: a long entry can reach past a
         # later one.
-        if entries and entry.offset - reach > max_fetch_gap:
+        if entries and entry.offset - reach > max_fetch_hole:
             yield entries
             entries, reach = [], 0
         entries.append(entry)
@@ -73,13 +74,13 @@ def _split_on_wide_holes(real_entries, max_fetch_gap):
 
 
 def _batch(batch_entries):
-    """Measure the range one run of entries needs.
+    """Measure the range one batch's entries need.
 
     Args:
         batch_entries: Entries that will share one request, in offset order.
 
     Returns:
-        A Batch whose length reaches the furthest end any entry in the run has.
+        A Batch whose length reaches the furthest end any of its entries has.
     """
     batch_offset = batch_entries[0].offset
     batch_end = max(entry.offset + entry.length for entry in batch_entries)
@@ -88,8 +89,8 @@ def _batch(batch_entries):
 
 
 @contextlib.contextmanager
-def fetch_batch_blob(session, batch, batch_label, worker_index, source,
-                     report_interval, spool_dir, phases):
+def fetch_batch_buffer(session, batch, batch_label, worker_index, source,
+                       report_interval, spool_dir, phases):
     """Fetch one batch's bytes, once, for every profile in the run to share.
 
     The body is streamed to a file and handed back as a read-only mapping, so
@@ -105,10 +106,10 @@ def fetch_batch_blob(session, batch, batch_label, worker_index, source,
         source: The archive's SourceMetadata.
         report_interval: Seconds between download progress lines.
         spool_dir: Directory to spool the body into. It belongs beside the
-            shards, not in a tmpfs, where the bytes would stay in RAM.
+            parts, not in a tmpfs, where the bytes would stay in RAM.
         phases: The worker's PhaseSeconds, charged for the download alone.
-            Mapping and unmapping are not fetching, and the caller's block
-            holds this context open across the whole transform.
+            Mapping and unmapping are not fetching, and the caller holds
+            this context open across the whole transform.
 
     Yields:
         The batch's bytes, as a read-only mmap.
@@ -119,18 +120,19 @@ def fetch_batch_blob(session, batch, batch_label, worker_index, source,
     print(f"starting download{batch_label} ({batch.length} bytes, "
           f"{len(batch.entries)} entries in a single range request)",
           file=sys.stderr)
-    spool_path = os.path.join(spool_dir, f"batch-{worker_index}.blob")
+    spool_path = os.path.join(spool_dir, f"batch-{worker_index}.bin")
     try:
         with phases.phase("fetch"):
             fetch_range(
                 session, source.url, source.tile_data_offset + batch.offset,
                 batch.length,
-                retry_label=f"worker {worker_index}", on_chunk=progress.update,
+                retry_label=f"worker {worker_index}",
+                on_progress=progress.update,
                 dest_path=spool_path)
         with open(spool_path, "rb") as spooled:
             with mmap.mmap(spooled.fileno(), 0,
-                           access=mmap.ACCESS_READ) as blob:
-                yield blob
+                           access=mmap.ACCESS_READ) as buffer:
+                yield buffer
     finally:
         # Before the next batch: two batches' bytes at once is what the budget
         # forbids.

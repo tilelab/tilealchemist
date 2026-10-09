@@ -27,9 +27,9 @@ class Profile(ABC):
             `name` are taken from unless overridden.
         seconds_per_tile: What `transform_tile()` costs on one deduped source
             tile. A profile's own measurement, since the work is its shapely,
-            not tilealchemist's; see docs/ARCHITECTURE.md "What a record costs".
+            not tilealchemist's; see docs/ARCHITECTURE.md "What an entry costs".
         bytes_per_output_tile: What one of this profile's real output tiles
-            weighs in the shard. The write is charged on bytes rather than on
+            weighs in the part. The write is charged on bytes rather than on
             tiles, and how heavy a tile is belongs to the profile that shaped
             it: a coastline profile's tiles are not a label profile's. A gap
             tile is not covered by this; `gap_bytes()` answers for those.
@@ -39,7 +39,7 @@ class Profile(ABC):
             that speaks for a coastline is silent across an ocean: one planet
             run left 77% of its tiles unwritten. `bytes_per_output_tile` is
             measured over the written ones alone, and this is what scales it
-            onto every tile in a record.
+            onto every tile in an entry.
 
     All three figures above are this profile's own *estimate*, used until
     something measures better. None is stored here once a run is under way: the

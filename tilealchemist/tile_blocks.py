@@ -32,12 +32,12 @@ def tile_block(tile_id):
     return zoom_base + offset
 
 
-def home_blocks(records):
-    """The block each record is measured, priced and partitioned under.
+def home_blocks(entries):
+    """The block each entry is measured, priced and partitioned under.
 
-    That is the block of the record that decodes its blob -- the first of its
+    That is the block of the entry that decodes its blob -- the first of its
     `(offset, length)` run in offset order, which is the lowest tile id
-    pointing there -- and not the record's own. A deduplicated tile points
+    pointing there -- and not the entry's own. A deduplicated tile points
     back at the blob its first copy wrote, so keyed by its own block it would
     drag that far-away offset into whichever worker holds its tile, and every
     such worker paid a range request per stretch of them: 84 on worker 2 of
@@ -46,21 +46,21 @@ def home_blocks(records):
     one stretch of the archive's bytes.
 
     Args:
-        records: Real manifest records, in offset order.
+        entries: Real manifest entries, in offset order.
 
     Yields:
-        The home block of each record, in the same order.
+        The home block of each entry, in the same order.
     """
     previous_key = home = None
-    for record in records:
-        key = (record.offset, record.length)
+    for entry in entries:
+        key = (entry.offset, entry.length)
         if key != previous_key:
-            home, previous_key = tile_block(record.tile_id), key
+            home, previous_key = tile_block(entry.tile_id), key
         yield home
 
 
-def profile_combo_key(names):
-    """What a set of profiles' measured block seconds are filed under.
+def profile_set_key(names):
+    """What a profile set's measured block seconds are filed under.
 
     The whole set rather than each profile alone: profiles share derived work
     through `Tile.derived()`, and whichever of them runs first is billed for

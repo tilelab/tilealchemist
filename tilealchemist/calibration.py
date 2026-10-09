@@ -13,14 +13,14 @@ SourceAxes = namedtuple("SourceAxes", "fetched_byte decode_call decoded_byte")
 # and its cores.
 SharedAxes = namedtuple(
     "SharedAxes",
-    "manifest_record written_byte worker_setup_seconds transform_parallelism")
+    "manifest_entry written_byte worker_setup_seconds transform_parallelism")
 
 REVIEWED_SOURCE = SourceAxes(fetched_byte=AXIS_SECONDS.fetched_byte,
                              decode_call=AXIS_SECONDS.decode_call,
                              decoded_byte=AXIS_SECONDS.decoded_byte)
 
 REVIEWED_SHARED = SharedAxes(
-    manifest_record=AXIS_SECONDS.manifest_record,
+    manifest_entry=AXIS_SECONDS.manifest_entry,
     written_byte=AXIS_SECONDS.written_byte,
     worker_setup_seconds=WORKER_SETUP_SECONDS,
     transform_parallelism=DEFAULT_TRANSFORM_PARALLELISM)
@@ -242,14 +242,14 @@ def measure_source(rows):
 def measure_transform_parallelism(rows):
     """Fit how many seconds of in-pool work one second of wall clock buys.
 
-    `run_transform()` fans a batch out across `--transform-workers` processes,
-    and every measurement taken inside one of them -- `length_hist`'s decode
-    seconds, and each profile's `transform_seconds` -- comes back summed across
-    the pool. The worker's own `transform` phase is the wall clock those
-    seconds were spent in, so their ratio is what the pool actually bought,
-    pool overhead and stragglers already deducted. Charging the summed figure
-    to a worker's wall-clock budget without it over-predicts every run by
-    about that factor.
+    `run_transform()` fans a batch out across `--transform-processes`
+    processes, and every measurement taken inside one of them --
+    `length_hist`'s decode seconds, and the profiles' `profile_seconds` --
+    comes back summed across the pool. The worker's own `transform` phase is
+    the wall clock those seconds were spent in, so their ratio is what the
+    pool actually bought, pool overhead and stragglers already deducted.
+    Charging the summed figure to a worker's wall-clock budget without it
+    over-predicts every run by about that factor.
 
     Args:
         rows: Parsed usage rows for the whole run.
@@ -259,9 +259,9 @@ def measure_transform_parallelism(rows):
         not clamped to the process count: a pool that never pays off is a
         measurement, not an error.
     """
-    workers, profiles = _scoped(rows, "worker"), _scoped(rows, "profile")
-    pooled = (_total(workers, "decode_seconds")
-              + _total(profiles, "transform_seconds"))
+    workers = _scoped(rows, "worker")
+    pooled = (sum(bucket[2] for bucket in length_buckets(workers).values())
+              + _total(workers, "profile_seconds"))
     # It divides every pooled second, so a run that pooled none has measured
     # nothing.
     if not pooled:
@@ -290,12 +290,12 @@ def measure_shared(rows, runner_overhead_seconds=None):
         for row in workers if "setup_seconds" in row]
     # The in-process residual only: a log cannot see runner boot, artifact
     # download or pip.
-    in_process_setup, manifest_record = _fit_two(setup_samples) or (None, None)
+    in_process_setup, manifest_entry = _fit_two(setup_samples) or (None, None)
     # Payload bytes, real and gap alike: both were written, and both took time.
-    written_bytes = (_total(profiles, "output_bytes")
+    written_bytes = (_total(workers, "output_bytes")
                      + _total(profiles, "gap_bytes"))
     return SharedAxes(
-        manifest_record=manifest_record,
+        manifest_entry=manifest_entry,
         written_byte=_ratio(_total(workers, "write_seconds"), written_bytes),
         worker_setup_seconds=(None if in_process_setup is None
                               or runner_overhead_seconds is None
@@ -320,7 +320,7 @@ def measure_run(rows, runner_overhead_seconds=None):
     workers, profiles = _scoped(rows, "worker"), _scoped(rows, "profile")
     buckets = length_buckets(workers)
     decode_total = sum(bucket[2] for bucket in buckets.values())
-    transform_total = _total(profiles, "transform_seconds")
+    transform_total = _total(workers, "profile_seconds")
     notes = []
     key = source_key_of(rows)
     if key is None:
@@ -373,7 +373,7 @@ def axis_seconds_of(source, shared):
         The AxisSeconds the cost model charges. A profile's own cost is not
         here: the block state measures it per tile block.
     """
-    return AxisSeconds(manifest_record=shared.manifest_record,
+    return AxisSeconds(manifest_entry=shared.manifest_entry,
                        decode_call=source.decode_call,
                        fetched_byte=source.fetched_byte,
                        decoded_byte=source.decoded_byte,

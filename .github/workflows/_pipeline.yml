@@ -49,7 +49,7 @@ on:
         type: string
         default: ""
       artifact_namespace:
-        description: 'Name to prefix this call''s own internal artifacts with (shard manifests, per-worker shards) -- pass "name", not "name-", the separator is added here. Only needed when one workflow run calls this pipeline more than once, since two calls would otherwise upload the same artifact names; namespacing the second is enough, an unnamespaced call''s names being no prefix of a namespaced one''s. The published `<output_basename>-pmtiles` artifacts are unaffected, their names being unique already.'
+        description: 'Name to prefix this call''s own internal artifacts with (shard manifests, per-worker parts) -- pass "name", not "name-", the separator is added here. Only needed when one workflow run calls this pipeline more than once, since two calls would otherwise upload the same artifact names; namespacing the second is enough, an unnamespaced call''s names being no prefix of a namespaced one''s. The published `<output_basename>-pmtiles` artifacts are unaffected, their names being unique already.'
         required: false
         type: string
         default: ""
@@ -351,12 +351,12 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shards-${{ matrix.worker }}
+          name: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}parts-${{ matrix.worker }}
           path: "*-part-${{ matrix.worker }}.pmtiles"
           if-no-files-found: ignore
 
       # What this worker actually cost. Same "a worker that died wrote no file"
-      # caveat as the shards above: merge-axes refuses to record a partial run
+      # caveat as the parts above: merge-axes refuses to record a partial run
       # anyway, so a missing file is not a failure here.
       - uses: actions/upload-artifact@v4
         if: always() && inputs.axis_state == 'true'
@@ -456,8 +456,8 @@ jobs:
       - name: Download all part artifacts
         uses: actions/download-artifact@v4
         with:
-          pattern: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}shards-*
-          path: shards
+          pattern: ${{ inputs.artifact_namespace && format('{0}-', inputs.artifact_namespace) || '' }}parts-*
+          path: parts
           merge-multiple: true
 
       # A pinned release, checked against the hash of the tarball it was
@@ -497,7 +497,7 @@ jobs:
           # a failed merge would exit as the throttle does: 0.
           set -o pipefail
           shopt -s nullglob
-          PARTS=(shards/"${OUTPUT_BASENAME}"-part-*.pmtiles)
+          PARTS=(parts/"${OUTPUT_BASENAME}"-part-*.pmtiles)
           case "${#PARTS[@]}" in
             0)
               echo "::error::no parts for ${OUTPUT_BASENAME}; every worker wrote nothing for it"
@@ -521,7 +521,7 @@ jobs:
           MAX_ZOOM: ${{ inputs.max_zoom }}
           WORKER_COUNT: ${{ needs.prepare-shards.outputs.worker_count }}
         run: |
-          PART_COUNT=$(find shards -name "${OUTPUT_BASENAME}-part-*.pmtiles" | wc -l | tr -d ' ')
+          PART_COUNT=$(find parts -name "${OUTPUT_BASENAME}-part-*.pmtiles" | wc -l | tr -d ' ')
           SIZE=$(du -h "${OUTPUT_BASENAME}.pmtiles" | cut -f1)
           {
             echo "### ${OUTPUT_BASENAME} layer"

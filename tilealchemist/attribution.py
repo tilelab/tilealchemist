@@ -23,11 +23,11 @@ def fetch_declared_attribution(session, url, header):
     length = header["metadata_length"]
     if length == 0:
         return None
-    blob = fetch_range(session, url, header["metadata_offset"], length,
-                       retry_label=RETRY_LABEL)
+    buffer = fetch_range(session, url, header["metadata_offset"], length,
+                         retry_label=RETRY_LABEL)
     # gzip, not header["internal_compression"]: the directory walk already
     # rejected the rest.
-    document = json.loads(gzip.decompress(blob))
+    document = json.loads(gzip.decompress(buffer))
     if not isinstance(document, dict):
         return None
     attribution = document.get("attribution")

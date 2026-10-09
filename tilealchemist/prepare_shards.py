@@ -111,7 +111,7 @@ def parse_args():
         help=f"a worker job's runtime limit (default {DEFAULT_JOB_SECONDS}); "
              f"predicted seconds are charged against it at "
              f"{TAIL_SAFETY_FACTOR:g}x, to leave room for the tail the model "
-             "cannot see -- content complexity, which no manifest record "
+             "cannot see -- content complexity, which no manifest entry "
              "exposes")
     parser.add_argument(
         "--profile", default=None,

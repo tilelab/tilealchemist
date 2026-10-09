@@ -1,9 +1,9 @@
-"""One worker's shard build; see docs/ARCHITECTURE.md "Parallelism"."""
+"""One worker's build of its shard; see docs/ARCHITECTURE.md "Parallelism"."""
 import os
 import sys
 import time
 
-from tilealchemist.fetch_batching import fetch_batch_blob, plan_fetch_batches
+from tilealchemist.fetch_batching import fetch_batch_buffer, plan_fetch_batches
 from tilealchemist.manifest import read_manifest, read_source_metadata
 from tilealchemist.pmtiles_part import (
     ProfileTileCounts,
@@ -13,16 +13,16 @@ from tilealchemist.pmtiles_part import (
 )
 from tilealchemist.ranged_fetch import make_session
 from tilealchemist.schemas import SCHEMAS
-from tilealchemist.tile_blocks import format_block_values, profile_combo_key
+from tilealchemist.tile_blocks import format_block_values, profile_set_key
 from tilealchemist.transform_pool import run_transform
-from tilealchemist.usage import PhaseSeconds, TransformUsage, report
+from tilealchemist.usage import PhaseSeconds, ShardUsage, report
 
 
 def split_manifest_entries(entries):
     """Split a manifest into the entries to fetch and the gaps to fill.
 
     Args:
-        entries: This worker's manifest records.
+        entries: This worker's manifest entries.
 
     Returns:
         The real entries and the gap entries, told apart by the `length=0`
@@ -65,7 +65,7 @@ def run_worker(args):
                for out, profile in zip(args.out, profiles)]
     counts = [ProfileTileCounts() for _ in profiles]
     gap_totals = [(0, 0, 0) for _ in profiles]
-    usage = TransformUsage(len(profiles))
+    usage = ShardUsage()
     # The key travels with the measurement: the fit must never guess which
     # archive it read.
     totals = {"source_key": source.axis_key,
@@ -105,12 +105,11 @@ def _report_worker_usage(args, profiles, counts, phases, wall_start, totals,
                          usage, gap_totals):
     """Print this worker's usage lines: one per profile, and one for itself.
 
-    Two scopes, split by what the measurement belongs to. A profile's own cost
-    -- the seconds its `transform_tile()` took, and the bytes its output came to
-    -- goes on its own line, where the fit can key it by profile. Everything
-    that belongs to the archive or the runner instead goes on the worker's line.
-    The profiles' seconds and written bytes per tile block go on a third,
-    written to the usage file only.
+    Two scopes, split by what the measurement belongs to. A profile's tile
+    counts, gap tiles and part size go on its own line, keyed by profile.
+    Everything else goes on the worker's line, the profiles' seconds and
+    written bytes summed across every profile. The same seconds and bytes per
+    tile block go on a third, written to the usage file only.
 
     Args:
         args: The parsed command line.
@@ -131,20 +130,17 @@ def _report_worker_usage(args, profiles, counts, phases, wall_start, totals,
             declines gaps as one that declines tiles.
     """
     lines = []
-    for (profile, out, profile_counts, profile_seconds, output_bytes,
+    for (profile, out, profile_counts,
             (gap_tiles, gap_skipped, gap_bytes)) in zip(
-            profiles, args.out, counts, usage.profile_seconds,
-            usage.profile_output_bytes, gap_totals):
-        shard_bytes = os.path.getsize(out) if os.path.exists(out) else 0
+            profiles, args.out, counts, gap_totals):
+        part_bytes = os.path.getsize(out) if os.path.exists(out) else 0
         lines.append(report("profile", worker=args.worker_index,
                             profile=profile.name,
                             written=profile_counts.written,
                             skipped=profile_counts.skipped,
                             blobs=profile_counts.blobs,
-                            transform_seconds=profile_seconds,
-                            output_bytes=output_bytes,
                             gap_tiles=gap_tiles, gap_skipped=gap_skipped,
-                            gap_bytes=gap_bytes, shard_bytes=shard_bytes))
+                            gap_bytes=gap_bytes, part_bytes=part_bytes))
     wall_seconds = time.perf_counter() - wall_start
     lines.append(report("worker", worker=args.worker_index,
                         wall_seconds=wall_seconds,
@@ -153,8 +149,8 @@ def _report_worker_usage(args, profiles, counts, phases, wall_start, totals,
     # Hundreds of blocks per worker: into the usage file, not the log.
     lines.append(report("blocks", echo=False, worker=args.worker_index,
                         source_key=totals["source_key"],
-                        profiles=profile_combo_key(profile.name
-                                                   for profile in profiles),
+                        profile_set=profile_set_key(profile.name
+                                                    for profile in profiles),
                         seconds=format_block_values(usage.block_seconds),
                         written_bytes=format_block_values(usage.block_bytes)))
     if args.usage_out:
@@ -169,7 +165,7 @@ def _process_real_entries(real_entries, args, source, schema, profiles,
     """Fetch, transform and write every real entry, batch by batch.
 
     Each batch's bytes are dropped before the next is fetched: a worker's
-    memory budget covers one batch, not the whole block's byte sum.
+    memory budget covers one batch, not the whole shard's byte sum.
 
     Args:
         real_entries: The entries to fetch, in offset order.
@@ -185,10 +181,10 @@ def _process_real_entries(real_entries, args, source, schema, profiles,
     Returns:
         The bytes fetched in total, and the largest single batch.
     """
-    batches = plan_fetch_batches(real_entries, args.max_fetch_gap)
+    batches = plan_fetch_batches(real_entries, args.max_fetch_hole)
     if len(batches) > 1:
         print(f"{len(real_entries)} real entries fetched in {len(batches)} "
-              f"range requests (gaps over {args.max_fetch_gap} bytes are not "
+              f"range requests (holes over {args.max_fetch_hole} bytes are not "
               f"fetched through)", file=sys.stderr)
     session = make_session()
     fetched_bytes = peak_batch = 0
@@ -197,14 +193,15 @@ def _process_real_entries(real_entries, args, source, schema, profiles,
         batch_label = (f" {batch_index}/{len(batches)}"
                        if len(batches) > 1 else "")
         # Unmapped and deleted on the way out, so two batches never overlap.
-        with fetch_batch_blob(session, batch, batch_label, args.worker_index,
-                              source, args.download_report_interval, out_dir,
-                              phases) as blob:
-            fetched_bytes += len(blob)
-            peak_batch = max(peak_batch, len(blob))
+        with fetch_batch_buffer(session, batch, batch_label,
+                                args.worker_index, source,
+                                args.download_report_interval, out_dir,
+                                phases) as buffer:
+            fetched_bytes += len(buffer)
+            peak_batch = max(peak_batch, len(buffer))
             with phases.phase("transform"):
                 for chunk_results in run_transform(
-                        blob, batch, source.min_zoom, source.max_zoom,
+                        buffer, batch, source.min_zoom, source.max_zoom,
                         profiles, schema, args, usage):
                     with phases.phase("write"):
                         for profile_counts, profile_runs, writer in zip(
@@ -220,7 +217,7 @@ def _process_gap_entries(gap_entries, schema, profiles, writers, counts):
     every gap tile in the run between them.
 
     Args:
-        gap_entries: The gap records this worker carries.
+        gap_entries: The gap entries this worker carries.
         schema: The schema the output is written against.
         profiles: The profiles to run, in output order.
         writers: Each profile's part, in the same order.

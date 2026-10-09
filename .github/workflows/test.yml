@@ -101,8 +101,8 @@ jobs:
       worker_scale: "1"
       # Both calls land in the same workflow run, and the pipeline names the
       # artifacts it hands between its own jobs per pipeline, not per call.
-      # Namespacing this one is enough: the other's `shards-*` does not reach
-      # into `protomaps-shards-*` (see _pipeline.yml's `artifact_namespace`).
+      # Namespacing this one is enough: the other's `parts-*` does not reach
+      # into `protomaps-parts-*` (see _pipeline.yml's `artifact_namespace`).
       # No state branch from CI. These runs stop at z4 on one worker, and a
       # coefficient fitted on ~6 MB of tile data has no business setting the
       # median a planet run is then partitioned by. Calibration is exercised by
@@ -148,7 +148,7 @@ jobs:
           contents = header["tile_contents_count"]
           print(f"{path}: {addressed} tiles, {contents} distinct contents")
           assert addressed > 0, f"no tiles written to {path}"
-          # addressed is what a shard layout must never change; contents is what
+          # addressed is what a part layout must never change; contents is what
           # deduplication moves, and can only ever be a subset of it.
           assert 0 < contents <= addressed, (
               f"{path}: {contents} distinct contents against {addressed} tiles")

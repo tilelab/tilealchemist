@@ -19,7 +19,8 @@ from tilealchemist.calibration import (
 # bad runner.
 HISTORY_LENGTH = 5
 
-VERSION = 1
+# 2 renamed `manifest_record` to `manifest_entry`.
+VERSION = 2
 
 
 def empty_document():
@@ -58,6 +59,23 @@ def read_state_file(path):
     return document
 
 
+def upgrade_document(document):
+    """Bring a document written by an older version up to this one, in place.
+
+    Args:
+        document: The state document as read, mutated in place.
+
+    Returns:
+        The same document, for a caller to chain.
+    """
+    if document.get("version", 1) < 2:
+        shared = document.get("shared")
+        if isinstance(shared, dict) and "manifest_record" in shared:
+            shared.setdefault("manifest_entry", shared.pop("manifest_record"))
+        document["version"] = VERSION
+    return document
+
+
 def _is_observation(value):
     """Whether a value can join a coefficient's history.
 
@@ -70,11 +88,11 @@ def _is_observation(value):
     return isinstance(value, (int, float)) and value >= 0 and value == value
 
 
-def _observations(entry, name):
+def _observations(section, name):
     """One coefficient's recorded runs.
 
     Args:
-        entry: The document section holding that coefficient.
+        section: The document section holding that coefficient.
         name: The coefficient's name.
 
     Returns:
@@ -84,13 +102,13 @@ def _observations(entry, name):
         measurement -- a decode fit that finds no per-call cost says so with
         a zero, and dropping it left `decode_call` forever unmeasured.
     """
-    raw = entry.get(name) if isinstance(entry, dict) else None
+    raw = section.get(name) if isinstance(section, dict) else None
     if not isinstance(raw, list):
         return []
     return [float(value) for value in raw if _is_observation(value)]
 
 
-def _summarize(entry, name):
+def _summarize(section, name):
     """What the recorded runs say this coefficient is.
 
     The median, not the mean: one runner with a slow disk, or one archive
@@ -99,35 +117,35 @@ def _summarize(entry, name):
     of its full weight.
 
     Args:
-        entry: The document section holding that coefficient.
+        section: The document section holding that coefficient.
         name: The coefficient's name.
 
     Returns:
         The median observation, or None where nothing was recorded.
     """
-    values = _observations(entry, name)
+    values = _observations(section, name)
     return statistics.median(values) if values else None
 
 
-def _summarize_group(group_type, entry):
+def _summarize_group(group_type, section):
     """What the recorded runs say every coefficient of one group is.
 
     Args:
         group_type: The group's namedtuple type, SourceAxes or SharedAxes.
-        entry: The document section holding the group's coefficients.
+        section: The document section holding the group's coefficients.
 
     Returns:
         A group of that type, any field None where nothing was recorded.
     """
-    return group_type(**{name: _summarize(entry, name)
+    return group_type(**{name: _summarize(section, name)
                          for name in group_type._fields})
 
 
-def _record_group(entry, measured):
+def _record_group(section, measured):
     """Append one run's measurements to a document section.
 
     Args:
-        entry: The section to extend, mutated in place.
+        section: The section to extend, mutated in place.
         measured: The measured group, whose None fields are skipped: a
             coefficient this run could not measure keeps the history it had
             rather than gaining a hole.
@@ -140,8 +158,8 @@ def _record_group(entry, measured):
         value = getattr(measured, name)
         if not _is_observation(value):
             continue
-        history = _observations(entry, name) + [float(value)]
-        entry[name] = history[-HISTORY_LENGTH:]
+        history = _observations(section, name) + [float(value)]
+        section[name] = history[-HISTORY_LENGTH:]
         recorded.append(name)
     return recorded
 
@@ -160,17 +178,17 @@ def record_run(document, measurement, build=None):
     Returns:
         A line per section saying what was recorded, for the job log.
     """
-    document.setdefault("version", VERSION)
+    upgrade_document(document)
     # A profile's cost is the block state's to keep, per archive and profile
     # set; see block_state.py.
     document.pop("profiles", None)
     lines = []
     if measurement.source_key:
-        entry = document.setdefault("sources", {}).setdefault(
+        section = document.setdefault("sources", {}).setdefault(
             measurement.source_key, {})
         if build:
-            entry["build"] = build
-        recorded = _record_group(entry, measurement.source)
+            section["build"] = build
+        recorded = _record_group(section, measurement.source)
         lines.append(f"source {measurement.source_key}: recorded "
                      f"{', '.join(recorded) or 'nothing'}")
     recorded = _record_group(document.setdefault("shared", {}),
@@ -190,8 +208,8 @@ def source_axes(document, source_key, notes):
     Returns:
         The SourceAxes to charge, every field usable.
     """
-    entry = document.get("sources", {}).get(source_key, {})
-    measured = _summarize_group(SourceAxes, entry)
+    section = document.get("sources", {}).get(source_key, {})
+    measured = _summarize_group(SourceAxes, section)
     return adopt_group(measured, REVIEWED_SOURCE, notes,
                        prefix=f"{source_key}.")
 
@@ -206,6 +224,7 @@ def shared_axes(document, notes):
     Returns:
         The SharedAxes to charge, every field usable.
     """
+    upgrade_document(document)
     measured = _summarize_group(SharedAxes, document.get("shared", {}))
     return adopt_group(measured, REVIEWED_SHARED, notes)
 
@@ -240,10 +259,11 @@ def history_depth(document):
         The smallest number of observations behind any recorded coefficient,
         and zero where nothing is recorded at all.
     """
+    upgrade_document(document)
     depths = []
-    for entry in document.get("sources", {}).values():
-        depths.extend(len(_observations(entry, name))
-                      for name in SourceAxes._fields if name in entry)
+    for section in document.get("sources", {}).values():
+        depths.extend(len(_observations(section, name))
+                      for name in SourceAxes._fields if name in section)
     shared = document.get("shared", {})
     depths.extend(len(_observations(shared, name))
                   for name in SharedAxes._fields if name in shared)
