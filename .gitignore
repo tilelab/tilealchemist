@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+build/
+dist/
+*.egg-info/
+.venv/
+
+# macOS
+.DS_Store

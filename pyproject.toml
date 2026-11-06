@@ -1,0 +1,48 @@
+[project]
+name = "tilealchemist"
+version = "0.2.0"
+description = "Builds PMTiles layers from an OpenStreetMap-based PMTiles archive, one pluggable per-tile profile per layer."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+requires-python = ">=3.11"
+dependencies = [
+    "pmtiles",
+    "mapbox-vector-tile",
+    # Imported directly; >=2.1 for make_valid(method="structure"), see
+    # profiles/water.py.
+    "shapely>=2.1",
+    # Imported directly, by archive/layer_writer.py.
+    "numpy",
+]
+
+[project.urls]
+Repository = "https://github.com/tilelab/tilealchemist"
+
+[project.scripts]
+tilealchemist = "tilealchemist.cli:main"
+
+# Declared the way plugins declare theirs; see docs/reference/schemas.md.
+[project.entry-points."tilealchemist.schemas"]
+openmaptiles = "tilealchemist.schemas.openmaptiles:OPENMAPTILES"
+protomaps = "tilealchemist.schemas.protomaps:PROTOMAPS"
+
+[build-system]
+# >=77 for the SPDX `license` string.
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["tilealchemist*"]
+
+[tool.mypy]
+strict = true
+files = ["tilealchemist", "tests"]
+# pmtiles is typed except for its writer, whose finalize_header() the
+# package calls, and its reader, which tests/ uses.
+untyped_calls_exclude = ["pmtiles.writer", "pmtiles.reader"]
+
+# No type information shipped.
+[[tool.mypy.overrides]]
+module = ["mapbox_vector_tile.*"]
+ignore_missing_imports = true

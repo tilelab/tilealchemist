@@ -1,0 +1,50 @@
+name: Lint
+
+# Also called by release.yml; tags run it only through there.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+jobs:
+  # Google Python Style Guide, with its pylintrc vendored as .pylintrc.
+  pylint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # The package, so imports resolve. pylint is pinned so new checks
+      # don't fail unrelated pushes.
+      - run: pip install . pylint==4.1.2
+
+      - name: Check Google Python style
+        run: pylint tilealchemist
+
+      # GitHub-specific code lives in .github/ only.
+      - name: Check the package stays GitHub-independent
+        run: |
+          if grep -rnE 'GITHUB_|api\.github\.com' tilealchemist; then
+            echo "::error::GitHub-specific code belongs in .github/, not in the package"
+            exit 1
+          fi
+
+  # Strict, on the files [tool.mypy] in pyproject.toml lists.
+  mypy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      # Pinned like pylint.
+      - run: pip install . mypy==2.4.1 types-shapely
+
+      - name: Check types
+        run: mypy

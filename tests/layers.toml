@@ -1,0 +1,6 @@
+# The run smoke_test.py builds from the archive it generates.
+schema = "protomaps"
+max_zoom = 3
+
+# Layers: surface-water.
+profiles = ["surface_water.py"]

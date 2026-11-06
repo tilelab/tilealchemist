@@ -1,0 +1,25 @@
+name: Test
+
+# Builds a layer from a generated archive and checks it; see
+# tests/smoke_test.py.
+
+# Also called by release.yml; tags run it only through there.
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  workflow_call:
+
+jobs:
+  smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - run: pip install .
+
+      - run: python tests/smoke_test.py
