@@ -45,7 +45,8 @@ class ConvertConfig:
 
     Attributes:
         profiles: Each layer's profile file, absolute, in order.
-        schema: The schema the archive's tiles are in.
+        schema: The schema the archive's tiles are in; None if the config
+            names none, which check() refuses.
         min_zoom: Lowest zoom level to build.
         max_zoom: Highest zoom level to build.
         attribution: What the layers credit, `{source}` standing for the
@@ -54,7 +55,7 @@ class ConvertConfig:
     """
 
     profiles: tuple[str, ...]
-    schema: str = "openmaptiles"
+    schema: str | None = None
     min_zoom: ZoomLevel = ZoomLevel.Z0
     max_zoom: ZoomLevel = ZoomLevel.Z14
     attribution: str | None = None
@@ -137,18 +138,32 @@ def check(config: ConvertConfig) -> None:
     """Checks that the config's values fit together.
 
     Raises:
-        ValueError: If the zoom range is reversed or the schema is not
-            installed.
+        ValueError: If the zoom range is reversed, or the schema is missing
+            or not installed.
     """
     if config.min_zoom > config.max_zoom:
         raise ValueError(f"min_zoom ({config.min_zoom}) must not exceed "
                          f"max_zoom ({config.max_zoom})")
+    schema: str = schema_name(config)
     schema_names: list[str] = plugins.schema_names()
-    if config.schema not in schema_names:
-        raise ValueError(f"schema {config.schema!r} is not installed "
+    if schema not in schema_names:
+        raise ValueError(f"schema {schema!r} is not installed "
                          f"(installed: {', '.join(schema_names)}); list the "
                          f"plugin providing it in the config's `plugins` "
                          f"and run `tilealchemist setup`")
+
+
+def schema_name(config: ConvertConfig) -> str:
+    """Returns the schema the config names.
+
+    Raises:
+        ValueError: If it names none.
+    """
+    if config.schema is None:
+        raise ValueError(f"the config names no schema; set `schema` to the "
+                         f"archive's, one of "
+                         f"{', '.join(plugins.schema_names())}")
+    return config.schema
 
 
 def check_layer_name(name: str, where: str) -> None:

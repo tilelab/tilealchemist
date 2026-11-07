@@ -18,7 +18,11 @@ from tilealchemist.archive.local import LocalArchive, open_archive
 from tilealchemist.archive.schema_check import check_schema
 from tilealchemist.archive.zoom import ZoomLevel
 from tilealchemist.config import plugins
-from tilealchemist.config.run_config import ConvertConfig, layer_names
+from tilealchemist.config.run_config import (
+    ConvertConfig,
+    layer_names,
+    schema_name,
+)
 from tilealchemist.conversion.partition import count_decoding_entries
 from tilealchemist.conversion.transform_chunk import (
     ChunkResults,
@@ -46,10 +50,10 @@ def convert(*, config: ConvertConfig, input_path: str, output_dir: str,
         overwrite: Whether a layer may replace an existing file.
 
     Raises:
-        ValueError: If a profile lacks a dependency or `PROFILE`, two
-            profiles share a name, a layer file exists, the archive isn't
-            gzipped MVT, isn't in the schema or has none of the zoom
-            range, or nothing would be credited.
+        ValueError: If the config names no schema, a profile lacks a
+            dependency or `PROFILE`, two profiles share a name, a layer file
+            exists, the archive isn't gzipped MVT, isn't in the schema or
+            has none of the zoom range, or nothing would be credited.
     """
     profiles: list[Profile] = [load_profile(path)()
                                for path in config.profiles]
@@ -62,7 +66,7 @@ def convert(*, config: ConvertConfig, input_path: str, output_dir: str,
                          f"{'exists' if len(existing) == 1 else 'exist'}; "
                          f"pass --overwrite to replace, or -o for another "
                          f"directory")
-    schema: TileSchema = plugins.schema(config.schema)
+    schema: TileSchema = plugins.schema(schema_name(config))
     os.makedirs(output_dir, exist_ok=True)
 
     archive: LocalArchive

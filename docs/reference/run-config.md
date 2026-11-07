@@ -18,7 +18,7 @@ The file name must end in `.toml`. Relative paths are relative to the file.
 | Key | Type | Default | Description |
 | --- | --- | --- | --- |
 | `profiles` | Array of paths | Required | One layer per profile, named after its `name`. Names must be unique. |
-| `schema` | String | `"openmaptiles"` | The archive's schema: `"openmaptiles"` (such as OpenFreeMap), `"protomaps"`, or one a plugin installs. |
+| `schema` | String | Required | The archive's schema: `"openmaptiles"` (such as OpenFreeMap), `"protomaps"`, or one a plugin installs. |
 | `min_zoom`, `max_zoom` | Integer, 0 to 30 | `0`, `14` | The zoom range. `--min-zoom` and `--max-zoom` override it, and `convert` narrows it to the archive's. |
 | `attribution` | String | Unset | A template for what each layer credits; see below. |
 | `plugins` | Array of strings | `[]` | Pip requirements `setup` installs: a PyPI name, a URL requirement, or a directory starting with `.`, `/` or `~`. |
