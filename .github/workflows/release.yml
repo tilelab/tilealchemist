@@ -1,0 +1,70 @@
+name: Release
+
+# Publishes tilealchemist to PyPI on a version tag:
+#
+#   git tag v1.0.0 && git push origin v1.0.0
+#
+# A release candidate tag such as v1.0.0rc1 publishes a pre-release. The
+# tag must match pyproject.toml's version, and lint and test must pass on
+# it. Uses trusted publishing from the `pypi` environment, so no token is
+# stored. tilealchemist-pipeline releases the same way, from its own
+# repository.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    uses: ./.github/workflows/lint.yml
+
+  test:
+    uses: ./.github/workflows/test.yml
+
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.11"
+
+      - name: Check the tag names pyproject.toml's version
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::tag $TAG does not name pyproject.toml's version $version; tag v$version, or set the version first"
+            exit 1
+          fi
+
+      # twine check finds a description PyPI would refuse or show badly.
+      - name: Build and check the sdist and wheel
+        run: |
+          pip install build twine
+          python -m build
+          twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: [lint, test, build]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist
+
+      - uses: pypa/gh-action-pypi-publish@release/v1
